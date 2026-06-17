@@ -1,0 +1,32 @@
+{
+  "name": "@henryavila/tooling-installer",
+  "version": "0.1.0",
+  "description": "Reversible, userland installer engine for CLI tools and AI skills. Reconciles a target directory tree to a declarative set of rendered files + config mutations; every mutation reverts byte-for-byte. No OS integration (no registry, services, daemons, or system PATH).",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "keywords": [
+    "installer",
+    "uninstaller",
+    "reversible",
+    "reconcile",
+    "idempotent",
+    "cli-tools",
+    "ai-skills",
+    "userland",
+    "dotfiles",
+    "config"
+  ],
+  "author": "Henry Avila <personal@henryavila.com>",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
