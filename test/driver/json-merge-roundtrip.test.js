@@ -82,4 +82,52 @@ describe('driver round-trip — built-in jsonMerge', () => {
     installer.uninstall({ projectDir: tempDir });
     assert.equal(existsSync(settingsPath), false, 'installer-created settings.json removed');
   });
+
+  // Regression guard for the UPDATE path: a second install re-touches an entry that
+  // is already present, so jsonMerge.apply inserts nothing THIS run. The latest
+  // journal must still own the merge (carried forward from the prior before-state via
+  // the Driver-threaded `previous`), or uninstall — which replays only the latest
+  // journal — leaves our command behind.
+  it('survives an UPDATE (re-install) before uninstall — third-party survives, our merge is removed', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'ti-jsonmerge-'));
+    mkdirSync(join(tempDir, '.claude'), { recursive: true });
+    const settingsPath = join(tempDir, '.claude', 'settings.json');
+
+    const thirdParty = { type: 'command', command: '/usr/local/bin/other.sh' };
+    const baseline = { theme: 'dark', hooks: { SessionStart: [{ matcher: '*', hooks: [thirdParty] }] } };
+    writeFileSync(settingsPath, JSON.stringify(baseline, null, 2) + '\n', 'utf8');
+    const baselineStr = readFileSync(settingsPath, 'utf8');
+
+    const installer = defineInstaller({
+      providers: [hookMergeProvider('/abs/version-check.sh')],
+      config: { manifestDir: '.ti-test' },
+    });
+
+    installer.install({ projectDir: tempDir });
+    installer.install({ projectDir: tempDir }); // UPDATE — entry already present, inserts nothing this apply
+    installer.uninstall({ projectDir: tempDir });
+
+    assert.equal(
+      readFileSync(settingsPath, 'utf8'), baselineStr,
+      'settings.json restored to baseline after update→uninstall (latest journal still owns the merge)',
+    );
+  });
+
+  it('deletes an installer-created settings.json after an UPDATE before uninstall', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'ti-jsonmerge-'));
+    const settingsPath = join(tempDir, '.claude', 'settings.json');
+
+    const installer = defineInstaller({
+      providers: [hookMergeProvider('/abs/version-check.sh')],
+      config: { manifestDir: '.ti-test' },
+    });
+
+    installer.install({ projectDir: tempDir });
+    installer.install({ projectDir: tempDir }); // UPDATE
+    assert.ok(existsSync(settingsPath), 'settings.json present after update');
+
+    installer.uninstall({ projectDir: tempDir });
+    assert.equal(existsSync(settingsPath), false,
+      'installer-created settings.json removed after update→uninstall (fileCreated carried forward)');
+  });
 });

@@ -70,6 +70,22 @@ const formatPath = (path) => (path.length === 0 ? '<root>' : path.join('.'));
 
 const cloneJsonValue = (value) => JSON.parse(JSON.stringify(value));
 
+// Dedupe a list of JSON-serializable records (inserts / container paths) by
+// structural identity. Used to carry forward a prior install's ownership without
+// recording a path twice when an update re-touches the same entry.
+const dedupeByJson = (items) => {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const key = JSON.stringify(item);
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(item);
+    }
+  }
+  return out;
+};
+
 const parseJsonFile = (absPath, path) => {
   try {
     return JSON.parse(readFileSync(absPath, 'utf8'));
@@ -203,7 +219,7 @@ const pruneCreatedContainers = (root, createdContainers) => {
 export const createJsonMergeEffect = () => ({
   type: 'jsonMerge',
 
-  apply({ basePath, path, delta }) {
+  apply({ basePath, path, delta, previous }) {
     const absPath = resolveWithinBase(basePath, path);
     const fileCreated = !existsSync(absPath);
     const target = fileCreated ? {} : parseJsonFile(absPath, path);
@@ -222,11 +238,31 @@ export const createJsonMergeEffect = () => ({
     mkdirSync(dirname(absPath), { recursive: true });
     writeFileSync(absPath, JSON.stringify(target, null, 2) + '\n', 'utf8');
 
+    // Carry forward ownership from a prior install. The Driver threads the prior
+    // before-state of this effect (same type + occurrence) as `previous`. On the
+    // UPDATE path the merged entry is already present, so THIS apply inserts nothing
+    // (`inserts: []`) — but the entries a PRIOR install added are still this effect's
+    // to revert, and uninstall replays ONLY the latest journal. Without carrying the
+    // prior before-state forward, the latest record would own nothing and uninstall
+    // would orphan the merge. Likewise `fileCreated` is sticky: if any install
+    // created the file, the last revert may remove it when the root empties.
+    // Deduped so an update that re-inserts the same entry does not record it twice.
+    const mergedInserts = dedupeByJson([...(previous?.inserts ?? []), ...inserts]);
+    const mergedContainers = dedupeByJson(
+      [...(previous?.createdContainers ?? []), ...createdContainers],
+    );
+    const ownFileCreated = fileCreated || Boolean(previous?.fileCreated);
+
     // `path` is journaled in the before-state so the effect is revertible through
     // the Driver, whose revert ctx carries only { basePath, manifestDir } (the
     // journal does not persist apply args). Mirrors reconcileFileSet, whose
     // before-state is likewise self-sufficient for revert.
-    return { path, fileCreated, inserts, createdContainers };
+    return {
+      path,
+      fileCreated: ownFileCreated,
+      inserts: mergedInserts,
+      createdContainers: mergedContainers,
+    };
   },
 
   revert(ctx, beforeState) {
