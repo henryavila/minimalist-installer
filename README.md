@@ -40,16 +40,21 @@ stabilizes, then via the npm release.
 
 Delivered so far: the effect kernel + journal + 3-hash file reconciler + the three
 built-in non-file effects (`json-merge`, `refcount`, `legacy-prune`), each with a
-round-trip / adversarial test suite.
+round-trip / adversarial test suite; and the **Provider contract** + a reference
+`createFileSetProvider()` + the **Driver** (`install` / `uninstall`, structural
+round-trip) — see [`docs/design/provider-driver.md`](docs/design/provider-driver.md).
 
-Not yet here (next): the **Provider API** (how a consumer declares its desired set)
-and the **Driver/CLI** (`install`/`uninstall`/`update`) — these are being designed
-as the atomic-skills consumer is wired up.
+Not yet here (next): re-install/**update** semantics in the Driver (3-hash
+reconcile + orphan removal), the declarative **two-tier config** schema, and the
+runtime-layer registration example. There is no CLI — this is a **library**; the
+consumer owns its own CLI (lib-only by design).
 
 ## API
 
 ```js
 import {
+  createDriver,
+  createFileSetProvider,
   createEffectRegistry,
   createReconcileFileSetEffect,
   createJsonMergeEffect,
@@ -61,6 +66,13 @@ import {
   writeManifest,
 } from '@henryavila/tooling-installer';
 ```
+
+- **`createDriver({ registry, providers, manifestDir })`** — the consumer-agnostic
+  orchestrator: `install(config, { projectDir })` applies the providers' effects and
+  journals them; `uninstall({ projectDir })` replays the journal in reverse and
+  removes the manifest (structural, byte-for-byte round-trip).
+- **`createFileSetProvider()`** — reference provider: maps `config.files`
+  (`[{ path, content }]`) to a `reconcileFileSet` effect. Generic, not skills-specific.
 
 - **`createEffectRegistry()`** — register/look up effect types (`{ type, apply, revert }`).
 - **`createReconcileFileSetEffect()`** — declarative 3-hash file reconciliation

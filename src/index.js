@@ -16,9 +16,16 @@ export { readEffects, recordEffect, replayReverse } from './kernel/journal.js';
 export {
   readManifest,
   writeManifest,
+  removeManifest,
   MANIFEST_DIR,
   MANIFEST_FILE,
 } from './manifest.js';
+
+// Provider contract + reference provider — pure planners that emit effects.
+export { createFileSetProvider } from './provider.js';
+
+// Driver — the consumer-agnostic install/uninstall orchestrator over the kernel.
+export { createDriver } from './driver.js';
 
 // Reconciler — declarative 3-hash file-set reconciliation (the file domain).
 export { classifyFile, createReconcileFileSetEffect } from './kernel/reconciler.js';
