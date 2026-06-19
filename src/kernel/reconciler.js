@@ -77,8 +77,12 @@ export const createReconcileFileSetEffect = () => ({
       if (prevHash !== undefined && existsSync(absPath)) {
         const currentHash = hashContent(readFileSync(absPath, 'utf8'));
         if (currentHash !== prevHash) {
-          // User edited a file we installed — keep theirs, track their hash.
-          beforeState.push({ path, installedHash: currentHash });
+          // User edited a file we installed — keep theirs (no clobber), and keep
+          // tracking the ORIGINAL installed hash so the file reads as "modified"
+          // forever. revert() only deletes when disk == tracked hash, so the
+          // user's edits survive uninstall too (P3 — no proof-less deletion of
+          // user content; symmetric with a user-modified orphan).
+          beforeState.push({ path, installedHash: prevHash });
           continue;
         }
       }

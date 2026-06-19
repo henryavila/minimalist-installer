@@ -67,25 +67,25 @@ so the order is stable). The file effect then applies the legacy `--yes` policy:
 - **dropped from desired + unmodified** → remove (orphan).
 - **dropped from desired + user-modified** → keep, and stop tracking it.
 
-### ⚠️ Known asymmetry to confirm (data-safety, not resolved unilaterally)
+### Data-safety: user-edited files survive uninstall (resolved 2026-06-19)
 
-A user-modified file is tracked differently depending on whether it stays in the
-desired set:
+A user-modified file is preserved on uninstall in BOTH cases, symmetrically:
 
-- a kept **orphan** (dropped from desired) → untracked → **survives uninstall**.
-- a kept file **still in desired** → tracked with the user's content hash (legacy
-  parity, `install.js:890`) → **removed on uninstall** (disk matches the tracked
-  hash), so the user's edits are lost.
+- a kept **orphan** (dropped from desired) → untracked → survives uninstall.
+- a kept file **still in desired** → tracked with its *original* installed hash,
+  so it reads as "modified" forever; `revert` only deletes when disk == tracked
+  hash, so the user's edits survive uninstall too.
 
-This is faithful to the legacy installer, but the asymmetry is a genuine policy
-call. Safer alternative to weigh with the user: record the *original* installed
-hash for a kept-still-desired file so it reads as "modified" forever and is
-preserved on uninstall too.
+This intentionally diverges from the legacy installer (which recorded the user's
+content hash at `install.js:890` and thus reclaimed the file on uninstall). The
+round-trip parity gate never exercises an edit-then-uninstall on current paths,
+so the divergence is safe, and P3 ("no proof-less deletion of user content") wins.
 
 ## Verification
 
 `node --test test/driver/install-uninstall.test.js` (5) +
-`test/driver/update.test.js` (2) + `test/kernel/reconciler-update.test.js` (5),
-plus `npm test` (full suite, **50**). The round-trip cases assert the install
-root returns to empty after uninstall — including after an update — the parity
-contract, proven at the Driver level.
+`test/driver/update.test.js` (3) + `test/kernel/reconciler-update.test.js` (5),
+plus `npm test` (full suite, **51**). The round-trip cases assert the install
+root returns to empty after uninstall — including after an update — while a
+user-edited file is proven to survive uninstall, at both the effect and Driver
+level.

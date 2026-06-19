@@ -74,6 +74,22 @@ describe('driver re-install / update', () => {
     assert.deepEqual(paths, ['a.md', 'new.md'], 'manifest reflects the new set');
   });
 
+  it('uninstall preserves a user-edited file that was kept through an update', () => {
+    const { dir, driver } = setup();
+
+    driver.install({ files: [{ path: 'a.md', content: 'v1' }] }, { projectDir: dir });
+    writeFileSync(join(dir, 'a.md'), 'USER', 'utf8');
+    driver.install({ files: [{ path: 'a.md', content: 'v2' }] }, { projectDir: dir });
+
+    driver.uninstall({ projectDir: dir });
+
+    assert.equal(
+      readFileSync(join(dir, 'a.md'), 'utf8'),
+      'USER',
+      'user edit survives uninstall',
+    );
+  });
+
   it('uninstall after an update returns to baseline', () => {
     const { dir, driver } = setup();
 

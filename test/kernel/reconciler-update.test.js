@@ -40,7 +40,7 @@ describe('reconcileFileSet effect — update (3-hash)', () => {
     assert.equal(next[0].installedHash, hashContent('v2'));
   });
 
-  it('keeps a user-modified file on update (no clobber), tracking the user content hash', () => {
+  it('keeps a user-modified file on update (no clobber), tracks the original hash, and survives uninstall', () => {
     const basePath = dir();
     const eff = createReconcileFileSetEffect();
 
@@ -53,8 +53,19 @@ describe('reconcileFileSet effect — update (3-hash)', () => {
       previous: prev,
     });
 
-    assert.equal(readFileSync(join(basePath, 'a.md'), 'utf8'), 'USER');
-    assert.equal(next[0].installedHash, hashContent('USER'));
+    assert.equal(readFileSync(join(basePath, 'a.md'), 'utf8'), 'USER', 'no clobber on update');
+    assert.equal(
+      next[0].installedHash,
+      hashContent('v1'),
+      'tracks the ORIGINAL installed hash, not the user content',
+    );
+
+    eff.revert({ basePath }, next);
+    assert.equal(
+      readFileSync(join(basePath, 'a.md'), 'utf8'),
+      'USER',
+      'user edits survive uninstall (revert does not reclaim a modified file)',
+    );
   });
 
   it('removes an unmodified orphan (dropped from desired) on update', () => {
