@@ -40,19 +40,19 @@ stabilizes, then via the npm release.
 
 Delivered so far: the effect kernel + journal + 3-hash file reconciler + the three
 built-in non-file effects (`json-merge`, `refcount`, `legacy-prune`), each with a
-round-trip / adversarial test suite; and the **Provider contract** + a reference
-`createFileSetProvider()` + the **Driver** (`install` / `uninstall`, structural
-round-trip) — see [`docs/design/provider-driver.md`](docs/design/provider-driver.md).
+round-trip / adversarial test suite; the **Provider contract** + a reference
+`createFileSetProvider()`; the **Driver** (`install` / `uninstall` / **update**,
+structural round-trip, no-clobber on user edits); and **`defineInstaller`** (the
+two-tier config factory) — see [`docs/design/provider-driver.md`](docs/design/provider-driver.md).
 
-Not yet here (next): re-install/**update** semantics in the Driver (3-hash
-reconcile + orphan removal), the declarative **two-tier config** schema, and the
-runtime-layer registration example. There is no CLI — this is a **library**; the
-consumer owns its own CLI (lib-only by design).
+Not yet here (next): a fuller runtime-layer registration example. There is no
+CLI — this is a **library**; the consumer owns its own CLI (lib-only by design).
 
 ## API
 
 ```js
 import {
+  defineInstaller,
   createDriver,
   createFileSetProvider,
   createEffectRegistry,
@@ -67,10 +67,14 @@ import {
 } from '@henryavila/tooling-installer';
 ```
 
-- **`createDriver({ registry, providers, manifestDir })`** — the consumer-agnostic
-  orchestrator: `install(config, { projectDir })` applies the providers' effects and
-  journals them; `uninstall({ projectDir })` replays the journal in reverse and
-  removes the manifest (structural, byte-for-byte round-trip).
+- **`defineInstaller({ config, providers, effects })`** — two-tier config factory:
+  declarative `config` (data; engine owns `manifestDir`, rest is pass-through to
+  providers) + code-tier `providers`/`effects` (auto-registers the 4 built-ins).
+  Returns `{ install, uninstall, registry }` bound to `config`.
+- **`createDriver({ registry, providers, manifestDir })`** — the lower-level
+  consumer-agnostic orchestrator: `install(config, { projectDir })` applies the
+  providers' effects and journals them; `uninstall({ projectDir })` replays the
+  journal in reverse and removes the manifest (structural, byte-for-byte round-trip).
 - **`createFileSetProvider()`** — reference provider: maps `config.files`
   (`[{ path, content }]`) to a `reconcileFileSet` effect. Generic, not skills-specific.
 

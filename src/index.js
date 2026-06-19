@@ -27,6 +27,10 @@ export { createFileSetProvider } from './provider.js';
 // Driver — the consumer-agnostic install/uninstall orchestrator over the kernel.
 export { createDriver } from './driver.js';
 
+// defineInstaller — two-tier config factory (declarative `config` + code-tier
+// `effects`/`providers`); auto-registers the 4 built-in effect types.
+export { defineInstaller } from './define-installer.js';
+
 // Reconciler — declarative 3-hash file-set reconciliation (the file domain).
 export { classifyFile, createReconcileFileSetEffect } from './kernel/reconciler.js';
 

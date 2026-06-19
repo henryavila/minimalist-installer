@@ -47,6 +47,34 @@ driver.uninstall({ projectDir })         // replayReverse the journal + remove t
   to every effect's `revert(ctx, beforeState)`. Effects read install-root context
   from `ctx` and everything else from their own recorded `beforeState`.
 
+## Two-tier config (`defineInstaller`)
+
+The D2 boundary, as one factory:
+
+```js
+const installer = defineInstaller({
+  config: { manifestDir: '.atomic-skills' /* + provider inputs */ }, // DECLARATIVE tier
+  providers: [ /* pure planners */ ],                                // CODE tier
+  effects: [ /* consumer custom effect types */ ],                   // CODE tier (escape hatch)
+});
+installer.install({ projectDir });
+installer.uninstall({ projectDir });
+```
+
+- **Declarative tier** = `config`. The engine owns only `config.manifestDir`;
+  everything else (`config.files`, a `config.language` flag, …) is **opaque
+  pass-through** to the providers. So the rich declarative config the legacy
+  design imagined (IDE matrix, catalog, language rendering) lives in the
+  **consumer's** config + providers, not in this generic engine — a deliberate
+  reinterpretation of D2 under the package-first boundary (DECIDIDO #1/#2).
+- **Code tier** = `providers` + `effects`. The 4 built-in effect types are always
+  registered (P4); a consumer adds a reversible effect type by listing it in
+  `effects` and a planner in `providers` — no kernel change (the runtime-layer
+  escape hatch; a fuller worked example is T-F2-4, still pending).
+
+Open: whether the engine should validate/normalize more than `manifestDir`
+(e.g. a `basePath` default, a config schema). Kept pass-through for now.
+
 ## Scope
 
 - **In:** greenfield install; structural uninstall; **re-install/update**
