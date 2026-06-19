@@ -70,19 +70,24 @@ installer.uninstall({ projectDir });
 - **Code tier** = `providers` + `effects`. The 4 built-in effect types are always
   registered (P4); a consumer adds a reversible effect type by listing it in
   `effects` and a planner in `providers` — no kernel change (the runtime-layer
-  escape hatch; a fuller worked example is T-F2-4, still pending).
+  escape hatch). Worked example: [`examples/symlink-runtime-layer.js`](../../examples/symlink-runtime-layer.js)
+  — a custom reversible `symlink` effect that round-trips through the Driver and
+  applies the same no-proof-less-deletion discipline (T-F2-4).
 
 Open: whether the engine should validate/normalize more than `manifestDir`
 (e.g. a `basePath` default, a config schema). Kept pass-through for now.
 
 ## Scope
 
-- **In:** greenfield install; structural uninstall; **re-install/update**
-  (non-interactive 3-hash reconcile + orphan removal, below); no-clobber on
-  user-modified files; fail-fast on an unregistered effect type.
-- **Out (next slice):** the declarative **two-tier config** schema (T-F2-3); the
-  **runtime-layer** registration example (T-F2-4, beyond the registry that
-  already exists).
+- **In (F2 complete):** greenfield install; structural uninstall;
+  **re-install/update** (non-interactive 3-hash reconcile + orphan removal,
+  below); no-clobber on user-modified files; fail-fast on an unregistered effect
+  type; the **two-tier config** factory (`defineInstaller`); a **runtime-layer**
+  worked example (`examples/symlink-runtime-layer.js`).
+- **Out (next phase, F3):** the atomic-skills consumer wires onto this package via
+  `file:` link, moves its SkillsProvider + render + runtime layers onto the
+  Driver, removes its in-repo `src/kernel/` copy, and proves round-trip parity
+  through the dependency. That work lives in the atomic-skills repo, not here.
 
 ## Update / re-install policy (ported from the legacy installer, non-interactive)
 

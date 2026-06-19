@@ -38,14 +38,17 @@ property of the engine, not code each consumer writes.
 (its first consumer), which will depend on it via a local link until the API
 stabilizes, then via the npm release.
 
-Delivered so far: the effect kernel + journal + 3-hash file reconciler + the three
+Delivered: the effect kernel + journal + 3-hash file reconciler + the three
 built-in non-file effects (`json-merge`, `refcount`, `legacy-prune`), each with a
 round-trip / adversarial test suite; the **Provider contract** + a reference
 `createFileSetProvider()`; the **Driver** (`install` / `uninstall` / **update**,
-structural round-trip, no-clobber on user edits); and **`defineInstaller`** (the
-two-tier config factory) — see [`docs/design/provider-driver.md`](docs/design/provider-driver.md).
+structural round-trip, no-clobber on user edits); **`defineInstaller`** (the
+two-tier config factory); and a **runtime-layer worked example**
+([`examples/symlink-runtime-layer.js`](examples/symlink-runtime-layer.js)) — see
+[`docs/design/provider-driver.md`](docs/design/provider-driver.md).
 
-Not yet here (next): a fuller runtime-layer registration example. There is no
+Next: the first consumer (`@henryavila/atomic-skills`) wires onto this package via
+a `file:` link and proves round-trip parity through the dependency. There is no
 CLI — this is a **library**; the consumer owns its own CLI (lib-only by design).
 
 ## API
