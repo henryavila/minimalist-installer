@@ -176,6 +176,7 @@ describe('jsonMerge effect', () => {
     effect.revert({ basePath: tempDir, path: 'settings.json' }, beforeState);
 
     assert.deepEqual(beforeState, {
+      path: 'settings.json',
       fileCreated: false,
       inserts: [],
       createdContainers: [],

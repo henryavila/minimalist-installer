@@ -222,10 +222,18 @@ export const createJsonMergeEffect = () => ({
     mkdirSync(dirname(absPath), { recursive: true });
     writeFileSync(absPath, JSON.stringify(target, null, 2) + '\n', 'utf8');
 
-    return { fileCreated, inserts, createdContainers };
+    // `path` is journaled in the before-state so the effect is revertible through
+    // the Driver, whose revert ctx carries only { basePath, manifestDir } (the
+    // journal does not persist apply args). Mirrors reconcileFileSet, whose
+    // before-state is likewise self-sufficient for revert.
+    return { path, fileCreated, inserts, createdContainers };
   },
 
-  revert({ basePath, path }, beforeState) {
+  revert(ctx, beforeState) {
+    const { basePath } = ctx;
+    // Prefer the journaled path (Driver path); fall back to ctx.path for direct
+    // callers that still pass it.
+    const path = beforeState?.path ?? ctx.path;
     const absPath = resolveWithinBase(basePath, path);
     if (!existsSync(absPath)) return;
 
