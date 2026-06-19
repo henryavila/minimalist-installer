@@ -47,17 +47,45 @@ driver.uninstall({ projectDir })         // replayReverse the journal + remove t
   to every effect's `revert(ctx, beforeState)`. Effects read install-root context
   from `ctx` and everything else from their own recorded `beforeState`.
 
-## MVP scope / not yet
+## Scope
 
-- **In:** greenfield install, structural uninstall, no-clobber on user-modified
-  files (from the reconciler), fail-fast on unknown effect type.
-- **Out (next slice):** re-install/update semantics — reading the prior manifest,
-  3-hash reconcile (`classifyFile` already exists), orphan removal; the config
-  two-tier schema (T-F2-3); the runtime-layer registration example (T-F2-4,
-  beyond the registry that already exists).
+- **In:** greenfield install; structural uninstall; **re-install/update**
+  (non-interactive 3-hash reconcile + orphan removal, below); no-clobber on
+  user-modified files; fail-fast on an unregistered effect type.
+- **Out (next slice):** the declarative **two-tier config** schema (T-F2-3); the
+  **runtime-layer** registration example (T-F2-4, beyond the registry that
+  already exists).
+
+## Update / re-install policy (ported from the legacy installer, non-interactive)
+
+On re-install the Driver threads each effect's prior before-state into its apply
+as `previous` (matched by type + occurrence order — providers are pure planners,
+so the order is stable). The file effect then applies the legacy `--yes` policy:
+
+- **disk == last-installed** → overwrite with the new content.
+- **disk != last-installed** (user edited) → **keep the user's file** (no clobber).
+- **dropped from desired + unmodified** → remove (orphan).
+- **dropped from desired + user-modified** → keep, and stop tracking it.
+
+### ⚠️ Known asymmetry to confirm (data-safety, not resolved unilaterally)
+
+A user-modified file is tracked differently depending on whether it stays in the
+desired set:
+
+- a kept **orphan** (dropped from desired) → untracked → **survives uninstall**.
+- a kept file **still in desired** → tracked with the user's content hash (legacy
+  parity, `install.js:890`) → **removed on uninstall** (disk matches the tracked
+  hash), so the user's edits are lost.
+
+This is faithful to the legacy installer, but the asymmetry is a genuine policy
+call. Safer alternative to weigh with the user: record the *original* installed
+hash for a kept-still-desired file so it reads as "modified" forever and is
+preserved on uninstall too.
 
 ## Verification
 
-`node --test test/driver/install-uninstall.test.js` (5 cases) +
-`npm test` (full suite). The round-trip case asserts the install root returns to
-empty after uninstall — the parity contract, now proven at the Driver level.
+`node --test test/driver/install-uninstall.test.js` (5) +
+`test/driver/update.test.js` (2) + `test/kernel/reconciler-update.test.js` (5),
+plus `npm test` (full suite, **50**). The round-trip cases assert the install
+root returns to empty after uninstall — including after an update — the parity
+contract, proven at the Driver level.

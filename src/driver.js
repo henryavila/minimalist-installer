@@ -4,7 +4,7 @@ import {
   removeManifest,
   MANIFEST_DIR,
 } from './manifest.js';
-import { recordEffect, replayReverse } from './kernel/journal.js';
+import { readEffects, recordEffect, replayReverse } from './kernel/journal.js';
 
 // The Driver is identical for every consumer. It runs the configured providers to
 // emit effects, applies each effect, journals its before-state on the manifest,
@@ -24,6 +24,21 @@ export const createDriver = ({ registry, providers, manifestDir = MANIFEST_DIR }
 
   return {
     install(config, { projectDir }) {
+      // On re-install, each effect's prior before-state is threaded into its
+      // apply as `previous` so it can reconcile against what it last installed
+      // (the file effect uses it for 3-hash update + orphan removal). Prior
+      // entries are matched to new ones by (type, occurrence order); providers
+      // are pure planners so that order is stable across installs.
+      const priorByType = new Map();
+      const prior = readManifest(projectDir, manifestDir);
+      if (prior) {
+        for (const { type, beforeState } of readEffects(prior)) {
+          if (!priorByType.has(type)) priorByType.set(type, []);
+          priorByType.get(type).push(beforeState);
+        }
+      }
+
+      const cursor = new Map();
       let manifest = {};
 
       for (const { type, args } of planEffects(config, projectDir)) {
@@ -31,7 +46,12 @@ export const createDriver = ({ registry, providers, manifestDir = MANIFEST_DIR }
         if (!effect) {
           throw new Error(`Provider emitted an unregistered effect type "${type}"`);
         }
-        const beforeState = effect.apply(args);
+        const occurrence = cursor.get(type) ?? 0;
+        cursor.set(type, occurrence + 1);
+        const previous = priorByType.get(type)?.[occurrence];
+        const applyArgs = previous === undefined ? args : { ...args, previous };
+
+        const beforeState = effect.apply(applyArgs);
         manifest = recordEffect(manifest, { type, beforeState });
       }
 

@@ -57,17 +57,48 @@ const pruneEmptyParents = (absPath, basePath) => {
 export const createReconcileFileSetEffect = () => ({
   type: 'reconcileFileSet',
 
-  apply({ basePath, desired }) {
-    return desired.map(({ path, content }) => {
+  // `previous` is the beforeState of the prior apply (the previously-installed
+  // file set). On a greenfield install it is empty and every desired file is
+  // written. On update it drives the non-interactive 3-hash policy ported from
+  // the legacy installer: a file the user modified since we installed it is kept
+  // as-is (no clobber); files dropped from the desired set are removed only when
+  // still unmodified (no proof-less deletion of user content).
+  apply({ basePath, desired, previous = [] }) {
+    const prevHashByPath = new Map(
+      previous.map(({ path, installedHash }) => [path, installedHash]),
+    );
+    const desiredPaths = new Set(desired.map(({ path }) => path));
+    const beforeState = [];
+
+    for (const { path, content } of desired) {
       const absPath = resolveWithinBase(basePath, path);
+      const prevHash = prevHashByPath.get(path);
+
+      if (prevHash !== undefined && existsSync(absPath)) {
+        const currentHash = hashContent(readFileSync(absPath, 'utf8'));
+        if (currentHash !== prevHash) {
+          // User edited a file we installed — keep theirs, track their hash.
+          beforeState.push({ path, installedHash: currentHash });
+          continue;
+        }
+      }
+
       mkdirSync(dirname(absPath), { recursive: true });
       writeFileSync(absPath, content, 'utf8');
+      beforeState.push({ path, installedHash: hashContent(content) });
+    }
 
-      return {
-        path,
-        installedHash: hashContent(content),
-      };
-    });
+    for (const { path, installedHash } of previous) {
+      if (desiredPaths.has(path)) continue;
+      const absPath = resolveWithinBase(basePath, path);
+      if (!existsSync(absPath)) continue;
+      if (hashContent(readFileSync(absPath, 'utf8')) === installedHash) {
+        unlinkSync(absPath);
+        pruneEmptyParents(absPath, basePath);
+      }
+    }
+
+    return beforeState;
   },
 
   revert({ basePath }, beforeState) {
