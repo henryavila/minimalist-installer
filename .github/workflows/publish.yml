@@ -1,0 +1,32 @@
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+
+# OIDC Trusted Publishing — no npm token needed once the package is configured
+# for trusted publishing on npmjs.com (Settings → Trusted Publisher → this repo +
+# workflow). The first publish is manual (npm publish with a token); every release
+# after that is automatic here.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # node >= 21 — the test script uses node's recursive `--test` glob.
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: npm install -g npm@latest
+      - run: npm ci
+      - run: npm test
+
+      # No NODE_AUTH_TOKEN — OIDC provides auth via id-token.
+      - run: npm publish --provenance --access public

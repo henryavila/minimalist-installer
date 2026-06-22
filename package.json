@@ -1,8 +1,16 @@
 {
-  "name": "@henryavila/tooling-installer",
+  "name": "@henryavila/minimalist-installer",
   "version": "0.1.0",
   "description": "Reversible, userland installer engine for CLI tools and AI skills. Reconciles a target directory tree to a declarative set of rendered files + config mutations; every mutation reverts byte-for-byte. No OS integration (no registry, services, daemons, or system PATH).",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/henryavila/minimalist-installer.git"
+  },
+  "homepage": "https://github.com/henryavila/minimalist-installer#readme",
+  "bugs": {
+    "url": "https://github.com/henryavila/minimalist-installer/issues"
+  },
   "exports": {
     ".": "./src/index.js"
   },

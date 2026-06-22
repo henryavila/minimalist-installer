@@ -1,4 +1,4 @@
-# @henryavila/tooling-installer
+# @henryavila/minimalist-installer
 
 A reversible, **userland** installer engine for CLI tools and AI skills.
 
@@ -6,6 +6,11 @@ It reconciles a target directory tree (a project repo or `$HOME`) to a
 declaratively-defined set of **rendered files + structured config mutations**,
 and every mutation it makes knows how to undo itself. A clean uninstall is a
 property of the engine, not code each consumer writes.
+
+It is *minimalist* by design: it writes files and merges config in userland and
+nothing more — no OS integration, no package management, no template engine, no
+multi-machine transactions. Small surface, strong guarantee (byte-for-byte
+round-trip).
 
 ## What it is
 
@@ -32,11 +37,16 @@ property of the engine, not code each consumer writes.
 - **Not** a transactional multi-machine rollback system — the scope is one local,
   reversible installation.
 
+## Install
+
+```sh
+npm install @henryavila/minimalist-installer
+```
+
 ## Status
 
-**v0.1.0 — early.** This is the engine core extracted from `@henryavila/atomic-skills`
-(its first consumer), which will depend on it via a local link until the API
-stabilizes, then via the npm release.
+**v0.1.0.** The engine core, extracted from `@henryavila/atomic-skills` (its first
+consumer) and now published to npm.
 
 Delivered: the effect kernel + journal + 3-hash file reconciler + the three
 built-in non-file effects (`json-merge`, `refcount`, `legacy-prune`), each with a
@@ -47,9 +57,8 @@ two-tier config factory); and a **runtime-layer worked example**
 ([`examples/symlink-runtime-layer.js`](examples/symlink-runtime-layer.js)) — see
 [`docs/design/provider-driver.md`](docs/design/provider-driver.md).
 
-Next: the first consumer (`@henryavila/atomic-skills`) wires onto this package via
-a `file:` link and proves round-trip parity through the dependency. There is no
-CLI — this is a **library**; the consumer owns its own CLI (lib-only by design).
+There is no CLI — this is a **library**; the consumer owns its own CLI (lib-only
+by design).
 
 ## API
 
@@ -67,7 +76,7 @@ import {
   replayReverse,
   readManifest,
   writeManifest,
-} from '@henryavila/tooling-installer';
+} from '@henryavila/minimalist-installer';
 ```
 
 - **`defineInstaller({ config, providers, effects })`** — two-tier config factory:
@@ -100,7 +109,7 @@ import {
 ## Test
 
 ```sh
-npm test    # node --test "test/**/*.test.js"
+npm test    # node --test "test/**/*.test.js"  (requires Node >= 21 for glob expansion)
 ```
 
 ## License

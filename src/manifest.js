@@ -13,7 +13,7 @@ import { join } from 'node:path';
 // overrides it via the `manifestDir` argument to point at its own location
 // (atomic-skills uses `.atomic-skills`). The engine itself never hardcodes a
 // consumer-specific name.
-export const MANIFEST_DIR = '.tooling-installer';
+export const MANIFEST_DIR = '.minimalist-installer';
 export const MANIFEST_FILE = 'manifest.json';
 
 export function readManifest(projectDir, manifestDir = MANIFEST_DIR) {

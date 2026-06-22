@@ -1,4 +1,4 @@
-// @henryavila/tooling-installer — public API surface.
+// @henryavila/minimalist-installer — public API surface.
 //
 // The reversible, userland file+config installer engine. Consumers compose
 // these primitives; they never write uninstall logic — reversibility is a
