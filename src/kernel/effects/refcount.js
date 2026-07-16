@@ -1,51 +1,67 @@
 import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
+  openSync,
+  closeSync,
   readdirSync,
   rmdirSync,
-  unlinkSync,
-  writeFileSync,
+  constants,
+  existsSync,
 } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { join } from 'node:path';
 
 import { hashContent } from '../../hash.js';
+import {
+  assertLexicalWithinBase,
+  existsNoFollow,
+  readFileNoFollow,
+  writeFileNoFollow,
+  unlinkNoFollow,
+  pruneEmptyParentsNoFollow,
+  openParentNoFollow,
+  PathSafetyError,
+} from '../../path-safety.js';
 
-const resolveWithinBase = (basePath, path) => {
-  const base = resolve(basePath);
-  const absPath = join(basePath, path);
-  const resolved = resolve(absPath);
-  if (resolved !== base && !resolved.startsWith(base + sep)) {
-    throw new Error(`Refusing to operate outside basePath: "${path}"`);
-  }
-  return absPath;
-};
-
-const pruneEmptyParents = (absPath, basePath) => {
-  const base = resolve(basePath);
-  let parent = dirname(resolve(absPath));
-
-  while (parent !== base && parent !== '.') {
+const listDirNoFollow = (basePath, dirRel) => {
+  const handle = openParentNoFollow(basePath, dirRel, { createParents: false });
+  try {
+    const p = `/proc/self/fd/${handle.parentFd}/${handle.leafName}`;
+    let fd;
     try {
-      if (readdirSync(parent).length === 0) {
-        rmdirSync(parent);
-        parent = dirname(parent);
-      } else {
-        break;
+      fd = openSync(p, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    } catch (err) {
+      if (err.code === 'ENOENT') return null;
+      if (err.code === 'ELOOP' || err.code === 'ENOTDIR') {
+        throw new PathSafetyError(
+          'UNSAFE_PATH_RACE',
+          `Refusing to list symlink directory "${dirRel}"`,
+          { causeCode: err.code },
+        );
       }
-    } catch {
-      break;
+      throw err;
     }
+    try {
+      return readdirSync(p);
+    } finally {
+      closeSync(fd);
+    }
+  } finally {
+    handle.close();
   }
 };
 
-const pruneOrphanMarkers = (absOwnersDir) => {
-  for (const marker of readdirSync(absOwnersDir)) {
-    const markerPath = join(absOwnersDir, marker);
-    const ownerManifestPath = readFileSync(markerPath, 'utf8').trim();
-
+const pruneOrphanMarkers = (basePath, ownersDir) => {
+  const markers = listDirNoFollow(basePath, ownersDir);
+  if (!markers) return;
+  for (const marker of markers) {
+    const markerRel = join(ownersDir, marker).replace(/\\/g, '/');
+    let ownerManifestPath;
+    try {
+      ownerManifestPath = readFileNoFollow(basePath, markerRel, 'utf8').trim();
+    } catch {
+      continue;
+    }
+    // ownerManifestPath is absolute and outside the install base — plain exists is OK.
     if (!existsSync(ownerManifestPath)) {
-      unlinkSync(markerPath);
+      unlinkNoFollow(basePath, markerRel);
     }
   }
 };
@@ -54,33 +70,40 @@ export const createRefcountEffect = () => ({
   type: 'refcount',
 
   apply({ basePath, ownersDir, ownerId, ownerManifestPath }) {
-    const absOwnersDir = resolveWithinBase(basePath, ownersDir);
+    assertLexicalWithinBase(basePath, ownersDir);
     const ownerKey = hashContent(ownerId);
-    const markerPath = join(absOwnersDir, ownerKey);
-    const markerExisted = existsSync(markerPath);
+    const markerRel = join(ownersDir, ownerKey).replace(/\\/g, '/');
+    assertLexicalWithinBase(basePath, markerRel);
+    const markerExisted = existsNoFollow(basePath, markerRel);
 
-    mkdirSync(absOwnersDir, { recursive: true });
-    writeFileSync(markerPath, `${ownerManifestPath}\n`, 'utf8');
+    writeFileNoFollow(basePath, markerRel, `${ownerManifestPath}\n`, { atomic: true });
 
     return { ownerKey, markerExisted, ownersDir };
   },
 
-  revert({ basePath, ownersDir }, beforeState) {
-    const absOwnersDir = resolveWithinBase(basePath, ownersDir);
+  revert({ basePath }, beforeState) {
+    const ownersDir = beforeState.ownersDir;
+    assertLexicalWithinBase(basePath, ownersDir);
 
     if (!beforeState.markerExisted) {
-      const markerPath = join(absOwnersDir, beforeState.ownerKey);
-      if (existsSync(markerPath)) {
-        unlinkSync(markerPath);
+      const markerRel = join(ownersDir, beforeState.ownerKey).replace(/\\/g, '/');
+      if (existsNoFollow(basePath, markerRel)) {
+        unlinkNoFollow(basePath, markerRel);
       }
     }
 
-    if (existsSync(absOwnersDir)) {
-      pruneOrphanMarkers(absOwnersDir);
+    if (existsNoFollow(basePath, ownersDir)) {
+      pruneOrphanMarkers(basePath, ownersDir);
 
-      if (readdirSync(absOwnersDir).length === 0) {
-        rmdirSync(absOwnersDir);
-        pruneEmptyParents(absOwnersDir, basePath);
+      const remaining = listDirNoFollow(basePath, ownersDir);
+      if (remaining && remaining.length === 0) {
+        const handle = openParentNoFollow(basePath, ownersDir, { createParents: false });
+        try {
+          rmdirSync(`/proc/self/fd/${handle.parentFd}/${handle.leafName}`);
+        } finally {
+          handle.close();
+        }
+        pruneEmptyParentsNoFollow(basePath, ownersDir);
         return { lastOwnerReleased: true };
       }
     }
