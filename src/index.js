@@ -48,6 +48,7 @@ export {
   ERR_UNSAFE_PATH_RACE,
   ERR_PATH_ESCAPE,
   ERR_GREENFIELD_CONFLICT,
+  ERR_UNSUPPORTED_PLATFORM,
   writeFileNoFollow,
   readFileNoFollow,
   unlinkNoFollow,
@@ -57,6 +58,7 @@ export {
   entryPath,
   assertLexicalWithinBase,
   getPathSafetyBackend,
+  resetPathSafetyBackendForTests,
 } from './path-safety.js';
 
 // Canonical resource locks + recovery / inspect.

@@ -116,14 +116,15 @@ function detectBackend() {
   if (probeFdRelativePrefix('/dev/fd')) {
     return { kind: 'fd-relative', prefix: '/dev/fd' };
   }
-  // macOS and other Unix: O_NOFOLLOW component walk (no symlink following).
-  if (typeof constants.O_NOFOLLOW === 'number' && process.platform !== 'win32') {
+  // macOS / Windows / other hosts without fd-relative mounts: O_NOFOLLOW walk.
+  // Never follows symlinks; weaker only against concurrent rename TOCTOU.
+  if (typeof constants.O_NOFOLLOW === 'number') {
     return { kind: 'path-nofollow' };
   }
   throw new PathSafetyError(
     ERR_UNSUPPORTED_PLATFORM,
     'No-follow mutations require an fd-relative mount (/proc/self/fd or /dev/fd) '
-    + 'or Unix O_NOFOLLOW. Refusing platforms that cannot refuse symlink follow.',
+    + 'or fs.constants.O_NOFOLLOW. Refusing platforms that cannot refuse symlink follow.',
   );
 }
 
