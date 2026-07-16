@@ -17,13 +17,14 @@ import {
   unlinkNoFollow,
   pruneEmptyParentsNoFollow,
   openParentNoFollow,
+  entryPath,
   PathSafetyError,
 } from '../../path-safety.js';
 
 const listDirNoFollow = (basePath, dirRel) => {
   const handle = openParentNoFollow(basePath, dirRel, { createParents: false });
   try {
-    const p = `/proc/self/fd/${handle.parentFd}/${handle.leafName}`;
+    const p = entryPath(handle, handle.leafName);
     let fd;
     try {
       fd = openSync(p, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -99,7 +100,7 @@ export const createRefcountEffect = () => ({
       if (remaining && remaining.length === 0) {
         const handle = openParentNoFollow(basePath, ownersDir, { createParents: false });
         try {
-          rmdirSync(`/proc/self/fd/${handle.parentFd}/${handle.leafName}`);
+          rmdirSync(entryPath(handle, handle.leafName));
         } finally {
           handle.close();
         }

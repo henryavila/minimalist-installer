@@ -54,7 +54,9 @@ export {
   existsNoFollow,
   atomicWriteJsonNoFollow,
   openParentNoFollow,
+  entryPath,
   assertLexicalWithinBase,
+  getPathSafetyBackend,
 } from './path-safety.js';
 
 // Canonical resource locks + recovery / inspect.

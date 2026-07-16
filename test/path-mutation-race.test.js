@@ -11,6 +11,8 @@ import {
   PathSafetyError,
   writeFileNoFollow,
   openParentNoFollow,
+  getPathSafetyBackend,
+  resetPathSafetyBackendForTests,
 } from '../src/path-safety.js';
 
 describe('path mutation race', () => {
@@ -18,6 +20,8 @@ describe('path mutation race', () => {
   afterEach(() => {
     if (root) rmSync(root, { recursive: true, force: true });
     root = undefined;
+    delete process.env.MINIMALIST_INSTALLER_PATH_BACKEND;
+    resetPathSafetyBackendForTests();
   });
 
   it('temp→rename refuses when leaf becomes a symlink before rename', () => {
@@ -79,8 +83,50 @@ describe('path mutation race', () => {
     try {
       assert.equal(handle.leafName, 'c.txt');
       assert.ok(typeof handle.parentFd === 'number');
+      assert.ok(typeof handle.parentAbs === 'string');
     } finally {
       handle.close();
     }
+  });
+
+  it('path-nofollow backend refuses leaf symlink (macOS-class platforms)', () => {
+    process.env.MINIMALIST_INSTALLER_PATH_BACKEND = 'path';
+    resetPathSafetyBackendForTests();
+    assert.equal(getPathSafetyBackend().kind, 'path-nofollow');
+
+    root = mkdtempSync(join(tmpdir(), 'mi-path-backend-'));
+    const basePath = join(root, 'install');
+    const outside = join(root, 'outside');
+    mkdirSync(join(basePath, 'dir'), { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    const sentinel = join(outside, 'victim.txt');
+    writeFileSync(sentinel, 'SAFE', 'utf8');
+    symlinkSync(sentinel, join(basePath, 'dir', 'target.txt'));
+
+    assert.throws(
+      () => writeFileNoFollow(basePath, 'dir/target.txt', 'PWNED', { atomic: true }),
+      (err) => err instanceof PathSafetyError && err.code === 'UNSAFE_PATH_RACE',
+    );
+    assert.equal(readFileSync(sentinel, 'utf8'), 'SAFE');
+  });
+
+  it('path-nofollow backend refuses intermediate symlink on write', () => {
+    process.env.MINIMALIST_INSTALLER_PATH_BACKEND = 'path';
+    resetPathSafetyBackendForTests();
+
+    root = mkdtempSync(join(tmpdir(), 'mi-path-mid-'));
+    const basePath = join(root, 'install');
+    const outside = join(root, 'outside');
+    mkdirSync(basePath, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    const sentinel = join(outside, 'victim.txt');
+    writeFileSync(sentinel, 'SAFE', 'utf8');
+    symlinkSync(outside, join(basePath, 'nested'));
+
+    assert.throws(
+      () => writeFileNoFollow(basePath, 'nested/victim.txt', 'PWNED', { atomic: true }),
+      (err) => err instanceof PathSafetyError && err.code === 'UNSAFE_PATH_RACE',
+    );
+    assert.equal(readFileSync(sentinel, 'utf8'), 'SAFE');
   });
 });

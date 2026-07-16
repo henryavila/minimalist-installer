@@ -5,6 +5,7 @@ import {
   writeFileNoFollow,
   unlinkNoFollow,
   openParentNoFollow,
+  entryPath,
   PathSafetyError,
   splitRelativePath,
 } from '../../path-safety.js';
@@ -30,7 +31,7 @@ const pruneEmptyParentsWithin = (basePath, fileRel, namespaceRootRel) => {
     try {
       const handle = openParentNoFollow(basePath, dirRel, { createParents: false });
       try {
-        const p = `/proc/self/fd/${handle.parentFd}/${handle.leafName}`;
+        const p = entryPath(handle, handle.leafName);
         let fd;
         try {
           fd = openSync(p, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -93,7 +94,7 @@ const walkFilesNoFollow = (basePath, rootRel, visitFile) => {
       }
       const handle = openParentNoFollow(basePath, dirRel, { createParents: false });
       try {
-        const p = `/proc/self/fd/${handle.parentFd}/${handle.leafName}`;
+        const p = entryPath(handle, handle.leafName);
         let fd;
         try {
           fd = openSync(p, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);

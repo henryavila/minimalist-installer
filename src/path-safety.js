@@ -1,13 +1,24 @@
 /**
  * No-follow path authority for installer mutations.
  *
- * All writes/unlinks/renames go through directory-handle relative operations
- * (Linux: /proc/self/fd/<dirfd>/<name> with O_NOFOLLOW). Intermediate and leaf
- * components that are symlinks fail closed with UNSAFE_PATH_RACE. Platforms
- * without /proc/self/fd fail closed — no permissive fallback.
+ * Backends (selected once per process, fail-closed if none apply):
  *
- * Check-then-use revalidation on path strings is intentionally insufficient:
- * mutations never use a post-validation absolute path for the kernel op.
+ * 1. **fd-relative** — open a parent directory fd, then operate on
+ *    `<prefix>/<dirfd>/<name>` with O_NOFOLLOW. Prefix is `/proc/self/fd`
+ *    (Linux) or `/dev/fd` when a runtime probe proves relative child ops work
+ *    (some BSDs). Holds directory identity across renames; strongest TOCTOU
+ *    resistance without a native openat binding.
+ *
+ * 2. **path-nofollow** — component walk opening each intermediate with
+ *    O_DIRECTORY|O_NOFOLLOW, then leaf ops with O_NOFOLLOW on the absolute
+ *    path under the verified parent. Blocks pre-placed intermediate/leaf
+ *    symlinks (the realistic installer threat). Weaker against concurrent
+ *    rename races between parent open and path-based child open — used when
+ *    no fd-relative mount exists (macOS, and other Unix without proc/fdesc
+ *    child lookup). Never a "follow-symlinks" fallback.
+ *
+ * Check-then-use revalidation on path strings alone is intentionally
+ * insufficient: every open of a mutable component uses O_NOFOLLOW.
  */
 import {
   openSync,
@@ -23,8 +34,12 @@ import {
   readdirSync,
   constants,
   existsSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
 } from 'node:fs';
 import { join, resolve, sep, posix } from 'node:path';
+import { tmpdir } from 'node:os';
 
 export const ERR_UNSAFE_PATH_RACE = 'UNSAFE_PATH_RACE';
 export const ERR_PATH_ESCAPE = 'PATH_ESCAPE';
@@ -40,20 +55,109 @@ export class PathSafetyError extends Error {
   constructor(code, message, details = {}) {
     super(message);
     this.name = 'PathSafetyError';
-    this.code = code;
     this.details = details;
+    this.code = code;
   }
 }
 
-const hasProcFd = () => existsSync('/proc/self/fd');
+/**
+ * Probe whether `<prefix>/<dirfd>/<name>` can create/open files relative to an
+ * open directory fd (Linux procfs and some fdescfs implementations).
+ * @param {string} prefix
+ * @returns {boolean}
+ */
+function probeFdRelativePrefix(prefix) {
+  if (!existsSync(prefix)) return false;
+  let probeRoot;
+  let dirFd;
+  try {
+    probeRoot = mkdtempSync(join(tmpdir(), 'mi-fd-probe-'));
+    dirFd = openSync(probeRoot, constants.O_RDONLY | constants.O_DIRECTORY);
+    const child = `${prefix}/${dirFd}/.probe-${process.pid}`;
+    writeFileSync(child, 'ok');
+    unlinkSync(child);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (dirFd != null) {
+      try { closeSync(dirFd); } catch { /* ignore */ }
+    }
+    if (probeRoot) {
+      try { rmSync(probeRoot, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }
+}
+
+/**
+ * @returns {{ kind: 'fd-relative', prefix: string } | { kind: 'path-nofollow' }}
+ */
+function detectBackend() {
+  const forced = process.env.MINIMALIST_INSTALLER_PATH_BACKEND;
+  if (forced === 'path' || forced === 'path-nofollow') {
+    if (typeof constants.O_NOFOLLOW !== 'number') {
+      throw new PathSafetyError(
+        ERR_UNSUPPORTED_PLATFORM,
+        'Forced path-nofollow backend requires O_NOFOLLOW.',
+      );
+    }
+    return { kind: 'path-nofollow' };
+  }
+  if (forced === 'proc') {
+    return { kind: 'fd-relative', prefix: '/proc/self/fd' };
+  }
+  if (forced === 'devfd') {
+    return { kind: 'fd-relative', prefix: '/dev/fd' };
+  }
+
+  if (probeFdRelativePrefix('/proc/self/fd')) {
+    return { kind: 'fd-relative', prefix: '/proc/self/fd' };
+  }
+  if (probeFdRelativePrefix('/dev/fd')) {
+    return { kind: 'fd-relative', prefix: '/dev/fd' };
+  }
+  // macOS and other Unix: O_NOFOLLOW component walk (no symlink following).
+  if (typeof constants.O_NOFOLLOW === 'number' && process.platform !== 'win32') {
+    return { kind: 'path-nofollow' };
+  }
+  throw new PathSafetyError(
+    ERR_UNSUPPORTED_PLATFORM,
+    'No-follow mutations require an fd-relative mount (/proc/self/fd or /dev/fd) '
+    + 'or Unix O_NOFOLLOW. Refusing platforms that cannot refuse symlink follow.',
+  );
+}
+
+/** @type {{ kind: 'fd-relative', prefix: string } | { kind: 'path-nofollow' } | null} */
+let cachedBackend = null;
+
+export function getPathSafetyBackend() {
+  if (!cachedBackend) cachedBackend = detectBackend();
+  return cachedBackend;
+}
+
+/** Test-only: clear cached backend selection. */
+export function resetPathSafetyBackendForTests() {
+  cachedBackend = null;
+}
 
 export function assertNoFollowPlatform() {
-  if (!hasProcFd()) {
-    throw new PathSafetyError(
-      ERR_UNSUPPORTED_PLATFORM,
-      'No-follow mutations require /proc/self/fd (Linux). Refusing permissive fallback.',
-    );
+  getPathSafetyBackend();
+}
+
+/**
+ * Path of a directory entry relative to an open parent directory handle.
+ * Prefer fd-relative paths; path-nofollow uses absolute parent + name.
+ *
+ * @param {{ parentFd: number, parentAbs: string }} handle
+ * @param {string} name
+ * @returns {string}
+ */
+export function entryPath(handle, name) {
+  const backend = getPathSafetyBackend();
+  if (backend.kind === 'fd-relative') {
+    return `${backend.prefix}/${handle.parentFd}/${name}`;
   }
+  return join(handle.parentAbs, name);
 }
 
 /**
@@ -104,10 +208,6 @@ export function assertLexicalWithinBase(basePath, relativePath) {
   return absPath;
 }
 
-function procPath(dirFd, name) {
-  return `/proc/self/fd/${dirFd}/${name}`;
-}
-
 function openDirFd(pathOrProc, { noFollow = false } = {}) {
   const flags = constants.O_RDONLY | constants.O_DIRECTORY | (noFollow ? constants.O_NOFOLLOW : 0);
   try {
@@ -142,10 +242,26 @@ export function openBaseDir(basePath) {
 }
 
 /**
+ * Build the path used to open a child of the current parent under the active backend.
+ * @param {number} parentFd
+ * @param {string} parentAbs
+ * @param {string} part
+ */
+function childEntryPath(parentFd, parentAbs, part) {
+  return entryPath({ parentFd, parentAbs }, part);
+}
+
+/**
  * Walk components under base with O_NOFOLLOW. Optionally create missing dirs.
  * Returns a handle for the parent directory of the leaf and the leaf name.
  *
- * @returns {{ parentFd: number, leafName: string, close: () => void, components: string[] }}
+ * @returns {{
+ *   parentFd: number,
+ *   parentAbs: string,
+ *   leafName: string,
+ *   close: () => void,
+ *   components: string[],
+ * }}
  */
 export function openParentNoFollow(basePath, relativePath, { createParents = false } = {}) {
   assertNoFollowPlatform();
@@ -155,15 +271,17 @@ export function openParentNoFollow(basePath, relativePath, { createParents = fal
   const dirParts = components.slice(0, -1);
 
   const fds = [];
+  const baseAbs = resolve(basePath);
   const baseFd = openBaseDir(basePath);
   fds.push(baseFd);
   let currentFd = baseFd;
+  let currentAbs = baseAbs;
 
   for (const part of dirParts) {
-    const childProc = procPath(currentFd, part);
+    const childPath = childEntryPath(currentFd, currentAbs, part);
     let childFd;
     try {
-      childFd = openDirFd(childProc, { noFollow: true });
+      childFd = openDirFd(childPath, { noFollow: true });
     } catch (err) {
       if (err instanceof PathSafetyError) {
         for (const fd of fds.reverse()) closeSync(fd);
@@ -171,7 +289,7 @@ export function openParentNoFollow(basePath, relativePath, { createParents = fal
       }
       if (err.code === 'ENOENT' && createParents) {
         try {
-          mkdirSync(childProc);
+          mkdirSync(childPath);
         } catch (mkdirErr) {
           if (mkdirErr.code !== 'EEXIST') {
             for (const fd of fds.reverse()) closeSync(fd);
@@ -179,7 +297,7 @@ export function openParentNoFollow(basePath, relativePath, { createParents = fal
           }
         }
         try {
-          childFd = openDirFd(childProc, { noFollow: true });
+          childFd = openDirFd(childPath, { noFollow: true });
         } catch (err2) {
           for (const fd of fds.reverse()) closeSync(fd);
           if (err2 instanceof PathSafetyError) throw err2;
@@ -214,10 +332,12 @@ export function openParentNoFollow(basePath, relativePath, { createParents = fal
     }
     fds.push(childFd);
     currentFd = childFd;
+    currentAbs = join(currentAbs, part);
   }
 
   return {
     parentFd: currentFd,
+    parentAbs: currentAbs,
     leafName,
     components,
     close() {
@@ -251,7 +371,7 @@ export function existsNoFollow(basePath, relativePath) {
     throw err;
   }
   try {
-    const p = procPath(handle.parentFd, handle.leafName);
+    const p = entryPath(handle, handle.leafName);
     try {
       const fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW);
       closeSync(fd);
@@ -286,7 +406,7 @@ export function existsNoFollow(basePath, relativePath) {
 export function readFileNoFollow(basePath, relativePath, encoding = 'utf8') {
   const handle = openParentNoFollow(basePath, relativePath, { createParents: false });
   try {
-    const p = procPath(handle.parentFd, handle.leafName);
+    const p = entryPath(handle, handle.leafName);
     let fd;
     try {
       fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -329,7 +449,7 @@ export function writeFileNoFollow(basePath, relativePath, content, {
     if (!atomic || exclusive) {
       const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW
         | (exclusive ? constants.O_EXCL : constants.O_TRUNC);
-      const p = procPath(handle.parentFd, handle.leafName);
+      const p = entryPath(handle, handle.leafName);
       let fd;
       try {
         fd = openSync(p, flags, mode);
@@ -348,7 +468,7 @@ export function writeFileNoFollow(basePath, relativePath, content, {
     // Atomic: write temp in same dir, fsync, rename over target (rename fails if target is dir;
     // O_NOFOLLOW on temp create; rename of temp→dest where dest is symlink replaces the symlink entry).
     const tmpName = `.${handle.leafName}.tmp-${process.pid}-${Date.now()}`;
-    const tmpProc = procPath(handle.parentFd, tmpName);
+    const tmpProc = entryPath(handle, tmpName);
     let fd;
     try {
       fd = openSync(tmpProc, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
@@ -368,7 +488,7 @@ export function writeFileNoFollow(basePath, relativePath, content, {
       // open O_NOFOLLOW first when the entry exists.
       try {
         const existing = openSync(
-          procPath(handle.parentFd, handle.leafName),
+          entryPath(handle, handle.leafName),
           constants.O_RDONLY | constants.O_NOFOLLOW,
         );
         closeSync(existing);
@@ -391,7 +511,7 @@ export function writeFileNoFollow(basePath, relativePath, content, {
           }
         }
       }
-      renameSync(tmpProc, procPath(handle.parentFd, handle.leafName));
+      renameSync(tmpProc, entryPath(handle, handle.leafName));
     } catch (err) {
       try { unlinkSync(tmpProc); } catch { /* ignore */ }
       if (err instanceof PathSafetyError) throw err;
@@ -405,7 +525,7 @@ export function writeFileNoFollow(basePath, relativePath, content, {
 export function unlinkNoFollow(basePath, relativePath) {
   const handle = openParentNoFollow(basePath, relativePath, { createParents: false });
   try {
-    const p = procPath(handle.parentFd, handle.leafName);
+    const p = entryPath(handle, handle.leafName);
     // Refuse to operate if leaf is a symlink (unlink would remove the link itself,
     // which is actually safe for not following — but for prune of "our" files we
     // only delete regular files we can open with O_NOFOLLOW).
@@ -464,7 +584,7 @@ export function pruneEmptyParentsNoFollow(basePath, relativePath) {
     try {
       const handle = openParentNoFollow(basePath, dirRel, { createParents: false });
       try {
-        const p = procPath(handle.parentFd, handle.leafName);
+        const p = entryPath(handle, handle.leafName);
         let fd;
         try {
           fd = openSync(p, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -481,7 +601,7 @@ export function pruneEmptyParentsNoFollow(basePath, relativePath) {
         }
         try {
           // readdir via path is fine only for emptiness check after open proved not symlink —
-          // still use proc path for rmdir.
+          // still use entry path for rmdir.
           const entries = readdirSync(p);
           if (entries.length === 0) {
             closeSync(fd);
