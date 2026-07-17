@@ -57,20 +57,25 @@ export const createDriver = ({
 
         const cursor = new Map();
         // Incomplete marker preserves prior effects so a crash before the first
-        // mutation still leaves a recoverable journal; new effects replace them
-        // as they are recorded.
+        // mutation still leaves a recoverable journal. Once the first new effect
+        // applies, the on-disk journal is rebuilt from applied effects only
+        // (durable per-effect flush — F-001). journalMode marks post-U trust.
+        const txId = `${Date.now()}-${process.pid}`;
+        const startedAt = new Date().toISOString();
         let manifest = {
           journalVersion: JOURNAL_VERSION,
           effects: prior ? [...readEffects(prior)] : [],
           transaction: {
-            id: `${Date.now()}-${process.pid}`,
+            id: txId,
             state: 'incomplete',
-            startedAt: new Date().toISOString(),
+            journalMode: 'per-effect',
+            startedAt,
+            appliedCount: 0,
           },
         };
         writeManifest(projectDir, manifest, manifestDir);
 
-        // Rebuild journal for this install.
+        // Rebuild journal for this install (in memory until first successful apply).
         manifest = { ...manifest, effects: [] };
 
         for (const { type, args, id: plannedId } of planEffects(config, projectDir)) {
@@ -90,6 +95,20 @@ export const createDriver = ({
 
           const beforeState = effect.apply(applyArgs);
           manifest = recordEffect(manifest, { type, id, beforeState });
+          // F-001: after each successful apply, flush incomplete journal so
+          // crash/SIGKILL leaves disk ownership matching journaled effects.
+          // Rollback-only recovery is rejected — durability is the primary
+          // mechanism (optional in-process reverse remains a consumer choice).
+          manifest = {
+            ...manifest,
+            transaction: {
+              ...manifest.transaction,
+              state: 'incomplete',
+              journalMode: 'per-effect',
+              appliedCount: readEffects(manifest).length,
+            },
+          };
+          writeManifest(projectDir, manifest, manifestDir);
         }
 
         manifest = {
@@ -97,6 +116,8 @@ export const createDriver = ({
           transaction: {
             ...manifest.transaction,
             state: 'complete',
+            journalMode: 'per-effect',
+            appliedCount: readEffects(manifest).length,
             completedAt: new Date().toISOString(),
           },
         };

@@ -72,6 +72,7 @@ export {
 export {
   inspectTransaction,
   describeRecovery,
+  readJournaledEffects,
   assertNoIncompleteTransaction,
   TX_STATE_COMPLETE,
   TX_STATE_INCOMPLETE,

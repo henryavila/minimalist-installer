@@ -1,9 +1,14 @@
 import { describe, it, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { mkdtempSync, mkdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { defineInstaller, createFileSetProvider, inspectTransaction } from '../src/index.js';
+import {
+  defineInstaller,
+  createFileSetProvider,
+  inspectTransaction,
+  describeRecovery,
+} from '../src/index.js';
 
 describe('fault injection', () => {
   let root;
@@ -35,6 +40,14 @@ describe('fault injection', () => {
     assert.throws(() => installer.install({ projectDir: root }), /injected/);
     assert.equal(existsSync(join(root, 'skills/a.md')), true);
     assert.equal(inspectTransaction(root, '.mi').state, 'incomplete');
+
+    // F-001: the successful file-set apply must be durable on the incomplete journal
+    const onDisk = JSON.parse(readFileSync(join(root, '.mi/manifest.json'), 'utf8'));
+    assert.equal(onDisk.transaction.journalMode, 'per-effect');
+    assert.equal(onDisk.effects.length, 1);
+    assert.equal(onDisk.effects[0].type, 'reconcileFileSet');
+    assert.equal(describeRecovery(root, '.mi').effectCount, 1);
+    assert.equal(describeRecovery(root, '.mi').durablePerEffect, true);
 
     assert.throws(
       () => installer.install({ projectDir: root }),
