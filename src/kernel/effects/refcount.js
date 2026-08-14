@@ -1,9 +1,7 @@
 import {
-  openSync,
   closeSync,
   readdirSync,
   rmdirSync,
-  constants,
   existsSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -17,6 +15,7 @@ import {
   unlinkNoFollow,
   pruneEmptyParentsNoFollow,
   openParentNoFollow,
+  openDirNoFollow,
   entryPath,
   PathSafetyError,
 } from '../../path-safety.js';
@@ -27,7 +26,7 @@ const listDirNoFollow = (basePath, dirRel) => {
     const p = entryPath(handle, handle.leafName);
     let fd;
     try {
-      fd = openSync(p, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      fd = openDirNoFollow(p);
     } catch (err) {
       if (err.code === 'ENOENT') return null;
       if (err.code === 'ELOOP' || err.code === 'ENOTDIR') {

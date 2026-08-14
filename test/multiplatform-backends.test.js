@@ -9,7 +9,7 @@ import { describe, it, before, after, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
 import {
   mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, rmSync,
-  readdirSync, existsSync, constants as fsConstants,
+  readdirSync, existsSync, lstatSync, constants as fsConstants,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -66,7 +66,9 @@ describe('multiplatform path backends', () => {
   it('selects a backend without throwing on this host', () => {
     const backend = getPathSafetyBackend();
     assert.ok(
-      backend.kind === 'fd-relative' || backend.kind === 'path-nofollow',
+      backend.kind === 'fd-relative'
+        || backend.kind === 'path-nofollow'
+        || backend.kind === 'windows-noreparse',
       `unexpected backend: ${JSON.stringify(backend)}`,
     );
     if (backend.kind === 'fd-relative') {
@@ -77,10 +79,15 @@ describe('multiplatform path backends', () => {
     }
   });
 
-  it('path-nofollow is available whenever O_NOFOLLOW exists (macOS/Windows class)', () => {
-    assert.equal(typeof fsConstants.O_NOFOLLOW, 'number');
+  it('forced path backend is portable (path-nofollow or windows-noreparse)', () => {
     withBackend('path', () => {
-      assert.equal(getPathSafetyBackend().kind, 'path-nofollow');
+      const kind = getPathSafetyBackend().kind;
+      if (typeof fsConstants.O_NOFOLLOW === 'number' && fsConstants.O_NOFOLLOW !== 0) {
+        assert.equal(kind, 'path-nofollow');
+      } else {
+        assert.equal(process.platform, 'win32');
+        assert.equal(kind, 'windows-noreparse');
+      }
     });
   });
 
@@ -172,13 +179,31 @@ describe('multiplatform path backends', () => {
     });
   });
 
-  it('UNSUPPORTED_PLATFORM is only for hosts without O_NOFOLLOW and without fd mounts', () => {
-    // On every supported Node build for this package engines, O_NOFOLLOW exists.
-    assert.equal(typeof fsConstants.O_NOFOLLOW, 'number');
+  it('this host can always select a backend', () => {
     assert.doesNotThrow(() => getPathSafetyBackend());
     assert.notEqual(getPathSafetyBackend().kind, undefined);
-    // Ensure the error code symbol is exported for consumers.
     assert.equal(ERR_UNSUPPORTED_PLATFORM, 'UNSUPPORTED_PLATFORM');
+  });
+
+  it('refuses an intermediate Windows junction and does not write outside', () => {
+    if (process.platform !== 'win32') return;
+    withBackend('path', () => {
+      root = mkdtempSync(join(tmpdir(), 'mi-mp-junc-'));
+      const base = join(root, 'base');
+      const outside = join(root, 'out');
+      mkdirSync(base, { recursive: true });
+      mkdirSync(outside, { recursive: true });
+      const sentinel = join(outside, 'secret.txt');
+      writeFileSync(sentinel, 'SAFE');
+      symlinkSync(outside, join(base, 'linked'), 'junction');
+      assert.equal(lstatSync(join(base, 'linked')).isSymbolicLink(), true);
+      assert.throws(
+        () => writeFileNoFollow(base, 'linked/pwned.txt', 'PWNED', { atomic: true }),
+        (e) => e instanceof PathSafetyError && e.code === 'UNSAFE_PATH_RACE',
+      );
+      assert.equal(readFileSync(sentinel, 'utf8'), 'SAFE');
+      assert.equal(existsSync(join(outside, 'pwned.txt')), false);
+    });
   });
 });
 
@@ -214,11 +239,14 @@ describe('multiplatform static source guards', () => {
       src,
       /require \/proc\/self\/fd \(Linux\)\. Refusing permissive fallback/,
     );
+    assert.match(src, /windows-noreparse/);
     // Must not exclude win32 from path-nofollow when O_NOFOLLOW exists.
     assert.doesNotMatch(
       src,
       /O_NOFOLLOW === 'number' && process\.platform !== 'win32'/,
     );
+    // Must not fake kernel no-follow with a zero flag (that follows junctions).
+    assert.doesNotMatch(src, /O_NOFOLLOW['"]?\s*[:=]\s*0/);
   });
 
   it('public API exports backend introspection for consumers/tests', () => {

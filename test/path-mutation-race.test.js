@@ -92,7 +92,11 @@ describe('path mutation race', () => {
   it('path-nofollow backend refuses leaf symlink (macOS-class platforms)', () => {
     process.env.MINIMALIST_INSTALLER_PATH_BACKEND = 'path';
     resetPathSafetyBackendForTests();
-    assert.equal(getPathSafetyBackend().kind, 'path-nofollow');
+    const kind = getPathSafetyBackend().kind;
+    assert.ok(
+      kind === 'path-nofollow' || kind === 'windows-noreparse',
+      kind,
+    );
 
     root = mkdtempSync(join(tmpdir(), 'mi-path-backend-'));
     const basePath = join(root, 'install');

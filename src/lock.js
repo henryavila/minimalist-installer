@@ -14,13 +14,21 @@ import {
   unlinkSync,
   mkdirSync,
   existsSync,
+  readdirSync,
+  rmdirSync,
   constants,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
-export const DEFAULT_LOCK_ROOT = join(homedir(), '.minimalist-installer', 'locks');
+/** Live homedir — do not snapshot USERPROFILE/HOME at module load. */
+export function defaultLockRoot() {
+  return join(homedir(), '.minimalist-installer', 'locks');
+}
+
+/** @deprecated Prefer defaultLockRoot(); this is the load-time snapshot. */
+export const DEFAULT_LOCK_ROOT = defaultLockRoot();
 
 /**
  * @param {string} kind
@@ -40,6 +48,21 @@ export function lockFileName(identity) {
   return `${createHash('sha256').update(identity, 'utf8').digest('hex')}.lock`;
 }
 
+/** Best-effort: drop an empty lock dir (and empty `.minimalist-installer` parent). */
+function pruneEmptyLockRoot(lockRoot) {
+  try {
+    if (readdirSync(lockRoot).length !== 0) return;
+    rmdirSync(lockRoot);
+  } catch {
+    return;
+  }
+  const parent = dirname(lockRoot);
+  if (!parent.toLowerCase().endsWith('.minimalist-installer')) return;
+  try {
+    if (readdirSync(parent).length === 0) rmdirSync(parent);
+  } catch { /* ignore */ }
+}
+
 function isPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -57,7 +80,7 @@ function isPidAlive(pid) {
  * @returns {{ identities: string[], lockRoot: string, release: () => void }}
  */
 export function acquireLocks(identities, opts = {}) {
-  const lockRoot = resolve(opts.lockRoot ?? DEFAULT_LOCK_ROOT);
+  const lockRoot = resolve(opts.lockRoot ?? defaultLockRoot());
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const pollMs = opts.pollMs ?? 25;
 
@@ -82,6 +105,7 @@ export function acquireLocks(identities, opts = {}) {
       }
     }
     held.length = 0;
+    pruneEmptyLockRoot(lockRoot);
   };
 
   try {

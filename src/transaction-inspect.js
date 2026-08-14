@@ -1,4 +1,9 @@
 /**
  * Read-only transaction inspection (no mutation of disk).
  */
-export { inspectTransaction, describeRecovery, assertNoIncompleteTransaction } from './recovery.js';
+export {
+  inspectTransaction,
+  describeRecovery,
+  readJournaledEffects,
+  assertNoIncompleteTransaction,
+} from './recovery.js';
