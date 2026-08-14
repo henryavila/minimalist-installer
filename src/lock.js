@@ -20,7 +20,13 @@ import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
-export const DEFAULT_LOCK_ROOT = join(homedir(), '.minimalist-installer', 'locks');
+/** Live homedir — do not snapshot USERPROFILE/HOME at module load. */
+export function defaultLockRoot() {
+  return join(homedir(), '.minimalist-installer', 'locks');
+}
+
+/** @deprecated Prefer defaultLockRoot(); this is the load-time snapshot. */
+export const DEFAULT_LOCK_ROOT = defaultLockRoot();
 
 /**
  * @param {string} kind
@@ -57,7 +63,7 @@ function isPidAlive(pid) {
  * @returns {{ identities: string[], lockRoot: string, release: () => void }}
  */
 export function acquireLocks(identities, opts = {}) {
-  const lockRoot = resolve(opts.lockRoot ?? DEFAULT_LOCK_ROOT);
+  const lockRoot = resolve(opts.lockRoot ?? defaultLockRoot());
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const pollMs = opts.pollMs ?? 25;
 

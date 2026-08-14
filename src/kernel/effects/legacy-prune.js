@@ -5,16 +5,15 @@ import {
   writeFileNoFollow,
   unlinkNoFollow,
   openParentNoFollow,
+  openDirNoFollow,
   entryPath,
   PathSafetyError,
   splitRelativePath,
 } from '../../path-safety.js';
 import {
-  openSync,
   closeSync,
   readdirSync,
   rmdirSync,
-  constants,
 } from 'node:fs';
 import { join } from 'node:path';
 
@@ -34,7 +33,7 @@ const pruneEmptyParentsWithin = (basePath, fileRel, namespaceRootRel) => {
         const p = entryPath(handle, handle.leafName);
         let fd;
         try {
-          fd = openSync(p, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+          fd = openDirNoFollow(p);
         } catch (err) {
           if (err.code === 'ENOENT') continue;
           if (err.code === 'ELOOP' || err.code === 'ENOTDIR') {
@@ -97,7 +96,7 @@ const walkFilesNoFollow = (basePath, rootRel, visitFile) => {
         const p = entryPath(handle, handle.leafName);
         let fd;
         try {
-          fd = openSync(p, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+          fd = openDirNoFollow(p);
         } catch (err) {
           if (err.code === 'ENOENT') return;
           if (err.code === 'ELOOP' || err.code === 'ENOTDIR') {

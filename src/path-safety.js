@@ -17,8 +17,15 @@
  *    no fd-relative mount exists (macOS, and other Unix without proc/fdesc
  *    child lookup). Never a "follow-symlinks" fallback.
  *
- * Check-then-use revalidation on path strings alone is intentionally
- * insufficient: every open of a mutable component uses O_NOFOLLOW.
+ * 3. **windows-noreparse** — Node does not export O_NOFOLLOW/O_DIRECTORY on
+ *    win32, so every open would follow junctions. This backend walks with
+ *    lstat (no follow), refuses isSymbolicLink() at each component *inside*
+ *    the mutation (under the install lock), then opens with flags that exist
+ *    on Windows. Still weaker than kernel O_NOFOLLOW against a replace
+ *    between lstat and open; never a silent follow-symlinks fallback.
+ *
+ * Check-then-use on a path string *before* handing control to a following
+ * open is insufficient. Every mutable component is re-checked at open time.
  */
 import {
   openSync,
@@ -34,6 +41,7 @@ import {
   readdirSync,
   constants,
   existsSync,
+  lstatSync,
   mkdtempSync,
   rmSync,
   writeFileSync,
@@ -58,6 +66,95 @@ export class PathSafetyError extends Error {
     this.details = details;
     this.code = code;
   }
+}
+
+/** Kernel O_NOFOLLOW: a real non-zero flag. `0` (or a polyfill) follows. */
+function hasKernelNoFollow() {
+  return typeof constants.O_NOFOLLOW === 'number' && constants.O_NOFOLLOW !== 0;
+}
+
+function dirOpenFlags() {
+  return constants.O_RDONLY
+    | (typeof constants.O_DIRECTORY === 'number' ? constants.O_DIRECTORY : 0);
+}
+
+function refuseReparse(absPath, st) {
+  if (st.isSymbolicLink()) {
+    throw new PathSafetyError(
+      ERR_UNSAFE_PATH_RACE,
+      `Refusing to follow symlink or reparse point: "${absPath}"`,
+      { path: absPath },
+    );
+  }
+}
+
+/**
+ * Open a directory without following a reparse point / symlink.
+ * @param {string} absPath
+ * @returns {number} fd
+ */
+export function openDirNoFollow(absPath) {
+  if (hasKernelNoFollow() && typeof constants.O_DIRECTORY === 'number') {
+    try {
+      return openSync(absPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    } catch (err) {
+      if (err.code === 'ELOOP' || err.code === 'ENOTDIR') {
+        throw new PathSafetyError(
+          ERR_UNSAFE_PATH_RACE,
+          `Directory component is a symlink or reparse point: ${absPath}`,
+          { causeCode: err.code },
+        );
+      }
+      throw err;
+    }
+  }
+  let st;
+  try {
+    st = lstatSync(absPath);
+  } catch (err) {
+    throw err;
+  }
+  refuseReparse(absPath, st);
+  if (!st.isDirectory()) {
+    throw new PathSafetyError(
+      ERR_UNSAFE_PATH_RACE,
+      `Expected directory, found non-directory: "${absPath}"`,
+    );
+  }
+  return openSync(absPath, constants.O_RDONLY);
+}
+
+/**
+ * Open a leaf path without following a reparse point / symlink.
+ * @param {string} absPath
+ * @param {number} flags flags *without* O_NOFOLLOW (added when the kernel has it)
+ * @param {number} [mode]
+ * @returns {number} fd
+ */
+export function openLeafNoFollow(absPath, flags, mode) {
+  if (hasKernelNoFollow()) {
+    try {
+      return openSync(absPath, flags | constants.O_NOFOLLOW, mode);
+    } catch (err) {
+      if (err.code === 'ELOOP' || err.code === 'ENOTDIR') {
+        throw new PathSafetyError(
+          ERR_UNSAFE_PATH_RACE,
+          `Refusing to follow symlink at leaf "${absPath}"`,
+          { causeCode: err.code },
+        );
+      }
+      throw err;
+    }
+  }
+  const creat = typeof constants.O_CREAT === 'number' && (flags & constants.O_CREAT) !== 0;
+  let st = null;
+  try {
+    st = lstatSync(absPath);
+  } catch (err) {
+    if (err.code !== 'ENOENT' || !creat) throw err;
+  }
+  if (st) refuseReparse(absPath, st);
+  return openSync(absPath, flags, mode);
 }
 
 /**
@@ -90,18 +187,17 @@ function probeFdRelativePrefix(prefix) {
 }
 
 /**
- * @returns {{ kind: 'fd-relative', prefix: string } | { kind: 'path-nofollow' }}
+ * @returns {{ kind: 'fd-relative', prefix: string } | { kind: 'path-nofollow' } | { kind: 'windows-noreparse' }}
  */
 function detectBackend() {
   const forced = process.env.MINIMALIST_INSTALLER_PATH_BACKEND;
   if (forced === 'path' || forced === 'path-nofollow') {
-    if (typeof constants.O_NOFOLLOW !== 'number') {
-      throw new PathSafetyError(
-        ERR_UNSUPPORTED_PLATFORM,
-        'Forced path-nofollow backend requires O_NOFOLLOW.',
-      );
-    }
-    return { kind: 'path-nofollow' };
+    if (hasKernelNoFollow()) return { kind: 'path-nofollow' };
+    if (process.platform === 'win32') return { kind: 'windows-noreparse' };
+    throw new PathSafetyError(
+      ERR_UNSUPPORTED_PLATFORM,
+      'Forced path-nofollow backend requires O_NOFOLLOW.',
+    );
   }
   if (forced === 'proc') {
     return { kind: 'fd-relative', prefix: '/proc/self/fd' };
@@ -116,19 +212,23 @@ function detectBackend() {
   if (probeFdRelativePrefix('/dev/fd')) {
     return { kind: 'fd-relative', prefix: '/dev/fd' };
   }
-  // macOS / Windows / other hosts without fd-relative mounts: O_NOFOLLOW walk.
-  // Never follows symlinks; weaker only against concurrent rename TOCTOU.
-  if (typeof constants.O_NOFOLLOW === 'number') {
+  // macOS / Unix without fd-relative mounts: O_NOFOLLOW walk.
+  // win32 without exported O_NOFOLLOW: lstat-refuse-then-open.
+  if (hasKernelNoFollow()) {
     return { kind: 'path-nofollow' };
+  }
+  if (process.platform === 'win32') {
+    return { kind: 'windows-noreparse' };
   }
   throw new PathSafetyError(
     ERR_UNSUPPORTED_PLATFORM,
-    'No-follow mutations require an fd-relative mount (/proc/self/fd or /dev/fd) '
-    + 'or fs.constants.O_NOFOLLOW. Refusing platforms that cannot refuse symlink follow.',
+    'No-follow mutations require an fd-relative mount (/proc/self/fd or /dev/fd), '
+    + 'fs.constants.O_NOFOLLOW, or the Windows reparse-point walk. '
+    + 'Refusing platforms that cannot refuse symlink follow.',
   );
 }
 
-/** @type {{ kind: 'fd-relative', prefix: string } | { kind: 'path-nofollow' } | null} */
+/** @type {{ kind: 'fd-relative', prefix: string } | { kind: 'path-nofollow' } | { kind: 'windows-noreparse' } | null} */
 let cachedBackend = null;
 
 export function getPathSafetyBackend() {
@@ -210,9 +310,9 @@ export function assertLexicalWithinBase(basePath, relativePath) {
 }
 
 function openDirFd(pathOrProc, { noFollow = false } = {}) {
-  const flags = constants.O_RDONLY | constants.O_DIRECTORY | (noFollow ? constants.O_NOFOLLOW : 0);
+  if (noFollow) return openDirNoFollow(pathOrProc);
   try {
-    return openSync(pathOrProc, flags);
+    return openSync(pathOrProc, dirOpenFlags());
   } catch (err) {
     if (err.code === 'ELOOP' || err.code === 'ENOTDIR') {
       throw new PathSafetyError(
@@ -232,11 +332,11 @@ export function openBaseDir(basePath) {
   assertNoFollowPlatform();
   const abs = resolve(basePath);
   try {
-    return openSync(abs, constants.O_RDONLY | constants.O_DIRECTORY);
+    return openSync(abs, dirOpenFlags());
   } catch (err) {
     if (err.code === 'ENOENT') {
       mkdirSync(abs, { recursive: true });
-      return openSync(abs, constants.O_RDONLY | constants.O_DIRECTORY);
+      return openSync(abs, dirOpenFlags());
     }
     throw err;
   }
@@ -373,19 +473,28 @@ export function existsNoFollow(basePath, relativePath) {
   }
   try {
     const p = entryPath(handle, handle.leafName);
+    if (!hasKernelNoFollow()) {
+      try {
+        lstatSync(p);
+        return true;
+      } catch (err) {
+        if (err.code === 'ENOENT') return false;
+        throw err;
+      }
+    }
     try {
-      const fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const fd = openLeafNoFollow(p, constants.O_RDONLY);
       closeSync(fd);
       return true;
     } catch (err) {
       if (err.code === 'ENOENT') return false;
-      if (err.code === 'ELOOP') {
+      if (err.code === 'ELOOP' || err?.code === ERR_UNSAFE_PATH_RACE) {
         // Symlink exists at leaf — treat as present (so greenfield conflict / race can fire).
         return true;
       }
       if (err.code === 'EISDIR') {
         try {
-          const fd = openSync(p, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+          const fd = openDirNoFollow(p);
           closeSync(fd);
           return true;
         } catch (err2) {
@@ -410,7 +519,7 @@ export function readFileNoFollow(basePath, relativePath, encoding = 'utf8') {
     const p = entryPath(handle, handle.leafName);
     let fd;
     try {
-      fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW);
+      fd = openLeafNoFollow(p, constants.O_RDONLY);
     } catch (err) {
       throw mapOpenError(err, handle.leafName);
     }
@@ -448,12 +557,12 @@ export function writeFileNoFollow(basePath, relativePath, content, {
   try {
     const data = typeof content === 'string' ? Buffer.from(content, 'utf8') : content;
     if (!atomic || exclusive) {
-      const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW
+      const flags = constants.O_WRONLY | constants.O_CREAT
         | (exclusive ? constants.O_EXCL : constants.O_TRUNC);
       const p = entryPath(handle, handle.leafName);
       let fd;
       try {
-        fd = openSync(p, flags, mode);
+        fd = openLeafNoFollow(p, flags, mode);
       } catch (err) {
         throw mapOpenError(err, handle.leafName);
       }
@@ -472,7 +581,7 @@ export function writeFileNoFollow(basePath, relativePath, content, {
     const tmpProc = entryPath(handle, tmpName);
     let fd;
     try {
-      fd = openSync(tmpProc, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
+      fd = openLeafNoFollow(tmpProc, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, mode);
     } catch (err) {
       throw mapOpenError(err, tmpName);
     }
@@ -488,13 +597,13 @@ export function writeFileNoFollow(basePath, relativePath, content, {
       // But we refuse to overwrite a symlink leaf that redirects outside: detect via
       // open O_NOFOLLOW first when the entry exists.
       try {
-        const existing = openSync(
+        const existing = openLeafNoFollow(
           entryPath(handle, handle.leafName),
-          constants.O_RDONLY | constants.O_NOFOLLOW,
+          constants.O_RDONLY,
         );
         closeSync(existing);
       } catch (err) {
-        if (err.code === 'ELOOP') {
+        if (err.code === 'ELOOP' || err?.code === ERR_UNSAFE_PATH_RACE) {
           try { unlinkSync(tmpProc); } catch { /* ignore */ }
           throw new PathSafetyError(
             ERR_UNSAFE_PATH_RACE,
@@ -531,11 +640,11 @@ export function unlinkNoFollow(basePath, relativePath) {
     // which is actually safe for not following — but for prune of "our" files we
     // only delete regular files we can open with O_NOFOLLOW).
     try {
-      const fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const fd = openLeafNoFollow(p, constants.O_RDONLY);
       closeSync(fd);
     } catch (err) {
       if (err.code === 'ENOENT') return;
-      if (err.code === 'ELOOP') {
+      if (err.code === 'ELOOP' || err?.code === ERR_UNSAFE_PATH_RACE) {
         throw new PathSafetyError(
           ERR_UNSAFE_PATH_RACE,
           `Refusing to unlink symlink leaf "${handle.leafName}"`,
@@ -588,7 +697,7 @@ export function pruneEmptyParentsNoFollow(basePath, relativePath) {
         const p = entryPath(handle, handle.leafName);
         let fd;
         try {
-          fd = openSync(p, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+          fd = openDirNoFollow(p);
         } catch (err) {
           if (err.code === 'ENOENT') continue;
           if (err.code === 'ELOOP' || err.code === 'ENOTDIR') {

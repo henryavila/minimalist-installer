@@ -55,6 +55,8 @@ export {
   existsNoFollow,
   atomicWriteJsonNoFollow,
   openParentNoFollow,
+  openDirNoFollow,
+  openLeafNoFollow,
   entryPath,
   assertLexicalWithinBase,
   getPathSafetyBackend,
@@ -68,6 +70,7 @@ export {
   resourceIdentity,
   lockFileName,
   DEFAULT_LOCK_ROOT,
+  defaultLockRoot,
 } from './lock.js';
 export {
   inspectTransaction,
