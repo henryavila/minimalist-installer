@@ -13,6 +13,38 @@ def _api() -> ModuleType:
     return import_module("minimalist_installer")
 
 
+def _planning_values(api: ModuleType) -> dict[str, object]:
+    return {
+        "EffectPlan": api.EffectPlan(
+            id="skills:user",
+            type="reconcile_file_set",
+            version=1,
+            args={
+                "destination": "skills",
+                "files": [{"path": "SKILL.md", "content": "instructions"}],
+            },
+            resources=("path:/tmp/skills",),
+        ),
+        "PlanContext": api.PlanContext(
+            base_path=Path("/tmp/install"),
+            operation=api.Operation.INSTALL,
+            installation_id="installation-1",
+        ),
+        "EffectContext": api.EffectContext(
+            base_path=Path("/tmp/install"),
+            manifest_dir=Path("/tmp/state"),
+            operation=api.Operation.INSTALL,
+            transaction_id="tx-1",
+            effect_id="skills:user",
+        ),
+        "PreparedEffect": api.PreparedEffect(
+            before_state={"files": [{"path": "SKILL.md", "existed": False}]},
+            payload={"writes": [{"path": "SKILL.md", "content": "instructions"}]},
+            resources=("path:/tmp/install/SKILL.md",),
+        ),
+    }
+
+
 @pytest.mark.parametrize(
     ("value", "attribute", "replacement"),
     [
@@ -42,37 +74,77 @@ def test_public_planning_values_are_immutable(
     value: str, attribute: str, replacement: object
 ) -> None:
     api = _api()
-    operation = api.Operation
-    values = {
-        "EffectPlan": api.EffectPlan(
-            id="skills:user",
-            type="reconcile_file_set",
-            version=1,
-            args={"destination": "skills"},
-            resources=("path:/tmp/skills",),
-        ),
-        "PlanContext": api.PlanContext(
-            base_path=Path("/tmp/install"),
-            operation=operation.INSTALL,
-        ),
-        "EffectContext": api.EffectContext(
-            base_path=Path("/tmp/install"),
-            manifest_dir=Path("/tmp/state"),
-            operation=operation.INSTALL,
-            transaction_id="tx-1",
-            effect_id="skills:user",
-        ),
-        "PreparedEffect": api.PreparedEffect(
-            before_state={"existed": False},
-            payload={"content": "hello"},
-            resources=("path:/tmp/install/SKILL.md",),
-        ),
-    }
+    values = _planning_values(api)
     if replacement == "update":
-        replacement = operation.UPDATE
+        replacement = api.Operation.UPDATE
 
     with pytest.raises(FrozenInstanceError):
         setattr(values[value], attribute, replacement)
+
+
+@pytest.mark.parametrize(
+    ("value_name", "expected"),
+    [
+        (
+            "EffectPlan",
+            {
+                "id": "skills:user",
+                "type": "reconcile_file_set",
+                "version": 1,
+                "args": {
+                    "destination": "skills",
+                    "files": [
+                        {"path": "SKILL.md", "content": "instructions"},
+                    ],
+                },
+                "resources": ["path:/tmp/skills"],
+            },
+        ),
+        (
+            "PlanContext",
+            {
+                "base_path": "/tmp/install",
+                "operation": "install",
+                "installation_id": "installation-1",
+            },
+        ),
+        (
+            "EffectContext",
+            {
+                "base_path": "/tmp/install",
+                "manifest_dir": "/tmp/state",
+                "operation": "install",
+                "transaction_id": "tx-1",
+                "effect_id": "skills:user",
+            },
+        ),
+        (
+            "PreparedEffect",
+            {
+                "before_state": {
+                    "files": [{"path": "SKILL.md", "existed": False}],
+                },
+                "payload": {
+                    "writes": [
+                        {
+                            "path": "SKILL.md",
+                            "content": "instructions",
+                        },
+                    ],
+                },
+                "resources": ["path:/tmp/install/SKILL.md"],
+                "recoverable": True,
+            },
+        ),
+    ],
+)
+def test_public_planning_values_have_stable_json_representation(
+    value_name: str, expected: dict[str, object]
+) -> None:
+    api = _api()
+    value = _planning_values(api)[value_name]
+
+    assert json.loads(json.dumps(value.to_dict())) == expected
 
 
 def test_operation_results_are_immutable_and_json_serializable() -> None:
@@ -126,6 +198,9 @@ def test_operation_results_are_immutable_and_json_serializable() -> None:
     ("error_type", "code"),
     [
         ("UnsafePathError", "UNSAFE_PATH"),
+        ("GreenfieldConflictError", "GREENFIELD_CONFLICT"),
+        ("ModifiedContentError", "MODIFIED_CONTENT"),
+        ("LockTimeoutError", "LOCK_TIMEOUT"),
         ("IncompleteTransactionError", "INCOMPLETE_TRANSACTION"),
         ("CorruptManifestError", "CORRUPT_MANIFEST"),
         ("UnknownEffectError", "UNKNOWN_EFFECT"),

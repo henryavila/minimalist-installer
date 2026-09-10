@@ -55,6 +55,17 @@ class EffectPlan:
     args: Mapping[str, JsonValue]
     resources: tuple[str, ...] = ()
 
+    def to_dict(self) -> JsonObject:
+        """Return a stable JSON representation of the planned effect."""
+
+        return {
+            "id": self.id,
+            "type": self.type,
+            "version": self.version,
+            "args": _json_value(self.args),
+            "resources": list(self.resources),
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class PlanContext:
@@ -63,6 +74,15 @@ class PlanContext:
     base_path: Path
     operation: Operation
     installation_id: str | None = None
+
+    def to_dict(self) -> JsonObject:
+        """Return a stable JSON representation of the planning context."""
+
+        return {
+            "base_path": str(self.base_path),
+            "operation": self.operation.value,
+            "installation_id": self.installation_id,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +95,17 @@ class EffectContext:
     transaction_id: str
     effect_id: str
 
+    def to_dict(self) -> JsonObject:
+        """Return a stable JSON representation of the effect context."""
+
+        return {
+            "base_path": str(self.base_path),
+            "manifest_dir": str(self.manifest_dir),
+            "operation": self.operation.value,
+            "transaction_id": self.transaction_id,
+            "effect_id": self.effect_id,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class PreparedEffect:
@@ -84,6 +115,16 @@ class PreparedEffect:
     payload: JsonValue
     resources: tuple[str, ...] = ()
     recoverable: bool = True
+
+    def to_dict(self) -> JsonObject:
+        """Return a stable JSON representation suitable for the journal."""
+
+        return {
+            "before_state": _json_value(self.before_state),
+            "payload": _json_value(self.payload),
+            "resources": list(self.resources),
+            "recoverable": self.recoverable,
+        }
 
 
 @dataclass(frozen=True, slots=True)
