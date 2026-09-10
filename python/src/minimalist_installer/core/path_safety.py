@@ -4,8 +4,8 @@ The installer stores paths supplied by consumers and persisted manifests.  This
 module keeps those paths relative, refuses link-like entries, and performs
 mutations through the strongest standard-library primitives exposed by the
 current platform.  POSIX mutations are anchored to directory file descriptors;
-Windows uses component-by-component reparse-point inspection and same-directory
-atomic replacement.
+Win32 reparse points can be classified, but mutation fails closed until a fully
+handle-relative Windows backend is implemented and verified.
 """
 
 from __future__ import annotations

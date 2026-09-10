@@ -183,7 +183,10 @@ def test_backend_status_exposes_windows_release_blocker() -> None:
 
     assert status_type is not None
     assert status_function is not None
-    assert status_function(platform_name=sys.platform) is status_type.AVAILABLE
+    expected_current = (
+        status_type.UNAVAILABLE if sys.platform == "win32" else status_type.AVAILABLE
+    )
+    assert status_function(platform_name=sys.platform) is expected_current
     assert status_function(platform_name="win32") is status_type.UNAVAILABLE
     assert status_function(platform_name="unsupported-test-platform") is status_type.UNAVAILABLE
 
