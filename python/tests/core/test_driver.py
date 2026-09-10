@@ -109,6 +109,7 @@ class _Effect:
         self.journal_path = journal_path
         self.previous: list[object] = []
         self.reverted: list[str] = []
+        self.revert_checkpoints: list[str] = []
 
     def prepare(
         self,
@@ -144,8 +145,23 @@ class _Effect:
             raise RuntimeError("apply failed")
         return {"applied": effect_id}
 
-    def revert(self, context: EffectContext, before_state: object) -> None:
+    def revert(
+        self,
+        context: EffectContext,
+        before_state: object,
+        checkpoint: Any,
+    ) -> None:
+        if self.journal_path is not None:
+            journal = json.loads(self.journal_path.read_text("utf-8"))
+            entry = next(
+                item
+                for item in journal["effects"]
+                if item["id"] == context.effect_id
+            )
+            assert entry["status"] == "prepared"
         self.events.append(f"revert:{context.effect_id}")
+        checkpoint.write("inside-revert", {"effect_id": context.effect_id})
+        self.revert_checkpoints.append(context.effect_id)
         self.reverted.append(context.effect_id)
 
 
@@ -706,6 +722,7 @@ def test_uninstall_validates_all_versions_then_replays_in_reverse_order(
         "locks:released",
     ]
     assert result.reverted == ("b", "a")
+    assert effect.revert_checkpoints == ["b", "a"]
     assert not (tmp_path / "state/manifest.json").exists()
 
 
@@ -752,3 +769,39 @@ def test_define_installer_exposes_structured_library_operations(tmp_path: Path) 
     assert installed.operation is Operation.INSTALL
     assert removed.operation is Operation.UNINSTALL
     assert removed.status is OperationStatus.COMPLETED
+
+
+def test_status_reads_manifest_and_wal_under_one_root_authority(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    def commit_before_status_reads() -> None:
+        filesystem = SafeFilesystem(tmp_path)
+        ManifestRepository(filesystem, manifest_directory="state").commit(
+            installation_id="install-1",
+            consumer="tests",
+            consumer_version="1",
+            transaction_id="committed-tx",
+            engine_version="0.1.0",
+            effects=(),
+        )
+        filesystem.close()
+
+    locks = _LockManager(events, on_enters=(commit_before_status_reads,))
+    driver = _driver(
+        tmp_path,
+        _Provider(events, lambda _config, _context: (_plan("unused"),)),
+        _Effect(events),
+        locks,
+        (),
+    )
+
+    status = driver.status(base_path=tmp_path)
+
+    assert locks.acquisitions == [
+        (canonical_resource_identity("path", tmp_path),)
+    ]
+    assert status.installed is True
+    assert status.installation_id == "install-1"
+    assert status.incomplete_transaction_id is None

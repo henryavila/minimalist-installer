@@ -302,4 +302,5 @@ class Effect(Protocol):
         self,
         context: EffectContext,
         before_state: JsonValue,
+        checkpoint: CheckpointWriter,
     ) -> None: ...

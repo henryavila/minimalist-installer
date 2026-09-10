@@ -383,6 +383,12 @@ class Driver:
                             raise InvalidEffectError(
                                 f'effect "{plan.type}" is not recoverable in durable mode'
                             )
+                        prepared = replace(
+                            prepared,
+                            resources=canonicalize_resources(
+                                prepared.resources
+                            ),
+                        )
                         self._ensure_prepared_resources_locked(prepared, resources)
                         transactions.record_prepared(
                             transaction_id, plan.id, prepared
@@ -412,7 +418,7 @@ class Driver:
 
                     transactions.checkpoint(transaction_id, "effects_applied")
                     transactions.checkpoint(transaction_id, "committing")
-                    manifests.commit(
+                    committed = manifests.commit(
                         installation_id=installation_id,
                         consumer=self.consumer,
                         consumer_version=self.consumer_version,
@@ -421,7 +427,10 @@ class Driver:
                         effects=records,
                     )
                     transactions.checkpoint(transaction_id, "manifest_committed")
-                    transactions.complete(transaction_id)
+                    transactions.complete(
+                        transaction_id,
+                        committed_transaction_id=committed.transaction_id,
+                    )
 
                     return OperationResult(
                         operation=operation,
@@ -539,7 +548,13 @@ class Driver:
                             transaction_id=transaction_id,
                             effect_id=record.id,
                         )
-                        effects[record.id].revert(context, record.before_state)
+                        effects[record.id].revert(
+                            context,
+                            record.before_state,
+                            transactions.checkpoint_writer(
+                                transaction_id, record.id
+                            ),
+                        )
                         transactions.record_reverted(
                             transaction_id, record.id
                         )
@@ -581,27 +596,33 @@ class Driver:
             transactions = TransactionRepository(
                 filesystem, manifest_directory=self.manifest_directory
             )
-            manifest = manifests.read()
-            active = transactions.active()
-            return StatusResult(
-                status=(
-                    OperationStatus.BLOCKED
-                    if active is not None
-                    else OperationStatus.COMPLETED
-                ),
-                installed=manifest is not None,
-                installation_id=(
-                    manifest.installation_id if manifest is not None else None
-                ),
-                incomplete_transaction_id=(
-                    active.transaction_id if active is not None else None
-                ),
-                effect_ids=(
-                    tuple(record.id for record in manifest.effects)
-                    if manifest is not None
-                    else ()
-                ),
+            root_resources = canonicalize_resources(
+                (canonical_resource_identity("path", filesystem.base),)
             )
+            with self._manager().acquire(
+                root_resources, timeout=self.lock_timeout
+            ):
+                active = transactions.active()
+                manifest = manifests.read()
+                return StatusResult(
+                    status=(
+                        OperationStatus.BLOCKED
+                        if active is not None
+                        else OperationStatus.COMPLETED
+                    ),
+                    installed=manifest is not None,
+                    installation_id=(
+                        manifest.installation_id if manifest is not None else None
+                    ),
+                    incomplete_transaction_id=(
+                        active.transaction_id if active is not None else None
+                    ),
+                    effect_ids=(
+                        tuple(record.id for record in manifest.effects)
+                        if manifest is not None
+                        else ()
+                    ),
+                )
 
 
 class Installer:

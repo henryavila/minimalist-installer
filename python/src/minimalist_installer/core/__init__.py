@@ -24,9 +24,11 @@ from .errors import (
 )
 from .driver import Driver, Installer, define_installer
 from .journal import (
+    BlobStatus,
     EffectProgress,
     JournalCheckpoint,
     TransactionEffectRecord,
+    TransactionBlobRecord,
     TransactionJournal,
     TransactionPhase,
     TransactionRepository,
@@ -55,6 +57,7 @@ from .models import (
 
 __all__ = [
     "CheckpointWriter",
+    "BlobStatus",
     "CorruptManifestError",
     "CorruptTransactionError",
     "Driver",
@@ -92,6 +95,7 @@ __all__ = [
     "StatusResult",
     "JournalCheckpoint",
     "TransactionEffectRecord",
+    "TransactionBlobRecord",
     "TransactionJournal",
     "TransactionPhase",
     "TransactionRepository",

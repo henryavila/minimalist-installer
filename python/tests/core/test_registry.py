@@ -34,7 +34,12 @@ class _Effect:
     def apply(self, prepared: PreparedEffect, checkpoint: object) -> object:
         return None
 
-    def revert(self, context: EffectContext, before_state: object) -> None:
+    def revert(
+        self,
+        context: EffectContext,
+        before_state: object,
+        checkpoint: object,
+    ) -> None:
         return None
 
 

@@ -358,7 +358,12 @@ def test_provider_and_effect_contracts_are_public_protocols() -> None:
         def apply(self, prepared: object, checkpoint: object) -> object:
             return None
 
-        def revert(self, context: object, before_state: object) -> None:
+        def revert(
+            self,
+            context: object,
+            before_state: object,
+            checkpoint: object,
+        ) -> None:
             return None
 
     assert isinstance(ProviderImplementation(), api.Provider)
@@ -390,6 +395,7 @@ def test_provider_and_effect_contracts_are_public_protocols() -> None:
         "self",
         "context",
         "before_state",
+        "checkpoint",
     ]
 
 

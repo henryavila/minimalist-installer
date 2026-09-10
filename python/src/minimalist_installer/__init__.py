@@ -3,6 +3,7 @@
 from importlib import metadata as _metadata
 
 from .core import (
+    BlobStatus,
     CheckpointWriter,
     CorruptManifestError,
     CorruptTransactionError,
@@ -41,6 +42,7 @@ from .core import (
     StatusResult,
     JournalCheckpoint,
     TransactionEffectRecord,
+    TransactionBlobRecord,
     TransactionJournal,
     TransactionPhase,
     TransactionRepository,
@@ -55,6 +57,7 @@ from .core import (
 from .providers import FileSetProvider
 
 __all__ = [
+    "BlobStatus",
     "CheckpointWriter",
     "CorruptManifestError",
     "CorruptTransactionError",
@@ -93,6 +96,7 @@ __all__ = [
     "StatusResult",
     "JournalCheckpoint",
     "TransactionEffectRecord",
+    "TransactionBlobRecord",
     "TransactionJournal",
     "TransactionPhase",
     "TransactionRepository",

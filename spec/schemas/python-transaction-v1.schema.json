@@ -86,7 +86,15 @@
     },
     "blobs": {
       "type": "array",
-      "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["digest", "status"],
+        "properties": {
+          "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "status": { "enum": ["pending", "ready"] }
+        }
+      }
     }
   }
 }

@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from minimalist_installer import CorruptTransactionError, EffectPlan, Operation, PreparedEffect
 from minimalist_installer.core.journal import (
+    BlobStatus,
+    EffectProgress,
     TRANSACTION_V1_SCHEMA,
+    TransactionBlobRecord,
     TransactionPhase,
     TransactionRepository,
 )
 from minimalist_installer.core.path_safety import SafeFilesystem
+from minimalist_installer.core.manifest import ManifestRepository
 
 
 def _repository(tmp_path: Path) -> TransactionRepository:
@@ -29,6 +34,15 @@ def _plan(effect_id: str = "effect:a") -> EffectPlan:
         args={"value": effect_id},
         resources=("kind:z", "kind:a"),
     )
+
+
+def test_schema_file_exactly_matches_runtime_transaction_schema() -> None:
+    schema_path = (
+        Path(__file__).parents[3]
+        / "spec/schemas/python-transaction-v1.schema.json"
+    )
+
+    assert json.loads(schema_path.read_text("utf-8")) == TRANSACTION_V1_SCHEMA
 
 
 def test_begin_persists_a_strict_active_write_ahead_journal(tmp_path: Path) -> None:
@@ -67,7 +81,7 @@ def test_prepared_state_and_effect_checkpoint_are_durable(tmp_path: Path) -> Non
     prepared = PreparedEffect(
         before_state={"old": "bytes"},
         payload={"new": "bytes"},
-        resources=("kind:a",),
+        resources=("kind:a", "kind:z"),
     )
 
     repository.record_prepared("tx-1", plan.id, prepared)
@@ -94,7 +108,7 @@ def test_effect_checkpoint_names_are_idempotently_replaced(tmp_path: Path) -> No
         operation=Operation.INSTALL,
         engine_version="0.1.0",
         plans=(plan,),
-        resources=("kind:a",),
+        resources=("kind:a", "kind:z"),
     )
     repository.record_prepared(
         "tx-1", plan.id, PreparedEffect(before_state=None, payload=None)
@@ -111,17 +125,24 @@ def test_effect_checkpoint_names_are_idempotently_replaced(tmp_path: Path) -> No
 
 def test_blob_storage_is_content_addressed_and_verified(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
+    plan = _plan()
     repository.begin(
         transaction_id="tx-1",
         installation_id="install-1",
         operation=Operation.INSTALL,
         engine_version="0.1.0",
-        plans=(),
-        resources=("kind:a",),
+        plans=(plan,),
+        resources=("kind:a", "kind:z"),
+    )
+    repository.record_prepared(
+        "tx-1", plan.id, PreparedEffect(before_state=None, payload=None)
     )
 
     digest = repository.write_blob("tx-1", b"original")
 
+    assert repository.read("tx-1").blobs == (
+        TransactionBlobRecord(digest=digest, status=BlobStatus.READY),
+    )
     assert repository.read_blob("tx-1", digest) == b"original"
     (tmp_path / f"state/transactions/tx-1/blobs/{digest}.blob").write_bytes(b"tamper")
     with pytest.raises(CorruptTransactionError, match="digest"):
@@ -137,7 +158,7 @@ def test_checkpoint_writer_exposes_the_transaction_blob_store(tmp_path: Path) ->
         operation=Operation.INSTALL,
         engine_version="0.1.0",
         plans=(plan,),
-        resources=("kind:a",),
+        resources=("kind:a", "kind:z"),
     )
     repository.record_prepared(
         "tx-1", plan.id, PreparedEffect(before_state=None, payload=None)
@@ -147,7 +168,185 @@ def test_checkpoint_writer_exposes_the_transaction_blob_store(tmp_path: Path) ->
     digest = writer.write_blob(b"backup bytes")
 
     assert writer.read_blob(digest) == b"backup bytes"
-    assert repository.read("tx-1").blobs == (digest,)
+    assert repository.read("tx-1").blobs == (
+        TransactionBlobRecord(digest=digest, status=BlobStatus.READY),
+    )
+
+
+def test_blob_descriptor_is_write_ahead_of_bytes_and_marked_ready_last(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    plan = _plan()
+    repository.begin(
+        transaction_id="tx-1",
+        installation_id="install-1",
+        operation=Operation.INSTALL,
+        engine_version="0.1.0",
+        plans=(plan,),
+        resources=("kind:a", "kind:z"),
+    )
+    repository.record_prepared(
+        "tx-1", plan.id, PreparedEffect(before_state=None, payload=None)
+    )
+    events: list[str] = []
+    real_write = repository._write
+    real_bytes = repository.filesystem.atomic_write_bytes
+
+    def record_journal(transaction_id: str, journal: object) -> None:
+        status = journal.blobs[0].status.value
+        events.append(f"journal:{status}")
+        real_write(transaction_id, journal)
+
+    def record_bytes(path: object, data: bytes, **kwargs: object) -> None:
+        if str(path).endswith(".blob"):
+            events.append("blob:bytes")
+        real_bytes(path, data, **kwargs)
+
+    repository._write = record_journal  # type: ignore[method-assign]
+    repository.filesystem.atomic_write_bytes = record_bytes  # type: ignore[method-assign]
+
+    repository.write_blob("tx-1", b"backup")
+
+    assert events == ["journal:pending", "blob:bytes", "journal:ready"]
+
+
+@pytest.mark.parametrize("failure_boundary", ["pending", "bytes", "ready"])
+def test_blob_write_failures_remain_wal_discoverable(
+    tmp_path: Path,
+    failure_boundary: str,
+) -> None:
+    repository = _repository(tmp_path)
+    plan = _plan()
+    repository.begin(
+        transaction_id="tx-1",
+        installation_id="install-1",
+        operation=Operation.INSTALL,
+        engine_version="0.1.0",
+        plans=(plan,),
+        resources=("kind:a", "kind:z"),
+    )
+    repository.record_prepared(
+        "tx-1", plan.id, PreparedEffect(before_state=None, payload=None)
+    )
+    digest = __import__("hashlib").sha256(b"backup").hexdigest()
+    real_write = repository._write
+    real_bytes = repository.filesystem.atomic_write_bytes
+
+    def failing_journal(transaction_id: str, journal: object) -> None:
+        status = journal.blobs[0].status.value
+        if status == failure_boundary:
+            raise OSError(f"fail {status}")
+        real_write(transaction_id, journal)
+
+    def failing_bytes(path: object, data: bytes, **kwargs: object) -> None:
+        if failure_boundary == "bytes" and str(path).endswith(".blob"):
+            raise OSError("fail bytes")
+        real_bytes(path, data, **kwargs)
+
+    repository._write = failing_journal  # type: ignore[method-assign]
+    repository.filesystem.atomic_write_bytes = failing_bytes  # type: ignore[method-assign]
+
+    with pytest.raises(OSError):
+        repository.write_blob("tx-1", b"backup")
+
+    active = repository.active()
+    assert active is not None
+    blob_path = tmp_path / f"state/transactions/tx-1/blobs/{digest}.blob"
+    if failure_boundary == "pending":
+        assert active.blobs == ()
+        assert not blob_path.exists()
+    else:
+        assert active.blobs == (
+            TransactionBlobRecord(digest=digest, status=BlobStatus.PENDING),
+        )
+        assert blob_path.exists() is (failure_boundary == "ready")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda journal: replace(journal, phase=TransactionPhase.COMMITTED),
+        lambda journal: replace(journal, phase=TransactionPhase.APPLYING),
+        lambda journal: replace(
+            journal,
+            phase=TransactionPhase.APPLYING,
+            effects=(
+                replace(
+                    journal.effects[0],
+                    status=EffectProgress.APPLIED,
+                    prepared=None,
+                ),
+            ),
+        ),
+        lambda journal: replace(
+            journal,
+            effects=(
+                replace(
+                    journal.effects[0],
+                    prepared=PreparedEffect(
+                        before_state=None,
+                        payload=None,
+                        resources=("kind:outside",),
+                    ),
+                    status=EffectProgress.PREPARED,
+                ),
+            ),
+            phase=TransactionPhase.APPLYING,
+        ),
+    ],
+)
+def test_impossible_wal_state_combinations_are_rejected(
+    tmp_path: Path,
+    mutation: object,
+) -> None:
+    repository = _repository(tmp_path)
+    journal = repository.begin(
+        transaction_id="tx-1",
+        installation_id="install-1",
+        operation=Operation.INSTALL,
+        engine_version="0.1.0",
+        plans=(_plan(),),
+        resources=("kind:a", "kind:z"),
+    )
+
+    with pytest.raises(ValueError):
+        mutation(journal)
+
+
+def test_transaction_resources_must_cover_every_planned_effect(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+
+    with pytest.raises(ValueError, match="resource union"):
+        repository.begin(
+            transaction_id="tx-1",
+            installation_id="install-1",
+            operation=Operation.INSTALL,
+            engine_version="0.1.0",
+            plans=(_plan(),),
+            resources=("kind:a",),
+        )
+
+
+def test_effect_progress_cannot_transition_back_from_applied_to_prepared(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    plan = _plan()
+    repository.begin(
+        transaction_id="tx-1",
+        installation_id="install-1",
+        operation=Operation.INSTALL,
+        engine_version="0.1.0",
+        plans=(plan,),
+        resources=("kind:a", "kind:z"),
+    )
+    prepared = PreparedEffect(before_state=None, payload=None)
+    repository.record_prepared("tx-1", plan.id, prepared)
+    repository.record_applied("tx-1", plan.id, None)
+
+    with pytest.raises(CorruptTransactionError, match="transition"):
+        repository.record_prepared("tx-1", plan.id, prepared)
 
 
 def test_complete_removes_only_the_named_transaction_tree(tmp_path: Path) -> None:
@@ -160,12 +359,107 @@ def test_complete_removes_only_the_named_transaction_tree(tmp_path: Path) -> Non
         plans=(),
         resources=("kind:a",),
     )
-    repository.write_blob("tx-1", b"original")
+    repository.checkpoint("tx-1", "effects_applied")
+    repository.checkpoint("tx-1", "committing")
+    repository.checkpoint("tx-1", "manifest_committed")
+    ManifestRepository(
+        repository.filesystem, manifest_directory="state"
+    ).commit(
+        installation_id="install-1",
+        consumer="tests",
+        consumer_version="1",
+        transaction_id="tx-1",
+        engine_version="0.1.0",
+        effects=(),
+    )
+    removals: list[object] = []
+    real_unlink = repository.filesystem.unlink
+
+    def recording_unlink(path: object, **kwargs: object) -> bool:
+        removals.append(path)
+        return real_unlink(path, **kwargs)
+
+    repository.filesystem.unlink = recording_unlink  # type: ignore[method-assign]
 
     repository.complete("tx-1")
 
     assert repository.active() is None
     assert not (tmp_path / "state/transactions/tx-1").exists()
+    assert removals[-1] == "state/transactions/active.json"
+
+
+def test_complete_requires_actual_committed_manifest_transaction_proof(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    repository.begin(
+        transaction_id="tx-1",
+        installation_id="install-1",
+        operation=Operation.INSTALL,
+        engine_version="0.1.0",
+        plans=(),
+        resources=("kind:a",),
+    )
+    repository.checkpoint("tx-1", "effects_applied")
+    repository.checkpoint("tx-1", "committing")
+    repository.checkpoint("tx-1", "manifest_committed")
+
+    with pytest.raises(CorruptTransactionError, match="proof"):
+        repository.complete("tx-1", committed_transaction_id="tx-1")
+
+    ManifestRepository(
+        repository.filesystem, manifest_directory="state"
+    ).commit(
+        installation_id="install-1",
+        consumer="tests",
+        consumer_version="1",
+        transaction_id="other-tx",
+        engine_version="0.1.0",
+        effects=(),
+    )
+    with pytest.raises(CorruptTransactionError, match="proof"):
+        repository.complete("tx-1", committed_transaction_id="tx-1")
+
+    assert repository.active() is not None
+
+
+def test_cleanup_failure_never_removes_active_authority_first(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    repository.begin(
+        transaction_id="tx-1",
+        installation_id="install-1",
+        operation=Operation.INSTALL,
+        engine_version="0.1.0",
+        plans=(),
+        resources=("kind:a",),
+    )
+    repository.checkpoint("tx-1", "effects_applied")
+    repository.checkpoint("tx-1", "committing")
+    repository.checkpoint("tx-1", "manifest_committed")
+    ManifestRepository(
+        repository.filesystem, manifest_directory="state"
+    ).commit(
+        installation_id="install-1",
+        consumer="tests",
+        consumer_version="1",
+        transaction_id="tx-1",
+        engine_version="0.1.0",
+        effects=(),
+    )
+    real_unlink = repository.filesystem.unlink
+
+    def fail_journal(path: object, **kwargs: object) -> bool:
+        if str(path).endswith("journal.json"):
+            raise OSError("cleanup interrupted")
+        return real_unlink(path, **kwargs)
+
+    repository.filesystem.unlink = fail_journal  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="cleanup interrupted"):
+        repository.complete("tx-1")
+
+    assert (tmp_path / "state/transactions/active.json").is_file()
+    assert repository.active() is not None
 
 
 def test_corrupt_or_foreign_transaction_fails_closed(tmp_path: Path) -> None:
