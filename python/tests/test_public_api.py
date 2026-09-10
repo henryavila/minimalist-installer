@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from importlib import import_module
+import importlib.metadata
+import inspect
+from importlib import import_module, reload
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import ModuleType
@@ -80,6 +82,100 @@ def test_public_planning_values_are_immutable(
 
     with pytest.raises(FrozenInstanceError):
         setattr(values[value], attribute, replacement)
+
+
+def test_effect_plan_snapshots_and_deeply_freezes_caller_json() -> None:
+    api = _api()
+    source = {
+        "files": [
+            {"path": "SKILL.md", "metadata": {"owners": ["installer"]}},
+        ],
+    }
+    plan = api.EffectPlan(
+        id="skills:user",
+        type="reconcile_file_set",
+        version=1,
+        args=source,
+    )
+
+    source["files"][0]["path"] = "MUTATED.md"
+    source["files"][0]["metadata"]["owners"].append("caller")
+    source["files"].append({"path": "EXTRA.md"})
+
+    assert plan.to_dict()["args"] == {
+        "files": [
+            {"path": "SKILL.md", "metadata": {"owners": ["installer"]}},
+        ],
+    }
+    with pytest.raises(TypeError):
+        plan.args["extra"] = "blocked"
+    with pytest.raises(TypeError):
+        plan.args["files"][0]["path"] = "blocked"
+
+
+def test_prepared_effect_snapshots_and_deeply_freezes_caller_json() -> None:
+    api = _api()
+    before_state = {"files": [{"path": "SKILL.md", "existed": False}]}
+    payload = {"steps": [{"writes": ["SKILL.md"]}]}
+    prepared = api.PreparedEffect(before_state=before_state, payload=payload)
+
+    before_state["files"][0]["existed"] = True
+    payload["steps"][0]["writes"].append("EXTRA.md")
+
+    assert prepared.to_dict() == {
+        "before_state": {
+            "files": [{"path": "SKILL.md", "existed": False}],
+        },
+        "payload": {"steps": [{"writes": ["SKILL.md"]}]},
+        "resources": [],
+        "recoverable": True,
+    }
+    with pytest.raises(TypeError):
+        prepared.before_state["files"][0]["path"] = "blocked"
+    with pytest.raises(AttributeError):
+        prepared.payload["steps"][0]["writes"].append("blocked")
+
+
+@pytest.mark.parametrize("invalid_number", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("value_type", ["EffectPlan", "PreparedEffect"])
+def test_public_json_values_reject_non_finite_numbers(
+    value_type: str, invalid_number: float
+) -> None:
+    api = _api()
+
+    with pytest.raises(ValueError, match="finite"):
+        if value_type == "EffectPlan":
+            api.EffectPlan(
+                id="effect",
+                type="test",
+                version=1,
+                args={"nested": [invalid_number]},
+            )
+        else:
+            api.PreparedEffect(
+                before_state={"nested": [invalid_number]},
+                payload=None,
+            )
+
+
+@pytest.mark.parametrize("value_type", ["EffectPlan", "PreparedEffect"])
+def test_public_json_values_reject_non_string_mapping_keys(value_type: str) -> None:
+    api = _api()
+    invalid = {1: "numeric", "1": "text"}
+
+    with pytest.raises(TypeError, match="keys must be strings"):
+        if value_type == "EffectPlan":
+            api.EffectPlan(id="effect", type="test", version=1, args=invalid)
+        else:
+            api.PreparedEffect(before_state=invalid, payload=None)
+
+
+def test_error_json_rejects_invalid_detail_keys_without_stringifying_them() -> None:
+    api = _api()
+    error = api.InstallerError("invalid details", details={1: "numeric", "1": "text"})
+
+    with pytest.raises(TypeError, match="keys must be strings"):
+        error.to_dict()
 
 
 @pytest.mark.parametrize(
@@ -243,6 +339,67 @@ def test_typed_errors_keep_stable_codes_when_serialized(
 
 def test_provider_and_effect_contracts_are_public_protocols() -> None:
     api = _api()
-    assert api.Provider.__name__ == "Provider"
-    assert api.Effect.__name__ == "Effect"
-    assert api.CheckpointWriter.__name__ == "CheckpointWriter"
+
+    class ProviderImplementation:
+        def plan(self, config: object, context: object) -> tuple[object, ...]:
+            return ()
+
+    class CheckpointImplementation:
+        def write(self, checkpoint: str, state: object) -> None:
+            return None
+
+    class EffectImplementation:
+        type = "example"
+        version = 1
+
+        def prepare(self, args: object, previous: object, context: object) -> object:
+            return object()
+
+        def apply(self, prepared: object, checkpoint: object) -> object:
+            return None
+
+        def revert(self, context: object, before_state: object) -> None:
+            return None
+
+    assert isinstance(ProviderImplementation(), api.Provider)
+    assert isinstance(CheckpointImplementation(), api.CheckpointWriter)
+    assert isinstance(EffectImplementation(), api.Effect)
+    assert not isinstance(object(), api.Provider)
+    assert list(inspect.signature(api.Provider.plan).parameters) == [
+        "self",
+        "config",
+        "context",
+    ]
+    assert list(inspect.signature(api.CheckpointWriter.write).parameters) == [
+        "self",
+        "checkpoint",
+        "state",
+    ]
+    assert list(inspect.signature(api.Effect.prepare).parameters) == [
+        "self",
+        "args",
+        "previous",
+        "context",
+    ]
+    assert list(inspect.signature(api.Effect.apply).parameters) == [
+        "self",
+        "prepared",
+        "checkpoint",
+    ]
+    assert list(inspect.signature(api.Effect.revert).parameters) == [
+        "self",
+        "context",
+        "before_state",
+    ]
+
+
+def test_package_version_comes_from_installed_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _api()
+
+    with monkeypatch.context() as context:
+        context.setattr(importlib.metadata, "version", lambda name: "9.8.7")
+        assert reload(api).__version__ == "9.8.7"
+
+    assert reload(api).__version__ == importlib.metadata.version("minimalist-installer")

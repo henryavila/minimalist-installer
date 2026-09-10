@@ -1,5 +1,7 @@
 """Public API for the Python minimalist installer."""
 
+from importlib import metadata as _metadata
+
 from .core import (
     CheckpointWriter,
     CorruptManifestError,
@@ -72,4 +74,7 @@ __all__ = [
     "UpdateResult",
 ]
 
-__version__ = "0.1.0"
+try:
+    __version__ = _metadata.version("minimalist-installer")
+except _metadata.PackageNotFoundError:
+    __version__ = "0+unknown"

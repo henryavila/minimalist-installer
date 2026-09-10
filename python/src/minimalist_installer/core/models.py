@@ -4,11 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from math import isfinite
 from pathlib import Path
-from typing import Mapping, Protocol, Sequence, TypeAlias
+from types import MappingProxyType
+from typing import Mapping, Protocol, Sequence, TypeAlias, runtime_checkable
 
 JsonScalar: TypeAlias = None | bool | int | float | str
-JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+JsonValue: TypeAlias = (
+    JsonScalar
+    | list["JsonValue"]
+    | tuple["JsonValue", ...]
+    | Mapping[str, "JsonValue"]
+)
 JsonObject: TypeAlias = dict[str, JsonValue]
 
 
@@ -34,14 +41,44 @@ class OperationStatus(StrEnum):
 def _json_value(value: object) -> JsonValue:
     """Convert supported public values into JSON-compatible primitives."""
 
-    if value is None or isinstance(value, bool | int | float | str):
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise ValueError("JSON numbers must be finite")
         return value
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):
-        return {str(key): _json_value(item) for key, item in value.items()}
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        converted: JsonObject = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JSON object keys must be strings")
+            converted[key] = _json_value(item)
+        return converted
+    if isinstance(value, list | tuple):
         return [_json_value(item) for item in value]
+    raise TypeError(f"value is not JSON serializable: {type(value).__name__}")
+
+
+def _freeze_json(value: object) -> JsonValue:
+    """Validate and snapshot JSON as recursively immutable containers."""
+
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise ValueError("JSON numbers must be finite")
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, JsonValue] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JSON object keys must be strings")
+            frozen[key] = _freeze_json(item)
+        return MappingProxyType(frozen)
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_json(item) for item in value)
     raise TypeError(f"value is not JSON serializable: {type(value).__name__}")
 
 
@@ -54,6 +91,13 @@ class EffectPlan:
     version: int
     args: Mapping[str, JsonValue]
     resources: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        frozen_args = _freeze_json(self.args)
+        if not isinstance(frozen_args, Mapping):
+            raise TypeError("effect args must be a JSON object")
+        object.__setattr__(self, "args", frozen_args)
+        object.__setattr__(self, "resources", tuple(self.resources))
 
     def to_dict(self) -> JsonObject:
         """Return a stable JSON representation of the planned effect."""
@@ -115,6 +159,11 @@ class PreparedEffect:
     payload: JsonValue
     resources: tuple[str, ...] = ()
     recoverable: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "before_state", _freeze_json(self.before_state))
+        object.__setattr__(self, "payload", _freeze_json(self.payload))
+        object.__setattr__(self, "resources", tuple(self.resources))
 
     def to_dict(self) -> JsonObject:
         """Return a stable JSON representation suitable for the journal."""
@@ -197,12 +246,14 @@ class StatusResult:
         }
 
 
+@runtime_checkable
 class CheckpointWriter(Protocol):
     """Durably records fine-grained progress inside an applied effect."""
 
     def write(self, checkpoint: str, state: JsonValue) -> None: ...
 
 
+@runtime_checkable
 class Provider(Protocol):
     """Pure planner extension contract."""
 
@@ -213,6 +264,7 @@ class Provider(Protocol):
     ) -> Sequence[EffectPlan]: ...
 
 
+@runtime_checkable
 class Effect(Protocol):
     """Prepared, reversible mutation extension contract."""
 
