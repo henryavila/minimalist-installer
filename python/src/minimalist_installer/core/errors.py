@@ -19,6 +19,10 @@ class ErrorCode(StrEnum):
     LOCK_TIMEOUT = "lock_timeout"
     INCOMPLETE_TRANSACTION = "incomplete_transaction"
     CORRUPT_MANIFEST = "corrupt_manifest"
+    CORRUPT_TRANSACTION = "corrupt_transaction"
+    INVALID_EFFECT = "invalid_effect"
+    INVALID_PLAN = "invalid_plan"
+    NO_INSTALLATION = "no_installation"
     UNKNOWN_EFFECT = "unknown_effect"
     UNSUPPORTED_EFFECT_VERSION = "unsupported_effect_version"
     RECOVERY_BLOCKED = "recovery_blocked"
@@ -84,6 +88,22 @@ class IncompleteTransactionError(InstallerError):
 
 class CorruptManifestError(InstallerError):
     code = ErrorCode.CORRUPT_MANIFEST
+
+
+class CorruptTransactionError(InstallerError):
+    code = ErrorCode.CORRUPT_TRANSACTION
+
+
+class InvalidEffectError(InstallerError, ValueError):
+    code = ErrorCode.INVALID_EFFECT
+
+
+class InvalidPlanError(InstallerError, ValueError):
+    code = ErrorCode.INVALID_PLAN
+
+
+class NoInstallationError(InstallerError):
+    code = ErrorCode.NO_INSTALLATION
 
 
 class UnknownEffectError(InstallerError):

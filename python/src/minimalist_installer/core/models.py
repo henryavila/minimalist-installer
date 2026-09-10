@@ -93,9 +93,19 @@ class EffectPlan:
     resources: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.id, str):
+            raise TypeError("effect id must be text")
+        if not isinstance(self.type, str) or not self.type.strip():
+            raise ValueError("effect type must be non-empty text")
+        if isinstance(self.version, bool) or not isinstance(self.version, int):
+            raise TypeError("effect version must be an integer")
+        if self.version < 1:
+            raise ValueError("effect version must be positive")
         frozen_args = _freeze_json(self.args)
         if not isinstance(frozen_args, Mapping):
             raise TypeError("effect args must be a JSON object")
+        if any(not isinstance(resource, str) or not resource for resource in self.resources):
+            raise ValueError("effect resources must be non-empty strings")
         object.__setattr__(self, "args", frozen_args)
         object.__setattr__(self, "resources", tuple(self.resources))
 
@@ -161,6 +171,10 @@ class PreparedEffect:
     recoverable: bool = True
 
     def __post_init__(self) -> None:
+        if any(not isinstance(resource, str) or not resource for resource in self.resources):
+            raise ValueError("prepared resources must be non-empty strings")
+        if not isinstance(self.recoverable, bool):
+            raise TypeError("recoverable must be a boolean")
         object.__setattr__(self, "before_state", _freeze_json(self.before_state))
         object.__setattr__(self, "payload", _freeze_json(self.payload))
         object.__setattr__(self, "resources", tuple(self.resources))
