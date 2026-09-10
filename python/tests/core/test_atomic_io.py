@@ -5,6 +5,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -143,6 +144,74 @@ def test_json_rejects_non_finite_numbers_without_replacing_existing_bytes(
     assert target.read_bytes() == b'{"original":true}\n'
 
 
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"value":NaN}',
+        b'{"value":Infinity}',
+        b'{"value":-Infinity}',
+        b'{"value":1e400}',
+        b'{"value":1,"value":2}',
+        b'{"nested":{"value":1,"value":2}}',
+    ),
+)
+def test_json_read_rejects_non_finite_numbers_and_duplicate_keys(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    base = tmp_path / "install"
+    base.mkdir()
+    (base / "manifest.json").write_bytes(payload)
+    filesystem = SafeFilesystem(base)
+
+    with pytest.raises(ValueError):
+        filesystem.read_json("manifest.json")
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        {1: "coerced-key"},
+        {"nested": {False: "coerced-key"}},
+        {"unsupported": {1, 2}},
+        {"unsupported": b"bytes"},
+        {"unsupported": Path("path")},
+        {"unsupported": object()},
+    ),
+)
+def test_json_write_rejects_non_string_keys_and_unsupported_values_recursively(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    base = tmp_path / "install"
+    base.mkdir()
+    target = base / "manifest.json"
+    target.write_bytes(b'{"original":true}\n')
+    filesystem = SafeFilesystem(base)
+
+    with pytest.raises(TypeError):
+        filesystem.atomic_write_json("manifest.json", value)
+
+    assert target.read_bytes() == b'{"original":true}\n'
+
+
+def test_json_write_accepts_public_mapping_and_tuple_value_contract(tmp_path: Path) -> None:
+    base = tmp_path / "install"
+    base.mkdir()
+    filesystem = SafeFilesystem(base)
+    value = MappingProxyType(
+        {
+            "items": (1, MappingProxyType({"enabled": True})),
+        }
+    )
+
+    filesystem.atomic_write_json("manifest.json", value)
+
+    assert filesystem.read_json("manifest.json") == {
+        "items": [1, {"enabled": True}],
+    }
+
+
 def test_atomic_replace_flushes_file_and_directory_where_supported(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -151,20 +220,37 @@ def test_atomic_replace_flushes_file_and_directory_where_supported(
     base.mkdir()
     filesystem = SafeFilesystem(base)
     real_fsync = path_safety.os.fsync
-    flushed_kinds: list[str] = []
+    real_replace = path_safety.os.replace
+    events: list[str] = []
 
     def recording_fsync(file_descriptor: int) -> None:
         mode = os.fstat(file_descriptor).st_mode
-        flushed_kinds.append("directory" if stat.S_ISDIR(mode) else "file")
+        events.append("directory-fsync" if stat.S_ISDIR(mode) else "file-fsync")
         real_fsync(file_descriptor)
 
+    def recording_replace(
+        source: Any,
+        destination: Any,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        events.append("replace")
+        real_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
     monkeypatch.setattr(path_safety.os, "fsync", recording_fsync)
+    monkeypatch.setattr(path_safety.os, "replace", recording_replace)
 
     filesystem.atomic_write_bytes("value.bin", b"durable")
 
-    assert "file" in flushed_kinds
+    assert events.index("file-fsync") < events.index("replace")
     if path_safety.directory_fsync_supported():
-        assert "directory" in flushed_kinds
+        assert events.index("replace") < events.index("directory-fsync")
 
 
 def test_unsupported_directory_fsync_does_not_hide_file_flush(

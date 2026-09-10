@@ -19,8 +19,10 @@ import stat
 import sys
 import threading
 import weakref
+from collections.abc import Mapping
 from contextlib import contextmanager
 from enum import StrEnum
+from math import isfinite
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Iterator, Protocol
@@ -52,6 +54,54 @@ class PathEntryKind(StrEnum):
     SYMLINK = "symlink"
     REPARSE = "reparse"
     OTHER = "other"
+
+
+class SafeFilesystemBackendStatus(StrEnum):
+    """Whether this process has a backend meeting the fail-closed contract."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
+_POSIX_PLATFORMS = (
+    "linux",
+    "darwin",
+    "freebsd",
+    "openbsd",
+    "netbsd",
+    "aix",
+    "cygwin",
+)
+
+
+def _posix_backend_available() -> bool:
+    required_dir_fd = (os.open, os.mkdir, os.stat, os.unlink, os.rmdir, os.rename)
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_NONBLOCK")
+        and hasattr(os, "O_DIRECTORY")
+        and all(function in os.supports_dir_fd for function in required_dir_fd)
+        and os.stat in os.supports_follow_symlinks
+    )
+
+
+def safe_filesystem_backend_status(
+    *,
+    platform_name: str | None = None,
+) -> SafeFilesystemBackendStatus:
+    """Report safe-backend capability without attempting a mutation.
+
+    Win32 intentionally remains unavailable until the cross-platform release
+    work supplies and verifies fully handle-relative traversal and mutation, as
+    required by design decision D10.  Reparse classification alone is not a
+    safe mutation backend.
+    """
+
+    platform = platform_name or sys.platform
+    if platform.startswith(_POSIX_PLATFORMS) and _posix_backend_available():
+        return SafeFilesystemBackendStatus.AVAILABLE
+    return SafeFilesystemBackendStatus.UNAVAILABLE
 
 
 def classify_entry(entry: object, *, platform_name: str | None = None) -> PathEntryKind:
@@ -157,6 +207,45 @@ def _stat_path_identity(path: Path) -> os.stat_result:
     return os.stat(path, follow_symlinks=False)
 
 
+def _reject_json_constant(token: str) -> None:
+    raise ValueError(f"non-finite JSON number is not allowed: {token}")
+
+
+def _parse_finite_json_float(token: str) -> float:
+    value = float(token)
+    if not isfinite(value):
+        raise ValueError(f"non-finite JSON number is not allowed: {token}")
+    return value
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key is not allowed: {key}")
+        value[key] = item
+    return value
+
+
+def _strict_json_value(value: object) -> Any:
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise ValueError("JSON numbers must be finite")
+        return value
+    if isinstance(value, Mapping):
+        converted: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JSON object keys must be strings")
+            converted[key] = _strict_json_value(item)
+        return converted
+    if isinstance(value, list | tuple):
+        return [_strict_json_value(item) for item in value]
+    raise TypeError(f"value is not JSON serializable: {type(value).__name__}")
+
+
 class _Backend(Protocol):
     base: Path
     uses_dir_fd: bool
@@ -185,15 +274,7 @@ class _PosixBackend:
     uses_dir_fd = True
 
     def __init__(self, base: Path, platform_name: str) -> None:
-        required_dir_fd = (os.open, os.mkdir, os.stat, os.unlink, os.rmdir, os.rename)
-        available = (
-            os.name == "posix"
-            and hasattr(os, "O_NOFOLLOW")
-            and hasattr(os, "O_DIRECTORY")
-            and all(function in os.supports_dir_fd for function in required_dir_fd)
-            and os.stat in os.supports_follow_symlinks
-        )
-        if not available:
+        if not _posix_backend_available():
             raise _unsafe(
                 f"safe filesystem backend is unavailable for {platform_name}",
                 base,
@@ -313,7 +394,12 @@ class _PosixBackend:
                 raise FileNotFoundError(display)
             if kind is not PathEntryKind.FILE:
                 raise _unsafe("safe reads require a regular file", display)
-            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            flags = (
+                os.O_RDONLY
+                | os.O_NOFOLLOW
+                | os.O_NONBLOCK
+                | getattr(os, "O_CLOEXEC", 0)
+            )
             try:
                 descriptor = os.open(leaf, flags, dir_fd=parent_fd)
             except OSError as error:
@@ -450,21 +536,16 @@ class SafeFilesystem:
         if not isinstance(raw_base, str) or not raw_base or "\x00" in raw_base:
             raise _unsafe("trusted base must be a non-empty text path")
         lexical_base = Path(os.path.abspath(raw_base))
-        if platform == "win32":
-            raise _unsafe(
-                f"safe filesystem backend is unavailable for {platform}",
-                lexical_base,
-            )
-        elif platform.startswith(
-            ("linux", "darwin", "freebsd", "openbsd", "netbsd", "aix", "cygwin")
+        if (
+            safe_filesystem_backend_status(platform_name=platform)
+            is SafeFilesystemBackendStatus.UNAVAILABLE
         ):
-            self._backend: _Backend = _PosixBackend(lexical_base, platform)
-            self.base = self._backend.base
-        else:
             raise _unsafe(
                 f"safe filesystem backend is unavailable for {platform}",
                 lexical_base,
             )
+        self._backend: _Backend = _PosixBackend(lexical_base, platform)
+        self.base = self._backend.base
 
     @property
     def uses_dir_fd(self) -> bool:
@@ -507,7 +588,12 @@ class SafeFilesystem:
     def read_json(self, relative: os.PathLike[str] | str) -> Any:
         """Read UTF-8 JSON through the safe byte reader."""
 
-        return json.loads(self.read_bytes(relative).decode("utf-8"))
+        return json.loads(
+            self.read_bytes(relative).decode("utf-8"),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+            parse_float=_parse_finite_json_float,
+        )
 
     def atomic_write_bytes(
         self,
@@ -532,7 +618,7 @@ class SafeFilesystem:
         """Serialize deterministic UTF-8 JSON and replace it atomically."""
 
         encoded = json.dumps(
-            value,
+            _strict_json_value(value),
             allow_nan=False,
             ensure_ascii=False,
             sort_keys=True,
@@ -562,6 +648,8 @@ class SafeFilesystem:
 __all__ = [
     "PathEntryKind",
     "SafeFilesystem",
+    "SafeFilesystemBackendStatus",
     "classify_entry",
     "directory_fsync_supported",
+    "safe_filesystem_backend_status",
 ]

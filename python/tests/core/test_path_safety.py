@@ -3,6 +3,9 @@ from __future__ import annotations
 import gc
 import os
 import stat
+import subprocess
+import sys
+import textwrap
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
@@ -172,6 +175,17 @@ def test_windows_fails_closed_without_handle_relative_mutations(
 
     with pytest.raises(UnsafePathError, match="safe filesystem backend"):
         SafeFilesystem(base, platform_name="win32")
+
+
+def test_backend_status_exposes_windows_release_blocker() -> None:
+    status_type = getattr(path_safety, "SafeFilesystemBackendStatus", None)
+    status_function = getattr(path_safety, "safe_filesystem_backend_status", None)
+
+    assert status_type is not None
+    assert status_function is not None
+    assert status_function(platform_name=sys.platform) is status_type.AVAILABLE
+    assert status_function(platform_name="win32") is status_type.UNAVAILABLE
+    assert status_function(platform_name="unsupported-test-platform") is status_type.UNAVAILABLE
 
 
 def test_base_must_be_an_existing_real_directory(tmp_path: Path) -> None:
@@ -381,6 +395,72 @@ def test_each_operation_closes_its_duplicate_of_the_held_base(
     assert duplicated
     assert all(descriptor in closed for descriptor in duplicated)
     filesystem.close()
+
+
+@pytest.mark.skipif(
+    os.name != "posix"
+    or not hasattr(os, "mkfifo")
+    or os.mkfifo not in os.supports_dir_fd,
+    reason="race regression requires POSIX mkfifo with dir_fd",
+)
+def test_read_race_to_fifo_fails_without_blocking_or_touching_external_sentinel(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "value.bin").write_bytes(b"regular-file")
+    sentinel = tmp_path / "outside-sentinel.bin"
+    sentinel.write_bytes(b"outside-original")
+    script = textwrap.dedent(
+        """
+        import os
+        import sys
+        from pathlib import Path
+
+        from minimalist_installer import UnsafePathError
+        from minimalist_installer.core import path_safety
+        from minimalist_installer.core.path_safety import SafeFilesystem
+
+        base = Path(sys.argv[1])
+        sentinel = Path(sys.argv[2])
+        filesystem = SafeFilesystem(base)
+        real_open = path_safety.os.open
+        swapped = False
+
+        def racing_open(path, flags, *args, **kwargs):
+            global swapped
+            if path == "value.bin" and not swapped and kwargs.get("dir_fd") is not None:
+                swapped = True
+                parent_fd = kwargs["dir_fd"]
+                os.unlink(path, dir_fd=parent_fd)
+                os.mkfifo(path, mode=0o600, dir_fd=parent_fd)
+            return real_open(path, flags, *args, **kwargs)
+
+        path_safety.os.open = racing_open
+        try:
+            filesystem.read_bytes("value.bin")
+        except UnsafePathError:
+            filesystem.close()
+            if sentinel.read_bytes() != b"outside-original":
+                raise SystemExit(4)
+            raise SystemExit(0)
+        raise SystemExit(5)
+        """
+    )
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script, os.fspath(base), os.fspath(sentinel)],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=3,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("safe read blocked after a regular file was replaced by a FIFO")
+
+    assert completed.returncode == 0, completed.stderr
+    assert sentinel.read_bytes() == b"outside-original"
 
 
 def test_empty_or_base_target_is_rejected(tmp_path: Path) -> None:
