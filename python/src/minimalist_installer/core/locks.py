@@ -440,7 +440,14 @@ class ResourceLockManager:
     def _open_root_authority(self) -> tuple[BinaryIO, LockBackend] | None:
         if self._uses_custom_backend or self._root_descriptor is None:
             return None
-        file = cast(BinaryIO, _DescriptorFile(os.dup(self._root_descriptor)))
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(".", flags, dir_fd=self._root_descriptor)
+        file = cast(BinaryIO, _DescriptorFile(descriptor))
         return file, FcntlLockBackend()
 
     def _acquire_one(

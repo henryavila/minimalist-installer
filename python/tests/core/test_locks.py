@@ -268,6 +268,68 @@ def test_unlinked_resource_lock_cannot_create_a_simultaneous_lease(
         lease.release()
 
 
+def test_same_manager_cannot_overlap_unlinked_resource_lease(tmp_path: Path) -> None:
+    manager = ResourceLockManager(tmp_path / "locks", poll_interval=0.005)
+    outer = manager.acquire(("kind:same-manager",), timeout=0.1)
+    manager.lock_path("kind:same-manager").unlink()
+
+    try:
+        with pytest.raises(LockTimeoutError):
+            manager.acquire(("kind:same-manager",), timeout=0.03)
+    finally:
+        outer.release()
+
+    with manager.acquire(("kind:same-manager",), timeout=0.1):
+        pass
+
+
+def test_nested_authority_cleanup_cannot_unlock_outer_lease(tmp_path: Path) -> None:
+    root = tmp_path / "locks"
+    manager = ResourceLockManager(root)
+    contender = ResourceLockManager(root)
+    outer = manager._open_root_authority()
+    inner = manager._open_root_authority()
+    external = contender._open_root_authority()
+    assert outer is not None
+    assert inner is not None
+    assert external is not None
+    outer_file, outer_backend = outer
+    inner_file, inner_backend = inner
+    external_file, external_backend = external
+    outer_locked = False
+    external_locked = False
+
+    try:
+        assert outer_backend.try_acquire(outer_file) is True
+        outer_locked = True
+        assert inner_backend.try_acquire(inner_file) is False
+
+        inner_backend.release(inner_file)
+
+        assert external_backend.try_acquire(external_file) is False
+        outer_backend.release(outer_file)
+        outer_locked = False
+        assert external_backend.try_acquire(external_file) is True
+        external_locked = True
+    finally:
+        if external_locked:
+            external_backend.release(external_file)
+        if outer_locked:
+            outer_backend.release(outer_file)
+        external_file.close()
+        inner_file.close()
+        outer_file.close()
+
+
+def test_one_lease_acquires_multiple_resources_without_guard_deadlock(
+    tmp_path: Path,
+) -> None:
+    manager = ResourceLockManager(tmp_path / "locks")
+
+    with manager.acquire(("kind:b", "kind:a"), timeout=0.1) as lease:
+        assert lease.resources == ("kind:a", "kind:b")
+
+
 def test_anchored_root_blocks_dual_lease_after_ancestor_retarget(
     tmp_path: Path,
 ) -> None:
