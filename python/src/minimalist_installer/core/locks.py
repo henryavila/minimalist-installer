@@ -332,13 +332,7 @@ class ResourceLockManager:
         if hasattr(os, "O_BINARY"):
             flags |= os.O_BINARY
         descriptor = os.open(path, flags, 0o600)
-        file = os.fdopen(descriptor, "r+b", buffering=0)
-        if os.name == "nt":
-            file.seek(0, os.SEEK_END)
-            if file.tell() == 0:
-                file.write(b"\0")
-                file.flush()
-        return file
+        return os.fdopen(descriptor, "r+b", buffering=0)
 
     @staticmethod
     def _write_diagnostic_metadata(file: BinaryIO, resource: str) -> None:

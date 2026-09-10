@@ -9,7 +9,7 @@ import textwrap
 import threading
 import time
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import pytest
 from minimalist_installer import LockTimeoutError
@@ -17,6 +17,7 @@ from minimalist_installer.core import locks
 from minimalist_installer.core.locks import (
     FcntlLockBackend,
     MsvcrtLockBackend,
+    ResourceLockLease,
     ResourceLockManager,
     canonical_resource_identity,
     canonicalize_resources,
@@ -360,6 +361,101 @@ def test_msvcrt_backend_uses_nonblocking_one_byte_lock(tmp_path: Path) -> None:
         (module.LK_NBLCK, 1),
         (module.LK_UNLCK, 1),
     ]
+
+
+class _DeterministicWindowsBackend:
+    def __init__(self) -> None:
+        self._mutex = threading.Lock()
+        self.holder_descriptor: int | None = None
+
+    def try_acquire(self, file: BinaryIO) -> bool:
+        with self._mutex:
+            if self.holder_descriptor is None:
+                self.holder_descriptor = file.fileno()
+                return True
+            return self.holder_descriptor == file.fileno()
+
+    def release(self, file: BinaryIO) -> None:
+        with self._mutex:
+            if self.holder_descriptor == file.fileno():
+                self.holder_descriptor = None
+
+
+class _WindowsRaceFile:
+    def __init__(self, file: BinaryIO, backend: _DeterministicWindowsBackend) -> None:
+        self._file = file
+        self._backend = backend
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._file, name)
+
+    def write(self, data: bytes) -> int:
+        holder = self._backend.holder_descriptor
+        if holder is not None and holder != self.fileno():
+            raise OSError(errno.EACCES, "byte zero is locked by holder")
+        return self._file.write(data)
+
+
+def test_windows_contender_retries_when_holder_pauses_after_truncate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "locks"
+    backend = _DeterministicWindowsBackend()
+    holder = ResourceLockManager(
+        root,
+        backend=backend,
+        platform_name="win32",
+        poll_interval=0.005,
+    )
+    contender = ResourceLockManager(
+        root,
+        backend=backend,
+        platform_name="win32",
+        poll_interval=0.005,
+    )
+    real_fdopen = locks.os.fdopen
+    original_metadata_writer = holder._write_diagnostic_metadata
+    truncated = threading.Event()
+    resume_holder = threading.Event()
+    holder_leases: list[ResourceLockLease] = []
+    holder_errors: list[Exception] = []
+
+    def wrapping_fdopen(*args: Any, **kwargs: Any) -> _WindowsRaceFile:
+        return _WindowsRaceFile(real_fdopen(*args, **kwargs), backend)
+
+    def paused_metadata(file: BinaryIO, resource: str) -> None:
+        file.seek(0)
+        file.truncate()
+        truncated.set()
+        if not resume_holder.wait(timeout=2):
+            raise TimeoutError("test did not resume metadata writer")
+        original_metadata_writer(file, resource)
+
+    def acquire_holder() -> None:
+        try:
+            holder_leases.append(holder.acquire(("kind:windows-race",), timeout=1))
+        except Exception as error:  # noqa: BLE001 - report failures from the thread
+            holder_errors.append(error)
+
+    monkeypatch.setattr(locks.os, "name", "nt")
+    monkeypatch.setattr(locks.os, "fdopen", wrapping_fdopen)
+    monkeypatch.setattr(holder, "_write_diagnostic_metadata", paused_metadata)
+    thread = threading.Thread(target=acquire_holder)
+    thread.start()
+    assert truncated.wait(timeout=2)
+
+    try:
+        with pytest.raises(LockTimeoutError):
+            contender.acquire(("kind:windows-race",), timeout=0.03)
+    finally:
+        resume_holder.set()
+        thread.join(timeout=2)
+        for lease in holder_leases:
+            lease.release()
+
+    assert not thread.is_alive()
+    assert holder_errors == []
 
 
 def test_platform_backend_selection_is_explicit_and_testable() -> None:
