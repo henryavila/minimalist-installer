@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import os
 import stat
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -9,6 +11,7 @@ from typing import Callable
 import pytest
 
 from minimalist_installer import UnsafePathError
+from minimalist_installer.core import path_safety
 from minimalist_installer.core.path_safety import (
     PathEntryKind,
     SafeFilesystem,
@@ -207,6 +210,177 @@ def test_trusted_base_is_canonicalized_before_descendant_access(tmp_path: Path) 
 
     assert (first / "install/value.bin").read_bytes() == b"anchored"
     assert not (second / "install/value.bin").exists()
+
+
+@pytest.mark.parametrize("operation", ("read", "write", "unlink", "prune"))
+def test_ancestor_retarget_cannot_redirect_an_operation_outside_the_held_base(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    trusted_parent = tmp_path / "trusted-parent"
+    trusted_base = trusted_parent / "base"
+    external_parent = tmp_path / "external-parent"
+    external_base = external_parent / "base"
+    trusted_base.mkdir(parents=True)
+    external_base.mkdir(parents=True)
+    trusted_sentinel = trusted_base / "sentinel.bin"
+    external_sentinel = external_base / "sentinel.bin"
+    trusted_sentinel.write_bytes(b"trusted-original")
+    external_sentinel.write_bytes(b"external-original")
+    filesystem = SafeFilesystem(trusted_base)
+
+    if operation == "prune":
+        filesystem.atomic_write_bytes("nested/empty/value.bin", b"value")
+        filesystem.unlink("nested/empty/value.bin")
+        (external_base / "nested/empty").mkdir(parents=True)
+
+    held_parent = tmp_path / "trusted-parent-held"
+    trusted_parent.rename(held_parent)
+    _symlink(external_parent, trusted_parent, target_is_directory=True)
+
+    if operation == "read":
+        assert filesystem.read_bytes("sentinel.bin") == b"trusted-original"
+    elif operation == "write":
+        filesystem.atomic_write_bytes("sentinel.bin", b"trusted-updated")
+        assert (held_parent / "base/sentinel.bin").read_bytes() == b"trusted-updated"
+    elif operation == "unlink":
+        assert filesystem.unlink("sentinel.bin") is True
+        assert not (held_parent / "base/sentinel.bin").exists()
+    else:
+        assert filesystem.prune_empty_parents("nested/empty/value.bin") == (
+            Path("nested/empty"),
+            Path("nested"),
+        )
+        assert not (held_parent / "base/nested").exists()
+        assert (external_base / "nested/empty").is_dir()
+
+    assert external_sentinel.read_bytes() == b"external-original"
+    filesystem.close()
+
+
+def test_construction_rejects_resolved_path_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "base"
+    other = tmp_path / "other"
+    base.mkdir()
+    other.mkdir()
+    real_close = path_safety.os.close
+    closed: list[int] = []
+
+    def recording_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(
+        path_safety,
+        "_stat_path_identity",
+        lambda target: os.stat(other, follow_symlinks=False),
+        raising=False,
+    )
+    monkeypatch.setattr(path_safety.os, "close", recording_close)
+
+    with pytest.raises(UnsafePathError, match="identity changed"):
+        SafeFilesystem(base)
+
+    assert len(closed) == 1
+
+
+def test_construction_validates_opened_base_descriptor_is_a_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "base"
+    regular_file = tmp_path / "regular-file"
+    base.mkdir()
+    regular_file.write_bytes(b"not a directory")
+    regular_stat = os.stat(regular_file)
+
+    monkeypatch.setattr(path_safety.os, "fstat", lambda descriptor: regular_stat)
+
+    with pytest.raises(UnsafePathError, match="opened descriptor is not a directory"):
+        SafeFilesystem(base)
+
+
+def test_close_and_context_manager_release_base_and_fail_closed(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    base.mkdir()
+
+    with SafeFilesystem(base) as filesystem:
+        assert filesystem.closed is False
+        filesystem.atomic_write_bytes("value.bin", b"value")
+        assert filesystem.read_bytes("value.bin") == b"value"
+
+    assert filesystem.closed is True
+    filesystem.close()
+    operations: tuple[Callable[[], object], ...] = (
+        lambda: filesystem.read_bytes("value.bin"),
+        lambda: filesystem.atomic_write_bytes("value.bin", b"changed"),
+        lambda: filesystem.unlink("value.bin"),
+        lambda: filesystem.prune_empty_parents("nested/value.bin"),
+    )
+    for operation in operations:
+        with pytest.raises(UnsafePathError, match="closed"):
+            operation()
+    assert (base / "value.bin").read_bytes() == b"value"
+
+
+def test_forgotten_filesystem_finalizer_closes_held_base_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "base"
+    base.mkdir()
+    real_close = path_safety.os.close
+    closed: list[int] = []
+
+    def recording_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(path_safety.os, "close", recording_close)
+    filesystem = SafeFilesystem(base)
+    reference = weakref.ref(filesystem)
+
+    del filesystem
+    gc.collect()
+
+    assert reference() is None
+    assert len(closed) == 1
+
+
+def test_each_operation_closes_its_duplicate_of_the_held_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "base"
+    base.mkdir()
+    filesystem = SafeFilesystem(base)
+    filesystem.atomic_write_bytes("value.bin", b"value")
+    real_dup = path_safety.os.dup
+    real_close = path_safety.os.close
+    duplicated: list[int] = []
+    closed: list[int] = []
+
+    def recording_dup(descriptor: int) -> int:
+        duplicate = real_dup(descriptor)
+        duplicated.append(duplicate)
+        return duplicate
+
+    def recording_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(path_safety.os, "dup", recording_dup)
+    monkeypatch.setattr(path_safety.os, "close", recording_close)
+
+    for _ in range(10):
+        assert filesystem.read_bytes("value.bin") == b"value"
+
+    assert duplicated
+    assert all(descriptor in closed for descriptor in duplicated)
+    filesystem.close()
 
 
 def test_empty_or_base_target_is_rejected(tmp_path: Path) -> None:

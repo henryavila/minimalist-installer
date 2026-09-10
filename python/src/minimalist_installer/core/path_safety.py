@@ -17,9 +17,12 @@ import os
 import secrets
 import stat
 import sys
+import threading
+import weakref
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Iterator, Protocol
 
 from .errors import UnsafePathError
@@ -150,8 +153,18 @@ def _fsync_directory_descriptor(file_descriptor: int) -> None:
             raise
 
 
+def _stat_path_identity(path: Path) -> os.stat_result:
+    return os.stat(path, follow_symlinks=False)
+
+
 class _Backend(Protocol):
+    base: Path
     uses_dir_fd: bool
+
+    @property
+    def closed(self) -> bool: ...
+
+    def close(self) -> None: ...
 
     def read_bytes(self, parts: tuple[str, ...]) -> bytes: ...
 
@@ -185,20 +198,62 @@ class _PosixBackend:
                 f"safe filesystem backend is unavailable for {platform_name}",
                 base,
             )
-        self.base = base
         self.platform_name = platform_name
+        self._lifecycle_lock = threading.Lock()
+        try:
+            base_descriptor = os.open(base, self._directory_flags)
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise _unsafe("trusted base is link-like or not a directory", base) from error
+            raise _unsafe("trusted base could not be opened safely", base) from error
+
+        try:
+            opened_entry = os.fstat(base_descriptor)
+            if not stat.S_ISDIR(opened_entry.st_mode):
+                raise _unsafe("opened descriptor is not a directory", base)
+            canonical_base = base.resolve(strict=True)
+            path_entry = _stat_path_identity(canonical_base)
+            path_kind = classify_entry(path_entry, platform_name=platform_name)
+            _raise_if_link_like(path_kind, canonical_base)
+            if path_kind is not PathEntryKind.DIRECTORY:
+                raise _unsafe("trusted base path is not a directory", canonical_base)
+            if not os.path.samestat(opened_entry, path_entry):
+                raise _unsafe(
+                    "trusted base identity changed while it was being opened",
+                    canonical_base,
+                )
+        except UnsafePathError:
+            os.close(base_descriptor)
+            raise
+        except (OSError, RuntimeError, ValueError) as error:
+            os.close(base_descriptor)
+            raise _unsafe("trusted base could not be validated safely", base) from error
+
+        self.base = canonical_base
+        self._base_descriptor = base_descriptor
+        self._finalizer = weakref.finalize(self, os.close, base_descriptor)
 
     @property
     def _directory_flags(self) -> int:
         return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
     def _open_base(self) -> int:
-        try:
-            return os.open(self.base, self._directory_flags)
-        except OSError as error:
-            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
-                raise _unsafe("trusted base became a link or ceased to be a directory", self.base) from error
-            raise
+        with self._lifecycle_lock:
+            if not self._finalizer.alive:
+                raise _unsafe("safe filesystem is closed", self.base)
+            try:
+                return os.dup(self._base_descriptor)
+            except OSError as error:
+                raise _unsafe("held base descriptor is unavailable", self.base) from error
+
+    @property
+    def closed(self) -> bool:
+        with self._lifecycle_lock:
+            return not self._finalizer.alive
+
+    def close(self) -> None:
+        with self._lifecycle_lock:
+            self._finalizer()
 
     def _open_directory_at(self, parent_fd: int, name: str, display: Path) -> int:
         try:
@@ -395,30 +450,20 @@ class SafeFilesystem:
         if not isinstance(raw_base, str) or not raw_base or "\x00" in raw_base:
             raise _unsafe("trusted base must be a non-empty text path")
         lexical_base = Path(os.path.abspath(raw_base))
-        try:
-            base_path = lexical_base.resolve(strict=True)
-            base_entry = os.lstat(base_path)
-        except (OSError, RuntimeError, ValueError) as error:
-            raise _unsafe("trusted base must be an existing real directory", lexical_base) from error
-        base_kind = classify_entry(base_entry, platform_name=platform)
-        _raise_if_link_like(base_kind, base_path)
-        if base_kind is not PathEntryKind.DIRECTORY:
-            raise _unsafe("trusted base must be an existing real directory", base_path)
-
-        self.base = base_path
         if platform == "win32":
             raise _unsafe(
                 f"safe filesystem backend is unavailable for {platform}",
-                base_path,
+                lexical_base,
             )
         elif platform.startswith(
             ("linux", "darwin", "freebsd", "openbsd", "netbsd", "aix", "cygwin")
         ):
-            self._backend = _PosixBackend(base_path, platform)
+            self._backend: _Backend = _PosixBackend(lexical_base, platform)
+            self.base = self._backend.base
         else:
             raise _unsafe(
                 f"safe filesystem backend is unavailable for {platform}",
-                base_path,
+                lexical_base,
             )
 
     @property
@@ -426,6 +471,30 @@ class SafeFilesystem:
         """Whether operations are anchored to directory descriptors."""
 
         return self._backend.uses_dir_fd
+
+    @property
+    def closed(self) -> bool:
+        """Whether the held base descriptor has been released."""
+
+        return self._backend.closed
+
+    def close(self) -> None:
+        """Release the held base descriptor; repeated calls are harmless."""
+
+        self._backend.close()
+
+    def __enter__(self) -> SafeFilesystem:
+        if self.closed:
+            raise _unsafe("safe filesystem is closed", self.base)
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
 
     def _parts(self, relative: os.PathLike[str] | str) -> tuple[str, ...]:
         return _lexical_parts(self.base, relative)
