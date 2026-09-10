@@ -160,7 +160,7 @@ def _plan(
         id=effect_id,
         type=effect_type,
         version=version,
-        args={"value": effect_id},
+        args={"value": effect_id, "prepared_resources": list(resources)},
         resources=resources,
     )
 
@@ -186,7 +186,9 @@ def _driver(
     )
 
 
-def test_driver_plans_and_validates_every_effect_before_locking(tmp_path: Path) -> None:
+def test_driver_validates_effects_after_wal_authority_and_before_effect_locks(
+    tmp_path: Path,
+) -> None:
     events: list[str] = []
     provider = _Provider(
         events,
@@ -199,8 +201,14 @@ def test_driver_plans_and_validates_every_effect_before_locking(tmp_path: Path) 
     with pytest.raises(UnknownEffectError):
         driver.install(base_path=tmp_path)
 
-    assert events == ["provider:plan"]
-    assert locks.acquisitions == []
+    root_resource = canonical_resource_identity("path", tmp_path)
+    assert events == [
+        "locks:acquire",
+        "locks:entered",
+        "locks:released",
+        "provider:plan",
+    ]
+    assert locks.acquisitions == [(root_resource,)]
     assert list(tmp_path.iterdir()) == []
 
 
@@ -221,9 +229,13 @@ def test_driver_acquires_complete_sorted_resources_before_prepare_and_apply(
 
     root_resource = canonical_resource_identity("path", tmp_path)
     assert locks.acquisitions == [
-        canonicalize_resources((root_resource, "kind:z", "kind:a", "kind:z"))
+        (root_resource,),
+        canonicalize_resources((root_resource, "kind:z", "kind:a", "kind:z")),
     ]
     assert events == [
+        "locks:acquire",
+        "locks:entered",
+        "locks:released",
         "provider:plan",
         "locks:acquire",
         "locks:entered",
@@ -369,7 +381,9 @@ def test_multiple_missing_ids_for_the_same_type_are_rejected_before_mutation(
     with pytest.raises(PlanDriftError, match="explicit ids"):
         driver.install(base_path=tmp_path)
 
-    assert locks.acquisitions == []
+    assert locks.acquisitions == [
+        (canonical_resource_identity("path", tmp_path),)
+    ]
     assert list(tmp_path.iterdir()) == []
 
 
@@ -446,6 +460,44 @@ def test_authoritative_incomplete_wal_takes_precedence_over_plan_drift(
 
     with pytest.raises(IncompleteTransactionError, match="active-tx"):
         driver.install(base_path=tmp_path)
+
+
+@pytest.mark.parametrize("operation", ["install", "update", "uninstall"])
+def test_active_wal_precedes_absent_manifest_results(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    filesystem = SafeFilesystem(tmp_path)
+    repository = TransactionRepository(filesystem, manifest_directory="state")
+    repository.begin(
+        transaction_id="active-tx",
+        installation_id="install-1",
+        operation=Operation.INSTALL,
+        engine_version="0.1.0",
+        plans=(),
+        resources=(canonical_resource_identity("path", tmp_path),),
+    )
+    filesystem.close()
+    sentinel = tmp_path / "partially-mutated.txt"
+    sentinel.write_bytes(b"preserve incomplete state")
+    events: list[str] = []
+    locks = _LockManager(events)
+    driver = _driver(
+        tmp_path,
+        _Provider(events, lambda _config, _context: (_plan("one"),)),
+        _Effect(events),
+        locks,
+        ("candidate-installation",),
+    )
+
+    with pytest.raises(IncompleteTransactionError, match="active-tx"):
+        getattr(driver, operation)(base_path=tmp_path)
+
+    root = canonical_resource_identity("path", tmp_path)
+    assert locks.acquisitions == [(root,)]
+    assert "provider:plan" not in events
+    assert sentinel.read_bytes() == b"preserve incomplete state"
+    assert not (tmp_path / "state/manifest.json").exists()
 
 
 def test_install_retries_planning_when_manifest_changes_before_lock_authority(
@@ -560,11 +612,63 @@ def test_effect_resources_persist_and_serialize_shared_external_locks(
     for driver, root in zip(drivers, roots, strict=True):
         driver.uninstall(base_path=root)
 
-    assert len(locks.acquisitions) == 4
-    assert all(shared in acquisition for acquisition in locks.acquisitions)
+    assert len(locks.acquisitions) == 6
+    assert all(
+        shared in locks.acquisitions[index] for index in (1, 3, 4, 5)
+    )
+    assert all(
+        shared not in locks.acquisitions[index] for index in (0, 2)
+    )
 
 
-def test_update_rejects_an_absent_installation_without_locks_or_writes(
+def test_update_persists_prepared_revert_resources_for_uninstall_locking(
+    tmp_path: Path,
+) -> None:
+    old_resource = "external:old-authority"
+    new_resource = "external:new-plan"
+    plans = iter(
+        (
+            (_plan("one", resources=(old_resource,)),),
+            (
+                EffectPlan(
+                    id="one",
+                    type="record",
+                    version=1,
+                    args={
+                        "value": "v2",
+                        "prepared_resources": [old_resource],
+                    },
+                    resources=(new_resource,),
+                ),
+            ),
+        )
+    )
+    events: list[str] = []
+    locks = _LockManager(events)
+    driver = _driver(
+        tmp_path,
+        _Provider(events, lambda _config, _context: next(plans)),
+        _Effect(events),
+        locks,
+        ("install-1", "tx-1", "tx-2", "tx-3"),
+    )
+
+    driver.install(base_path=tmp_path)
+    driver.update(base_path=tmp_path)
+    manifest = ManifestRepository(
+        SafeFilesystem(tmp_path), manifest_directory="state"
+    ).read()
+    assert manifest is not None
+    assert manifest.effects[0].resources == (old_resource,)
+    driver.uninstall(base_path=tmp_path)
+
+    assert old_resource in locks.acquisitions[2]
+    assert new_resource in locks.acquisitions[2]
+    assert old_resource in locks.acquisitions[3]
+    assert new_resource not in locks.acquisitions[3]
+
+
+def test_update_rejects_an_absent_installation_after_root_authority_without_writes(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
@@ -575,7 +679,7 @@ def test_update_rejects_an_absent_installation_without_locks_or_writes(
     with pytest.raises(NoInstallationError):
         driver.update(base_path=tmp_path)
 
-    assert events == []
+    assert events == ["locks:acquire", "locks:entered", "locks:released"]
     assert list(tmp_path.iterdir()) == []
 
 

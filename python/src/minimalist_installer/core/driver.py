@@ -249,6 +249,31 @@ class Driver:
                 )
         return prior_by_id
 
+    def _authorize_absent_manifest(
+        self,
+        *,
+        filesystem: SafeFilesystem,
+        manifests: ManifestRepository,
+        transactions: TransactionRepository,
+        operation: Operation,
+    ) -> CommittedManifest | None:
+        """Check WAL authority under the root lock before trusting absence."""
+
+        root_resources = canonicalize_resources(
+            (canonical_resource_identity("path", filesystem.base),)
+        )
+        with self._manager().acquire(
+            root_resources, timeout=self.lock_timeout
+        ):
+            active = transactions.active()
+            if active is not None:
+                raise IncompleteTransactionError(
+                    f"transaction {active.transaction_id} is incomplete",
+                    operation=operation,
+                    details={"transaction_id": active.transaction_id},
+                )
+            return manifests.read()
+
     @staticmethod
     def _ensure_prepared_resources_locked(
         prepared: PreparedEffect, resources: tuple[str, ...]
@@ -274,12 +299,21 @@ class Driver:
             candidate_installation_id: str | None = None
             for _attempt in range(3):
                 preliminary = manifests.read()
-                if operation is Operation.UPDATE and preliminary is None:
-                    raise NoInstallationError(
-                        "update requires an existing installation",
+                if preliminary is None:
+                    authoritative_absence = self._authorize_absent_manifest(
+                        filesystem=filesystem,
+                        manifests=manifests,
+                        transactions=transactions,
                         operation=operation,
-                        path=manifests.display_path,
                     )
+                    if authoritative_absence is not None:
+                        continue
+                    if operation is Operation.UPDATE:
+                        raise NoInstallationError(
+                            "update requires an existing installation",
+                            operation=operation,
+                            path=manifests.display_path,
+                        )
                 if preliminary is None:
                     if candidate_installation_id is None:
                         candidate_installation_id = _validated_identifier(
@@ -370,7 +404,9 @@ class Driver:
                                 type=plan.type,
                                 effect_version=plan.version,
                                 before_state=prepared.before_state,
-                                resources=plan.resources,
+                                resources=canonicalize_resources(
+                                    prepared.resources
+                                ),
                             )
                         )
 
@@ -424,6 +460,14 @@ class Driver:
             for _attempt in range(3):
                 preliminary = manifests.read()
                 if preliminary is None:
+                    authoritative_absence = self._authorize_absent_manifest(
+                        filesystem=filesystem,
+                        manifests=manifests,
+                        transactions=transactions,
+                        operation=Operation.UNINSTALL,
+                    )
+                    if authoritative_absence is not None:
+                        continue
                     return OperationResult(
                         operation=Operation.UNINSTALL,
                         status=OperationStatus.COMPLETED,
