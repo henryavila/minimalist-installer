@@ -267,6 +267,8 @@ class _Backend(Protocol):
 
     def unlink(self, parts: tuple[str, ...], *, missing_ok: bool) -> bool: ...
 
+    def rmdir_empty(self, parts: tuple[str, ...], *, missing_ok: bool) -> bool: ...
+
     def prune_empty_parents(self, parts: tuple[str, ...]) -> tuple[Path, ...]: ...
 
 
@@ -491,6 +493,31 @@ class _PosixBackend:
                 return False
             raise
 
+    def rmdir_empty(self, parts: tuple[str, ...], *, missing_ok: bool) -> bool:
+        display = self.base.joinpath(*parts)
+        try:
+            with self._open_parent(parts, create=False) as (parent_fd, leaf):
+                kind = self._entry_kind(parent_fd, leaf, display)
+                if kind is None:
+                    if missing_ok:
+                        return False
+                    raise FileNotFoundError(display)
+                if kind is not PathEntryKind.DIRECTORY:
+                    raise _unsafe("safe rmdir requires a real directory", display)
+                try:
+                    os.rmdir(leaf, dir_fd=parent_fd)
+                except OSError as error:
+                    if error.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                        return False
+                    raise
+                if directory_fsync_supported(platform_name=self.platform_name):
+                    _fsync_directory_descriptor(parent_fd)
+                return True
+        except FileNotFoundError:
+            if missing_ok:
+                return False
+            raise
+
     def prune_empty_parents(self, parts: tuple[str, ...]) -> tuple[Path, ...]:
         pruned: list[Path] = []
         for length in range(len(parts) - 1, 0, -1):
@@ -635,6 +662,16 @@ class SafeFilesystem:
         """Unlink a regular file, refusing links, reparses, and directories."""
 
         return self._backend.unlink(self._parts(relative), missing_ok=missing_ok)
+
+    def rmdir_empty(
+        self,
+        relative: os.PathLike[str] | str,
+        *,
+        missing_ok: bool = False,
+    ) -> bool:
+        """Remove exactly one empty real directory below the trusted base."""
+
+        return self._backend.rmdir_empty(self._parts(relative), missing_ok=missing_ok)
 
     def prune_empty_parents(
         self,
