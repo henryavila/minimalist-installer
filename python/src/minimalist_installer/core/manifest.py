@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +16,10 @@ from .path_safety import SafeFilesystem
 MANIFEST_SCHEMA_VERSION: Final = 1
 MANIFEST_ENGINE_NAME: Final = "minimalist-installer"
 MANIFEST_FILENAME: Final = "manifest.json"
+_CANONICAL_TIMESTAMP_PATTERN: Final = (
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
+_CANONICAL_TIMESTAMP = re.compile(_CANONICAL_TIMESTAMP_PATTERN)
 
 MANIFEST_V1_SCHEMA: JsonObject = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -67,8 +72,16 @@ MANIFEST_V1_SCHEMA: JsonObject = {
                 },
             },
         },
-        "installed_at": {"type": "string", "format": "date-time"},
-        "updated_at": {"type": "string", "format": "date-time"},
+        "installed_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": _CANONICAL_TIMESTAMP_PATTERN,
+        },
+        "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": _CANONICAL_TIMESTAMP_PATTERN,
+        },
     },
 }
 
@@ -122,6 +135,8 @@ def _require_positive_integer(value: object, label: str) -> int:
 
 def _parse_timestamp(value: object, label: str) -> str:
     timestamp = _require_text(value, label)
+    if _CANONICAL_TIMESTAMP.fullmatch(timestamp) is None:
+        raise ValueError(f"{label} must be a canonical UTC timestamp")
     try:
         parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError as error:
@@ -359,7 +374,10 @@ class ManifestRepository:
     def remove(self) -> bool:
         """Remove the file and, only if empty, its single owned directory."""
 
-        removed = self.filesystem.unlink(self.manifest_path, missing_ok=True)
+        manifest = self.read()
+        removed = False
+        if manifest is not None:
+            removed = self.filesystem.unlink(self.manifest_path, missing_ok=True)
         self.filesystem.rmdir_empty(self.manifest_directory, missing_ok=True)
         return removed
 

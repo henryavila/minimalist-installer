@@ -50,6 +50,16 @@ def _manifest(**overrides: object) -> dict[str, object]:
     return value
 
 
+def _manifest_with_duplicate_effect_ids() -> dict[str, object]:
+    duplicate = {
+        "id": "duplicate",
+        "type": "effect",
+        "effect_version": 1,
+        "before_state": None,
+    }
+    return _manifest(effects=[duplicate, {**duplicate, "type": "other"}])
+
+
 def _repository(tmp_path: Path, **kwargs: object) -> ManifestRepository:
     base = tmp_path / "base"
     base.mkdir()
@@ -72,6 +82,29 @@ def test_schema_file_exactly_matches_runtime_schema() -> None:
         MANIFEST_V1_SCHEMA["properties"]["effects"]["items"]["additionalProperties"]
         is False
     )
+    timestamp_pattern = "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    assert MANIFEST_V1_SCHEMA["properties"]["installed_at"]["pattern"] == (
+        timestamp_pattern
+    )
+    assert MANIFEST_V1_SCHEMA["properties"]["updated_at"]["pattern"] == (
+        timestamp_pattern
+    )
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    (
+        "2026-09-10 12:00:00+00:00",
+        "2026-09-10T12:00:00+00:00",
+        "2026-09-10T12:00:00.000Z",
+        "20260910T120000Z",
+        "2026-09-10T12:00:00z",
+        "2026-09-10T09:00:00-03:00",
+    ),
+)
+def test_manifest_rejects_noncanonical_timestamp_syntax(timestamp: str) -> None:
+    with pytest.raises(ValueError, match="timestamp"):
+        CommittedManifest.from_dict(_manifest(updated_at=timestamp))
 
 
 def test_commit_writes_exact_versioned_manifest_atomically(tmp_path: Path) -> None:
@@ -204,6 +237,33 @@ def test_remove_preserves_nonempty_owned_directory(tmp_path: Path) -> None:
     assert repository.remove() is True
     assert owned.is_dir()
     assert (owned / "consumer-data.txt").read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        json.dumps(_manifest(schema_version=2)).encode(),
+        json.dumps(_manifest(engine={"name": "foreign", "version": "1"})).encode(),
+        b"{not-json",
+        b'{"schema_version":1,"schema_version":1}',
+        b'{"schema_version":NaN}',
+        json.dumps(_manifest_with_duplicate_effect_ids()).encode(),
+        json.dumps(_manifest(updated_at="2026-09-10T12:00:00+00:00")).encode(),
+    ),
+)
+def test_remove_refuses_invalid_manifest_without_changing_its_bytes(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    repository = _repository(tmp_path)
+    target = repository.filesystem.base / "state/owned/manifest.json"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+
+    with pytest.raises(CorruptManifestError):
+        repository.remove()
+
+    assert target.read_bytes() == payload
 
 
 @pytest.mark.parametrize(

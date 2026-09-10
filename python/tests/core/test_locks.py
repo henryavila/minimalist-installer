@@ -13,6 +13,7 @@ from typing import BinaryIO
 
 import pytest
 from minimalist_installer import LockTimeoutError
+from minimalist_installer.core import locks
 from minimalist_installer.core.locks import (
     FcntlLockBackend,
     MsvcrtLockBackend,
@@ -46,10 +47,65 @@ def test_invalid_resource_identity_is_rejected(namespace: str, value: str) -> No
         canonical_resource_identity(namespace, value)
 
 
+def test_path_resource_identity_rejects_nul_in_base_path(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="NUL"):
+        canonical_resource_identity(
+            "path",
+            "target",
+            base_path=f"{tmp_path}\0escape",
+        )
+
+
+def test_opaque_resource_identity_still_rejects_nul_in_supplied_base() -> None:
+    with pytest.raises(ValueError, match="NUL"):
+        canonical_resource_identity("kind", "value", base_path="ignored\0base")
+
+
+def test_input_resource_identity_rejects_nul() -> None:
+    with pytest.raises(ValueError, match="NUL"):
+        canonicalize_resources(("kind:value\0suffix",))
+
+
+def test_final_canonical_resource_identity_rejects_nul(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(locks.ntpath, "normcase", lambda value: f"{value}\0suffix")
+
+    with pytest.raises(ValueError, match="NUL"):
+        canonical_resource_identity("path", r"C:\safe", platform_name="win32")
+
+
 def test_resources_are_deduplicated_and_sorted_by_raw_utf8_bytes() -> None:
     resources = ("kind:é", "kind:z", "kind:a", "kind:z")
 
     assert canonicalize_resources(resources) == ("kind:a", "kind:z", "kind:é")
+
+
+def test_windows_path_identities_apply_normcase_and_deduplicate(tmp_path: Path) -> None:
+    first = canonical_resource_identity("path", r"C:\Foo\Skills", platform_name="win32")
+    second = canonical_resource_identity("path", "c:/foo/skills", platform_name="win32")
+
+    assert first == second == "path:c:/foo/skills"
+    assert canonicalize_resources(
+        ("path:C:\\Foo\\Skills", "path:c:/foo/skills"),
+        platform_name="win32",
+    ) == ("path:c:/foo/skills",)
+
+
+def test_manager_uses_platform_path_semantics_before_locking(tmp_path: Path) -> None:
+    backend = _RecordingBackend()
+    manager = ResourceLockManager(
+        tmp_path / "locks",
+        backend=backend,
+        platform_name="win32",
+    )
+
+    with manager.acquire(
+        ("path:C:\\Foo\\Skills", "path:c:/foo/skills"), timeout=0
+    ) as lease:
+        assert lease.resources == ("path:c:/foo/skills",)
+
+    assert len(backend.acquired) == 1
 
 
 def test_default_lock_root_is_deterministic_and_user_scoped(tmp_path: Path) -> None:
@@ -73,6 +129,33 @@ def test_default_lock_root_is_deterministic_and_user_scoped(tmp_path: Path) -> N
         )
         == tmp_path / "local" / "minimalist-installer" / "locks"
     )
+
+
+@pytest.mark.parametrize(
+    "poll_interval",
+    (True, False, 0, -0.1, float("nan"), float("inf"), float("-inf"), "0.1", None),
+)
+def test_poll_interval_must_be_a_positive_finite_real(
+    tmp_path: Path, poll_interval: object
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        ResourceLockManager(tmp_path / "locks", poll_interval=poll_interval)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    (True, False, -0.1, float("nan"), float("inf"), float("-inf"), "0.1", None),
+)
+def test_timeout_must_be_a_nonnegative_finite_real(
+    tmp_path: Path, timeout: object
+) -> None:
+    root = tmp_path / "locks"
+    manager = ResourceLockManager(root)
+
+    with pytest.raises((TypeError, ValueError)):
+        manager.acquire(("kind:value",), timeout=timeout)  # type: ignore[arg-type]
+
+    assert not root.exists()
 
 
 class _RecordingBackend:
@@ -155,7 +238,6 @@ def test_stale_or_forged_metadata_never_grants_or_denies_a_lock(tmp_path: Path) 
         assert metadata["pid"] == os.getpid()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock integration test")
 def test_lock_is_released_when_subprocess_exits_without_cleanup(tmp_path: Path) -> None:
     root = tmp_path / "locks"
     script = textwrap.dedent("""

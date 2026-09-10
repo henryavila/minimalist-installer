@@ -6,6 +6,7 @@ import errno
 import hashlib
 import importlib
 import json
+import ntpath
 import os
 import re
 import sys
@@ -13,6 +14,8 @@ import tempfile
 import time
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
+from math import isfinite
+from numbers import Real
 from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, Protocol, Self
@@ -22,6 +25,16 @@ from .errors import LockTimeoutError
 _RESOURCE_NAMESPACE = re.compile(r"^[a-z][a-z0-9._-]*$")
 _CONTENTION_ERRNOS = {errno.EACCES, errno.EAGAIN}
 _POSIX_PLATFORMS = ("linux", "darwin", "freebsd", "openbsd", "netbsd", "aix", "cygwin")
+
+
+def _finite_real(value: object, label: str, *, allow_zero: bool) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{label} must be a real number")
+    converted = float(value)
+    if not isfinite(converted) or converted < 0 or (not allow_zero and converted == 0):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{label} must be a finite {qualifier} number")
+    return converted
 
 
 class LockBackend(Protocol):
@@ -117,6 +130,7 @@ def canonical_resource_identity(
     value: os.PathLike[str] | str,
     *,
     base_path: os.PathLike[str] | str | None = None,
+    platform_name: str | None = None,
 ) -> str:
     """Return one unambiguous UTF-8 resource identity.
 
@@ -138,17 +152,28 @@ def canonical_resource_identity(
     if not raw_value or "\x00" in raw_value:
         raise ValueError("resource value must be non-empty text without NUL")
 
+    canonical_base: str | None = None
+    if base_path is not None:
+        canonical_base = os.fspath(base_path)
+        if not isinstance(canonical_base, str):
+            raise TypeError("byte base paths are not accepted")
+        if "\x00" in canonical_base:
+            raise ValueError("resource base path must not contain NUL")
+
     if canonical_namespace == "path":
-        if base_path is not None:
-            base = os.fspath(base_path)
-            if not isinstance(base, str):
-                raise TypeError("byte base paths are not accepted")
-            raw_value = os.path.join(base, raw_value)
-        canonical_value = Path(os.path.abspath(os.path.normpath(raw_value))).as_posix()
+        platform = platform_name or sys.platform
+        path_module = ntpath if platform == "win32" else os.path
+        if canonical_base is not None:
+            raw_value = path_module.join(canonical_base, raw_value)
+        canonical_value = path_module.normcase(
+            path_module.abspath(path_module.normpath(raw_value))
+        ).replace("\\", "/")
     else:
         canonical_value = raw_value
 
     identity = f"{canonical_namespace}:{canonical_value}"
+    if "\x00" in identity:
+        raise ValueError("canonical resource identity must not contain NUL")
     try:
         identity.encode("utf-8")
     except UnicodeEncodeError as error:
@@ -156,19 +181,26 @@ def canonical_resource_identity(
     return identity
 
 
-def _canonical_existing_identity(identity: str) -> str:
+def _canonical_existing_identity(
+    identity: str, *, platform_name: str | None = None
+) -> str:
     if not isinstance(identity, str):
         raise TypeError("resource identities must be strings")
     namespace, separator, value = identity.partition(":")
     if not separator:
         raise ValueError("resource identity must contain a namespace")
-    return canonical_resource_identity(namespace, value)
+    return canonical_resource_identity(namespace, value, platform_name=platform_name)
 
 
-def canonicalize_resources(resources: Iterable[str]) -> tuple[str, ...]:
+def canonicalize_resources(
+    resources: Iterable[str], *, platform_name: str | None = None
+) -> tuple[str, ...]:
     """Canonicalize, deduplicate, and total-sort identities by raw UTF-8."""
 
-    canonical = {_canonical_existing_identity(resource) for resource in resources}
+    canonical = {
+        _canonical_existing_identity(resource, platform_name=platform_name)
+        for resource in resources
+    }
     return tuple(sorted(canonical, key=lambda resource: resource.encode("utf-8")))
 
 
@@ -258,12 +290,22 @@ class ResourceLockManager:
         *,
         backend: LockBackend | None = None,
         poll_interval: float = 0.05,
+        platform_name: str | None = None,
     ) -> None:
-        if poll_interval <= 0:
-            raise ValueError("poll_interval must be positive")
-        self.root = Path(root) if root is not None else default_lock_root()
-        self.backend = backend if backend is not None else lock_backend_for_platform()
-        self.poll_interval = poll_interval
+        self.platform_name = platform_name or sys.platform
+        self.root = (
+            Path(root)
+            if root is not None
+            else default_lock_root(platform_name=self.platform_name)
+        )
+        self.backend = (
+            backend
+            if backend is not None
+            else lock_backend_for_platform(self.platform_name)
+        )
+        self.poll_interval = _finite_real(
+            poll_interval, "poll_interval", allow_zero=False
+        )
 
     def _ensure_root(self) -> None:
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -276,7 +318,9 @@ class ResourceLockManager:
             )
 
     def lock_path(self, resource: str) -> Path:
-        canonical = canonicalize_resources((resource,))[0]
+        canonical = canonicalize_resources(
+            (resource,), platform_name=self.platform_name
+        )[0]
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return self.root / f"{digest}.lock"
 
@@ -327,11 +371,10 @@ class ResourceLockManager:
     ) -> ResourceLockLease:
         """Acquire every resource within one shared timeout budget."""
 
-        if isinstance(timeout, bool) or timeout < 0:
-            raise ValueError("timeout must be a non-negative number")
-        ordered = canonicalize_resources(resources)
+        timeout_seconds = _finite_real(timeout, "timeout", allow_zero=True)
+        ordered = canonicalize_resources(resources, platform_name=self.platform_name)
         self._ensure_root()
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout_seconds
         held: list[_HeldLock] = []
         try:
             for resource in ordered:
@@ -349,7 +392,7 @@ class ResourceLockManager:
                                 resource=resource,
                                 details={
                                     "lock_path": str(self.lock_path(resource)),
-                                    "timeout_seconds": timeout,
+                                    "timeout_seconds": timeout_seconds,
                                 },
                             )
                         time.sleep(min(self.poll_interval, remaining))
