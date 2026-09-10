@@ -9,16 +9,18 @@ import json
 import ntpath
 import os
 import re
+import stat
 import sys
-import tempfile
+import threading
 import time
-from collections.abc import Iterable, Mapping
+import weakref
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from math import isfinite
 from numbers import Real
 from pathlib import Path
 from types import TracebackType
-from typing import BinaryIO, Protocol, Self
+from typing import Any, BinaryIO, Protocol, Self, cast
 
 from .errors import LockTimeoutError
 
@@ -168,6 +170,8 @@ def canonical_resource_identity(
         canonical_value = path_module.normcase(
             path_module.abspath(path_module.normpath(raw_value))
         ).replace("\\", "/")
+        if platform != "win32":
+            canonical_value = f"/{canonical_value.lstrip('/')}"
     else:
         canonical_value = raw_value
 
@@ -207,24 +211,57 @@ def canonicalize_resources(
 def default_lock_root(
     *,
     platform_name: str | None = None,
-    temporary_directory: os.PathLike[str] | str | None = None,
-    environment: Mapping[str, str] | None = None,
     user_id: int | None = None,
+    posix_home_resolver: Callable[[int], os.PathLike[str] | str] | None = None,
+    windows_data_resolver: Callable[[], os.PathLike[str] | str] | None = None,
 ) -> Path:
     """Return a deterministic per-user directory for cross-process locks."""
 
     platform = platform_name or sys.platform
-    temporary = Path(temporary_directory or tempfile.gettempdir())
     if platform == "win32":
-        variables = environment if environment is not None else os.environ
-        local_data = variables.get("LOCALAPPDATA")
-        root = Path(local_data) if local_data else temporary
-        return root / "minimalist-installer" / "locks"
+        windows_resolver = windows_data_resolver or _windows_user_data_directory
+        return (
+            _validated_user_directory(windows_resolver())
+            / "minimalist-installer"
+            / "locks"
+        )
     identifier = user_id
     if identifier is None:
         getuid = getattr(os, "getuid", None)
-        identifier = int(getuid()) if getuid is not None else 0
-    return temporary / f"minimalist-installer-{identifier}" / "locks"
+        if getuid is None:
+            raise RuntimeError("POSIX user identity is unavailable")
+        identifier = int(getuid())
+    posix_resolver = posix_home_resolver or _posix_account_home
+    return (
+        _validated_user_directory(posix_resolver(identifier))
+        / ".cache/minimalist-installer/locks"
+    )
+
+
+def _validated_user_directory(value: os.PathLike[str] | str) -> Path:
+    raw = os.fspath(value)
+    if not isinstance(raw, str):
+        raise TypeError("byte user directories are not accepted")
+    if not raw or "\x00" in raw:
+        raise ValueError("OS user directory must be non-empty text without NUL")
+    return Path(raw)
+
+
+def _posix_account_home(user_id: int) -> Path:
+    module = importlib.import_module("pwd")
+    entry = module.getpwuid(user_id)
+    return Path(cast(str, entry.pw_dir))
+
+
+def _windows_user_data_directory() -> Path:
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    windll = cast(Any, getattr(ctypes, "windll"))  # noqa: B009 - absent on POSIX
+    result = int(windll.shell32.SHGetFolderPathW(None, 0x001C, None, 0, buffer))
+    if result != 0 or not buffer.value:
+        raise OSError(result, "could not resolve Local AppData for the OS user")
+    return Path(buffer.value)
 
 
 class _HeldLock:
@@ -240,6 +277,21 @@ class _HeldLock:
             self.backend.release(self.file)
         finally:
             self.file.close()
+
+
+class _DescriptorFile:
+    """Minimal owned file object used to lock a duplicated directory FD."""
+
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor = descriptor
+
+    def fileno(self) -> int:
+        return self._descriptor
+
+    def close(self) -> None:
+        if self._descriptor >= 0:
+            os.close(self._descriptor)
+            self._descriptor = -1
 
 
 class ResourceLockLease:
@@ -292,6 +344,9 @@ class ResourceLockManager:
         poll_interval: float = 0.05,
         platform_name: str | None = None,
     ) -> None:
+        validated_poll_interval = _finite_real(
+            poll_interval, "poll_interval", allow_zero=False
+        )
         self.platform_name = platform_name or sys.platform
         self.root = (
             Path(root)
@@ -303,19 +358,57 @@ class ResourceLockManager:
             if backend is not None
             else lock_backend_for_platform(self.platform_name)
         )
-        self.poll_interval = _finite_real(
-            poll_interval, "poll_interval", allow_zero=False
-        )
+        self.poll_interval = validated_poll_interval
+        self._uses_custom_backend = backend is not None
+        self._root_descriptor: int | None = None
+        self._root_finalizer: Callable[[], object] | None = None
+        self._root_lifecycle_lock = threading.Lock()
+        self._ensure_root()
 
     def _ensure_root(self) -> None:
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        entry = self.root.lstat()
-        if not self.root.is_dir() or self.root.is_symlink():
-            raise RuntimeError(f"lock root is not a real directory: {self.root}")
-        if os.name == "posix" and entry.st_uid != os.getuid():
-            raise RuntimeError(
-                f"lock root is not owned by the current user: {self.root}"
+        with self._root_lifecycle_lock:
+            if self._root_descriptor is not None:
+                return
+            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            entry = self.root.lstat()
+            if not stat.S_ISDIR(entry.st_mode) or self.root.is_symlink():
+                raise RuntimeError(f"lock root is not a real directory: {self.root}")
+            if os.name == "posix":
+                if stat.S_IMODE(entry.st_mode) & 0o022:
+                    raise RuntimeError(
+                        f"lock root is group or world writable: {self.root}"
+                    )
+                if entry.st_uid != os.getuid():
+                    raise RuntimeError(
+                        f"lock root is not owned by the current user: {self.root}"
+                    )
+            if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
+                return
+
+            flags = (
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
             )
+            descriptor = os.open(self.root, flags)
+            opened = os.fstat(descriptor)
+            if not os.path.samestat(entry, opened):
+                os.close(descriptor)
+                raise RuntimeError(
+                    f"lock root identity changed while opening: {self.root}"
+                )
+            self._root_descriptor = descriptor
+            self._root_finalizer = weakref.finalize(self, os.close, descriptor)
+
+    def close(self) -> None:
+        """Release the held root descriptor; repeated calls are harmless."""
+
+        with self._root_lifecycle_lock:
+            if self._root_finalizer is not None:
+                self._root_finalizer()
+                self._root_finalizer = None
+            self._root_descriptor = None
 
     def lock_path(self, resource: str) -> Path:
         canonical = canonicalize_resources(
@@ -325,14 +418,54 @@ class ResourceLockManager:
         return self.root / f"{digest}.lock"
 
     def _open_lock_file(self, resource: str) -> BinaryIO:
-        path = self.lock_path(resource)
+        digest = hashlib.sha256(resource.encode("utf-8")).hexdigest()
+        filename = f"{digest}.lock"
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_BINARY"):
             flags |= os.O_BINARY
-        descriptor = os.open(path, flags, 0o600)
-        return os.fdopen(descriptor, "r+b", buffering=0)
+        if self._root_descriptor is not None:
+            descriptor = os.open(filename, flags, 0o600, dir_fd=self._root_descriptor)
+        else:
+            descriptor = os.open(self.root / filename, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise RuntimeError("resource lock path is not a regular file")
+            return os.fdopen(descriptor, "r+b", buffering=0)
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _open_root_authority(self) -> tuple[BinaryIO, LockBackend] | None:
+        if self._uses_custom_backend or self._root_descriptor is None:
+            return None
+        file = cast(BinaryIO, _DescriptorFile(os.dup(self._root_descriptor)))
+        return file, FcntlLockBackend()
+
+    def _acquire_one(
+        self,
+        file: BinaryIO,
+        backend: LockBackend,
+        resource: str,
+        *,
+        deadline: float,
+        timeout_seconds: float,
+    ) -> None:
+        while True:
+            if backend.try_acquire(file):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LockTimeoutError(
+                    f"timed out acquiring resource lock: {resource}",
+                    resource=resource,
+                    details={
+                        "lock_path": str(self.lock_path(resource)),
+                        "timeout_seconds": timeout_seconds,
+                    },
+                )
+            time.sleep(min(self.poll_interval, remaining))
 
     @staticmethod
     def _write_diagnostic_metadata(file: BinaryIO, resource: str) -> None:
@@ -371,25 +504,37 @@ class ResourceLockManager:
         deadline = time.monotonic() + timeout_seconds
         held: list[_HeldLock] = []
         try:
+            authority = self._open_root_authority() if ordered else None
+            if authority is not None:
+                authority_file, authority_backend = authority
+                authority_acquired = False
+                try:
+                    self._acquire_one(
+                        authority_file,
+                        authority_backend,
+                        ordered[0],
+                        deadline=deadline,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    authority_acquired = True
+                    held.append(
+                        _HeldLock(ordered[0], authority_file, authority_backend)
+                    )
+                finally:
+                    if not authority_acquired:
+                        authority_file.close()
             for resource in ordered:
                 file = self._open_lock_file(resource)
                 acquired = False
                 try:
-                    while True:
-                        if self.backend.try_acquire(file):
-                            acquired = True
-                            break
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            raise LockTimeoutError(
-                                f"timed out acquiring resource lock: {resource}",
-                                resource=resource,
-                                details={
-                                    "lock_path": str(self.lock_path(resource)),
-                                    "timeout_seconds": timeout_seconds,
-                                },
-                            )
-                        time.sleep(min(self.poll_interval, remaining))
+                    self._acquire_one(
+                        file,
+                        self.backend,
+                        resource,
+                        deadline=deadline,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    acquired = True
                     held.append(_HeldLock(resource, file, self.backend))
                     self._write_diagnostic_metadata(file, resource)
                 finally:

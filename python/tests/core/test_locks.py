@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import stat
 import subprocess
 import sys
 import textwrap
@@ -33,6 +34,33 @@ def test_path_resource_identity_is_absolute_lexical_and_stable(tmp_path: Path) -
     )
 
     assert direct == aliased == f"path:{(tmp_path / 'target').as_posix()}"
+
+
+def test_posix_equivalent_leading_slashes_have_one_identity(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.touch()
+    single_slash = str(target)
+    double_slash = f"/{single_slash}"
+
+    assert os.path.samefile(single_slash, double_slash)
+    assert canonical_resource_identity(
+        "path", single_slash, platform_name="linux"
+    ) == canonical_resource_identity("path", double_slash, platform_name="linux")
+
+
+def test_posix_leading_slash_aliases_cannot_take_dual_locks(tmp_path: Path) -> None:
+    root = tmp_path / "locks"
+    target = tmp_path / "target"
+    single_slash = f"path:{target}"
+    double_slash = f"path:/{target}"
+    holder = ResourceLockManager(root, platform_name="linux", poll_interval=0.005)
+    contender = ResourceLockManager(root, platform_name="linux", poll_interval=0.005)
+
+    with (
+        holder.acquire((single_slash,), timeout=0.1),
+        pytest.raises(LockTimeoutError),
+    ):
+        contender.acquire((double_slash,), timeout=0.03)
 
 
 def test_non_path_resource_identity_preserves_opaque_utf8_value() -> None:
@@ -109,27 +137,170 @@ def test_manager_uses_platform_path_semantics_before_locking(tmp_path: Path) -> 
     assert len(backend.acquired) == 1
 
 
-def test_default_lock_root_is_deterministic_and_user_scoped(tmp_path: Path) -> None:
+def test_default_posix_lock_root_uses_os_account_home_not_temp_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_home = tmp_path / "account-home"
+    resolved_user_ids: list[int] = []
+
+    def resolve_home(user_id: int) -> Path:
+        resolved_user_ids.append(user_id)
+        return account_home
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "first-temp"))
     first = default_lock_root(
         platform_name="linux",
-        temporary_directory=tmp_path,
         user_id=123,
+        posix_home_resolver=resolve_home,
     )
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "second-temp"))
     second = default_lock_root(
         platform_name="linux",
-        temporary_directory=tmp_path,
         user_id=123,
+        posix_home_resolver=resolve_home,
     )
 
-    assert first == second == tmp_path / "minimalist-installer-123" / "locks"
-    assert (
-        default_lock_root(
-            platform_name="win32",
-            temporary_directory=tmp_path,
-            environment={"LOCALAPPDATA": str(tmp_path / "local")},
-        )
-        == tmp_path / "local" / "minimalist-installer" / "locks"
+    assert first == second == account_home / ".cache/minimalist-installer/locks"
+    assert resolved_user_ids == [123, 123]
+
+
+def test_default_windows_lock_root_uses_os_user_data_not_temp_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_data = tmp_path / "local-data"
+    calls = 0
+
+    def resolve_local_data() -> Path:
+        nonlocal calls
+        calls += 1
+        return local_data
+
+    monkeypatch.setenv("TEMP", str(tmp_path / "first-temp"))
+    monkeypatch.setenv("TMP", str(tmp_path / "first-tmp"))
+    first = default_lock_root(
+        platform_name="win32",
+        windows_data_resolver=resolve_local_data,
     )
+    monkeypatch.setenv("TEMP", str(tmp_path / "second-temp"))
+    monkeypatch.setenv("TMP", str(tmp_path / "second-tmp"))
+    second = default_lock_root(
+        platform_name="win32",
+        windows_data_resolver=resolve_local_data,
+    )
+
+    assert first == second == local_data / "minimalist-installer" / "locks"
+    assert calls == 2
+
+
+def test_explicit_lock_root_remains_supported(tmp_path: Path) -> None:
+    explicit = tmp_path / "explicit"
+
+    manager = ResourceLockManager(explicit, backend=_RecordingBackend())
+
+    assert manager.root == explicit
+
+
+def test_new_lock_root_is_private_to_the_os_user(tmp_path: Path) -> None:
+    root = tmp_path / "locks"
+    manager = ResourceLockManager(root)
+
+    with manager.acquire(("kind:private-root",), timeout=0.1):
+        pass
+
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+
+
+def test_existing_group_or_world_writable_lock_root_is_rejected(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "locks"
+    root.mkdir(mode=0o777)
+    root.chmod(0o777)
+
+    with pytest.raises(RuntimeError, match="writable"):
+        ResourceLockManager(root).acquire(("kind:unsafe-root",), timeout=0.1)
+
+    assert list(root.iterdir()) == []
+
+
+def test_lock_root_owned_by_another_posix_user_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "locks"
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(locks.os, "getuid", lambda: root.stat().st_uid + 1)
+
+    with pytest.raises(RuntimeError, match="owned"):
+        ResourceLockManager(root)
+
+    assert list(root.iterdir()) == []
+
+
+def test_windows_does_not_treat_posix_mode_bits_as_acl_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "locks"
+    manager = ResourceLockManager(root, backend=_RecordingBackend())
+    manager.close()
+    root.chmod(0o777)
+    monkeypatch.setattr(locks.os, "name", "nt")
+
+    manager._ensure_root()
+
+
+def test_unlinked_resource_lock_cannot_create_a_simultaneous_lease(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "locks"
+    holder = ResourceLockManager(root, poll_interval=0.005)
+    contender = ResourceLockManager(root, poll_interval=0.005)
+    lease = holder.acquire(("kind:unlink",), timeout=0.1)
+    holder.lock_path("kind:unlink").unlink()
+
+    try:
+        with pytest.raises(LockTimeoutError):
+            contender.acquire(("kind:unlink",), timeout=0.03)
+    finally:
+        lease.release()
+
+
+def test_anchored_root_blocks_dual_lease_after_ancestor_retarget(
+    tmp_path: Path,
+) -> None:
+    trusted_parent = tmp_path / "trusted"
+    root = trusted_parent / "locks"
+    outside_parent = tmp_path / "outside"
+    outside_root = outside_parent / "locks"
+    root.mkdir(parents=True, mode=0o700)
+    outside_root.mkdir(parents=True)
+    sentinel = outside_root / "sentinel.bin"
+    sentinel.write_bytes(b"outside-original")
+    holder = ResourceLockManager(root, poll_interval=0.005)
+    contender = ResourceLockManager(root, poll_interval=0.005)
+    holder._ensure_root()
+    contender._ensure_root()
+    lease = holder.acquire(("kind:retarget",), timeout=0.1)
+
+    moved_parent = tmp_path / "trusted-held"
+    trusted_parent.rename(moved_parent)
+    try:
+        trusted_parent.symlink_to(outside_parent, target_is_directory=True)
+    except (NotImplementedError, OSError) as error:
+        lease.release()
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    try:
+        with pytest.raises(LockTimeoutError):
+            contender.acquire(("kind:retarget",), timeout=0.03)
+    finally:
+        lease.release()
+
+    assert sentinel.read_bytes() == b"outside-original"
+    assert list(outside_root.iterdir()) == [sentinel]
 
 
 @pytest.mark.parametrize(
@@ -156,7 +327,7 @@ def test_timeout_must_be_a_nonnegative_finite_real(
     with pytest.raises((TypeError, ValueError)):
         manager.acquire(("kind:value",), timeout=timeout)  # type: ignore[arg-type]
 
-    assert not root.exists()
+    assert list(root.glob("*.lock")) == []
 
 
 class _RecordingBackend:
@@ -207,6 +378,34 @@ def test_failure_after_os_acquisition_releases_the_descriptor(
     assert backend.released == backend.acquired
 
 
+def test_fdopen_failure_closes_raw_lock_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = ResourceLockManager(tmp_path / "locks", backend=_RecordingBackend())
+    manager._ensure_root()
+    real_open = locks.os.open
+    descriptors: list[int] = []
+
+    def recording_open(*args: Any, **kwargs: Any) -> int:
+        descriptor = real_open(*args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+
+    def fail_fdopen(*args: Any, **kwargs: Any) -> BinaryIO:
+        raise OSError(errno.EMFILE, "injected fdopen failure")
+
+    monkeypatch.setattr(locks.os, "open", recording_open)
+    monkeypatch.setattr(locks.os, "fdopen", fail_fdopen)
+
+    with pytest.raises(OSError, match="fdopen failure"):
+        manager.acquire(("kind:fdopen",), timeout=0)
+
+    assert len(descriptors) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(descriptors[0])
+
+
 def test_contention_times_out_and_reports_safe_diagnostics(tmp_path: Path) -> None:
     root = tmp_path / "locks"
     first = ResourceLockManager(root, poll_interval=0.005)
@@ -227,7 +426,7 @@ def test_contention_times_out_and_reports_safe_diagnostics(tmp_path: Path) -> No
 
 def test_stale_or_forged_metadata_never_grants_or_denies_a_lock(tmp_path: Path) -> None:
     root = tmp_path / "locks"
-    root.mkdir()
+    root.mkdir(mode=0o700)
     resource = "kind:shared"
     manager = ResourceLockManager(root)
     path = manager.lock_path(resource)
