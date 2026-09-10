@@ -3,7 +3,10 @@
 from importlib import metadata as _metadata
 
 from .core import (
+    ActiveTransactionState,
     BlobStatus,
+    CleanupProofKind,
+    CleanupTombstone,
     CheckpointWriter,
     CorruptManifestError,
     CorruptTransactionError,
@@ -57,7 +60,10 @@ from .core import (
 from .providers import FileSetProvider
 
 __all__ = [
+    "ActiveTransactionState",
     "BlobStatus",
+    "CleanupProofKind",
+    "CleanupTombstone",
     "CheckpointWriter",
     "CorruptManifestError",
     "CorruptTransactionError",

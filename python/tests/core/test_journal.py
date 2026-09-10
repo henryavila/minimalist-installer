@@ -8,7 +8,9 @@ import pytest
 
 from minimalist_installer import CorruptTransactionError, EffectPlan, Operation, PreparedEffect
 from minimalist_installer.core.journal import (
+    ACTIVE_TRANSACTION_V1_SCHEMA,
     BlobStatus,
+    CleanupTombstone,
     EffectProgress,
     TRANSACTION_V1_SCHEMA,
     TransactionBlobRecord,
@@ -43,6 +45,13 @@ def test_schema_file_exactly_matches_runtime_transaction_schema() -> None:
     )
 
     assert json.loads(schema_path.read_text("utf-8")) == TRANSACTION_V1_SCHEMA
+    active_schema_path = (
+        Path(__file__).parents[3]
+        / "spec/schemas/python-active-transaction-v1.schema.json"
+    )
+    assert json.loads(active_schema_path.read_text("utf-8")) == (
+        ACTIVE_TRANSACTION_V1_SCHEMA
+    )
 
 
 def test_begin_persists_a_strict_active_write_ahead_journal(tmp_path: Path) -> None:
@@ -171,6 +180,44 @@ def test_checkpoint_writer_exposes_the_transaction_blob_store(tmp_path: Path) ->
     assert repository.read("tx-1").blobs == (
         TransactionBlobRecord(digest=digest, status=BlobStatus.READY),
     )
+
+
+def test_reconstructed_checkpoint_writer_loads_an_immutable_wal_snapshot(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    plan = _plan()
+    repository.begin(
+        transaction_id="tx-1",
+        installation_id="install-1",
+        operation=Operation.UNINSTALL,
+        engine_version="0.1.0",
+        plans=(plan,),
+        resources=("kind:a", "kind:z"),
+    )
+    repository.record_prepared(
+        "tx-1", plan.id, PreparedEffect(before_state=None, payload=None)
+    )
+    first = repository.checkpoint_writer("tx-1", plan.id)
+    first.write("removed:a", {"paths": ["a"]})
+    digest = first.write_blob(b"backup")
+
+    reconstructed = repository.checkpoint_writer("tx-1", plan.id)
+
+    assert reconstructed.read("removed:a") == {"paths": ("a",)}
+    assert reconstructed.read("missing") is None
+    snapshot = reconstructed.snapshot()
+    assert snapshot == {"removed:a": {"paths": ("a",)}}
+    with pytest.raises(TypeError):
+        snapshot["new"] = True
+    with pytest.raises(AttributeError):
+        snapshot["removed:a"]["paths"].append("mutate")
+    assert reconstructed.read_blob(digest) == b"backup"
+    reconstructed.write("removed:b", {"done": True})
+    assert repository.checkpoint_writer("tx-1", plan.id).snapshot() == {
+        "removed:a": {"paths": ("a",)},
+        "removed:b": {"done": True},
+    }
 
 
 def test_blob_descriptor_is_write_ahead_of_bytes_and_marked_ready_last(
@@ -460,6 +507,101 @@ def test_cleanup_failure_never_removes_active_authority_first(tmp_path: Path) ->
 
     assert (tmp_path / "state/transactions/active.json").is_file()
     assert repository.active() is not None
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["tombstone", "blob", "blob-dir", "journal", "transaction-dir", "active"],
+)
+def test_cleanup_restarts_from_strict_active_tombstone_after_every_boundary(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    repository = _repository(tmp_path)
+    plan = _plan()
+    repository.begin(
+        transaction_id="tx-1",
+        installation_id="install-1",
+        operation=Operation.INSTALL,
+        engine_version="0.1.0",
+        plans=(plan,),
+        resources=("kind:a", "kind:z"),
+    )
+    repository.record_prepared(
+        "tx-1", plan.id, PreparedEffect(before_state=None, payload=None)
+    )
+    digest = repository.write_blob("tx-1", b"backup")
+    repository.record_applied("tx-1", plan.id, None)
+    repository.checkpoint("tx-1", "effects_applied")
+    repository.checkpoint("tx-1", "committing")
+    repository.checkpoint("tx-1", "manifest_committed")
+    ManifestRepository(
+        repository.filesystem, manifest_directory="state"
+    ).commit(
+        installation_id="install-1",
+        consumer="tests",
+        consumer_version="1",
+        transaction_id="tx-1",
+        engine_version="0.1.0",
+        effects=(),
+    )
+    real_json = repository.filesystem.atomic_write_json
+    real_unlink = repository.filesystem.unlink
+    real_rmdir = repository.filesystem.rmdir_empty
+    failed = False
+
+    def fail_once(label: str) -> None:
+        nonlocal failed
+        if not failed and boundary == label:
+            failed = True
+            raise OSError(f"fail {label}")
+
+    def write_json(path: object, value: object, **kwargs: object) -> None:
+        if path == repository.active_path and isinstance(value, dict):
+            if value.get("state") == "cleanup":
+                fail_once("tombstone")
+        real_json(path, value, **kwargs)
+
+    def unlink(path: object, **kwargs: object) -> bool:
+        text = str(path)
+        if text.endswith(".blob"):
+            fail_once("blob")
+        elif text.endswith("journal.json"):
+            fail_once("journal")
+        elif path == repository.active_path:
+            fail_once("active")
+        return real_unlink(path, **kwargs)
+
+    def rmdir(path: object, **kwargs: object) -> bool:
+        text = str(path)
+        if text.endswith("/blobs"):
+            fail_once("blob-dir")
+        elif text.endswith("/tx-1"):
+            fail_once("transaction-dir")
+        return real_rmdir(path, **kwargs)
+
+    repository.filesystem.atomic_write_json = write_json  # type: ignore[method-assign]
+    repository.filesystem.unlink = unlink  # type: ignore[method-assign]
+    repository.filesystem.rmdir_empty = rmdir  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match=f"fail {boundary}"):
+        repository.complete("tx-1")
+
+    active = repository.active()
+    assert active is not None
+    if boundary == "tombstone":
+        assert not isinstance(active, CleanupTombstone)
+    else:
+        assert isinstance(active, CleanupTombstone)
+        assert active.blobs == (digest,)
+
+    repository.filesystem.atomic_write_json = real_json  # type: ignore[method-assign]
+    repository.filesystem.unlink = real_unlink  # type: ignore[method-assign]
+    repository.filesystem.rmdir_empty = real_rmdir  # type: ignore[method-assign]
+    repository.complete("tx-1")
+
+    assert repository.active() is None
+    assert not (tmp_path / f"state/transactions/tx-1/blobs/{digest}.blob").exists()
 
 
 def test_corrupt_or_foreign_transaction_fails_closed(tmp_path: Path) -> None:

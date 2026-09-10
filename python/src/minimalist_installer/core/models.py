@@ -262,9 +262,17 @@ class StatusResult:
 
 @runtime_checkable
 class CheckpointWriter(Protocol):
-    """Durably records fine-grained progress inside an applied effect."""
+    """Durable progress and blob access reconstructed from an effect WAL."""
 
     def write(self, checkpoint: str, state: JsonValue) -> None: ...
+
+    def snapshot(self) -> Mapping[str, JsonValue]: ...
+
+    def read(self, checkpoint: str) -> JsonValue | None: ...
+
+    def write_blob(self, data: bytes) -> str: ...
+
+    def read_blob(self, digest: str) -> bytes: ...
 
 
 @runtime_checkable

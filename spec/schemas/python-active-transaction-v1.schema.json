@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/henryavila/minimalist-installer/spec/schemas/python-active-transaction-v1.schema.json",
+  "title": "Minimalist Installer Python active transaction authority v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "state", "transaction_id"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "state": { "const": "active" },
+        "transaction_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "state",
+        "transaction_id",
+        "operation",
+        "proof",
+        "blobs"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "state": { "const": "cleanup" },
+        "transaction_id": { "type": "string", "minLength": 1 },
+        "operation": { "enum": ["install", "update", "repair", "uninstall"] },
+        "proof": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "transaction_id"],
+          "properties": {
+            "kind": { "enum": ["committed_manifest", "manifest_removed"] },
+            "transaction_id": { "type": "string", "minLength": 1 }
+          }
+        },
+        "blobs": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    }
+  ]
+}

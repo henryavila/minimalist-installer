@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Final, cast
 
 from .errors import CorruptTransactionError, IncompleteTransactionError
@@ -49,6 +50,16 @@ class EffectProgress(StrEnum):
 class BlobStatus(StrEnum):
     PENDING = "pending"
     READY = "ready"
+
+
+class ActiveTransactionState(StrEnum):
+    ACTIVE = "active"
+    CLEANUP = "cleanup"
+
+
+class CleanupProofKind(StrEnum):
+    COMMITTED_MANIFEST = "committed_manifest"
+    MANIFEST_REMOVED = "manifest_removed"
 
 
 TRANSACTION_V1_SCHEMA: JsonObject = {
@@ -155,6 +166,59 @@ TRANSACTION_V1_SCHEMA: JsonObject = {
     },
 }
 
+ACTIVE_TRANSACTION_V1_SCHEMA: JsonObject = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://github.com/henryavila/minimalist-installer/spec/schemas/python-active-transaction-v1.schema.json",
+    "title": "Minimalist Installer Python active transaction authority v1",
+    "oneOf": [
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["schema_version", "state", "transaction_id"],
+            "properties": {
+                "schema_version": {"const": 1},
+                "state": {"const": "active"},
+                "transaction_id": {"type": "string", "minLength": 1},
+            },
+        },
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "schema_version",
+                "state",
+                "transaction_id",
+                "operation",
+                "proof",
+                "blobs",
+            ],
+            "properties": {
+                "schema_version": {"const": 1},
+                "state": {"const": "cleanup"},
+                "transaction_id": {"type": "string", "minLength": 1},
+                "operation": {
+                    "enum": ["install", "update", "repair", "uninstall"]
+                },
+                "proof": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["kind", "transaction_id"],
+                    "properties": {
+                        "kind": {
+                            "enum": ["committed_manifest", "manifest_removed"]
+                        },
+                        "transaction_id": {"type": "string", "minLength": 1},
+                    },
+                },
+                "blobs": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                },
+            },
+        },
+    ],
+}
+
 _JOURNAL_KEYS = frozenset(
     {
         "schema_version",
@@ -186,6 +250,11 @@ _EFFECT_KEYS = frozenset(
 _PREPARED_KEYS = frozenset({"before_state", "payload", "resources", "recoverable"})
 _CHECKPOINT_KEYS = frozenset({"name", "state"})
 _BLOB_KEYS = frozenset({"digest", "status"})
+_ACTIVE_KEYS = frozenset({"schema_version", "state", "transaction_id"})
+_CLEANUP_KEYS = frozenset(
+    {"schema_version", "state", "transaction_id", "operation", "proof", "blobs"}
+)
+_PROOF_KEYS = frozenset({"kind", "transaction_id"})
 
 
 def _identifier(value: object, label: str, *, effect: bool = False) -> str:
@@ -270,6 +339,88 @@ class TransactionBlobRecord:
             raise ValueError("blob.status is unsupported") from error
         digest = _text(data["digest"], "blob.digest")
         return cls(digest=digest, status=status)
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupTombstone:
+    transaction_id: str
+    operation: Operation
+    proof_kind: CleanupProofKind
+    proof_transaction_id: str
+    blobs: tuple[str, ...]
+    schema_version: int = TRANSACTION_SCHEMA_VERSION
+    state: ActiveTransactionState = ActiveTransactionState.CLEANUP
+
+    def __post_init__(self) -> None:
+        if self.schema_version != TRANSACTION_SCHEMA_VERSION:
+            raise ValueError("unsupported cleanup tombstone schema")
+        if self.state is not ActiveTransactionState.CLEANUP:
+            raise ValueError("cleanup tombstone state must be cleanup")
+        _identifier(self.transaction_id, "transaction_id")
+        _identifier(self.proof_transaction_id, "proof.transaction_id")
+        if self.proof_transaction_id != self.transaction_id:
+            raise ValueError("cleanup proof transaction id must match tombstone")
+        if not isinstance(self.operation, Operation) or self.operation is Operation.STATUS:
+            raise ValueError("cleanup operation is invalid")
+        if not isinstance(self.proof_kind, CleanupProofKind):
+            raise TypeError("cleanup proof kind is invalid")
+        forward = self.operation in {Operation.INSTALL, Operation.UPDATE}
+        expected = (
+            CleanupProofKind.COMMITTED_MANIFEST
+            if forward
+            else CleanupProofKind.MANIFEST_REMOVED
+        )
+        if self.proof_kind is not expected:
+            raise ValueError("cleanup proof kind does not match operation")
+        object.__setattr__(self, "blobs", tuple(self.blobs))
+        if len(self.blobs) != len(set(self.blobs)) or any(
+            not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None
+            for digest in self.blobs
+        ):
+            raise ValueError("cleanup blob ids must be unique SHA-256 digests")
+
+    def to_dict(self) -> JsonObject:
+        return {
+            "schema_version": self.schema_version,
+            "state": self.state.value,
+            "transaction_id": self.transaction_id,
+            "operation": self.operation.value,
+            "proof": {
+                "kind": self.proof_kind.value,
+                "transaction_id": self.proof_transaction_id,
+            },
+            "blobs": list(self.blobs),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> CleanupTombstone:
+        data = _object(value, "cleanup tombstone")
+        _exact(data, _CLEANUP_KEYS, "cleanup tombstone")
+        if data["schema_version"] != TRANSACTION_SCHEMA_VERSION:
+            raise ValueError("unsupported cleanup tombstone schema")
+        if data["state"] != ActiveTransactionState.CLEANUP.value:
+            raise ValueError("cleanup tombstone state is invalid")
+        proof = _object(data["proof"], "cleanup proof")
+        _exact(proof, _PROOF_KEYS, "cleanup proof")
+        try:
+            operation = Operation(_text(data["operation"], "cleanup operation"))
+            proof_kind = CleanupProofKind(
+                _text(proof["kind"], "cleanup proof kind")
+            )
+        except ValueError as error:
+            raise ValueError("cleanup tombstone enum is unsupported") from error
+        return cls(
+            transaction_id=_identifier(data["transaction_id"], "transaction_id"),
+            operation=operation,
+            proof_kind=proof_kind,
+            proof_transaction_id=_identifier(
+                proof["transaction_id"], "proof.transaction_id"
+            ),
+            blobs=tuple(
+                _text(item, "cleanup blob")
+                for item in _array(data["blobs"], "cleanup blobs")
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,11 +749,36 @@ class _DurableCheckpointWriter:
         self._repository = repository
         self._transaction_id = transaction_id
         self._effect_id = effect_id
+        self._snapshot = self._load_snapshot()
+
+    def _load_snapshot(self) -> Mapping[str, JsonValue]:
+        journal = self._repository.read(self._transaction_id)
+        matches = tuple(
+            effect for effect in journal.effects if effect.id == self._effect_id
+        )
+        if len(matches) != 1:
+            raise CorruptTransactionError(
+                "checkpoint writer effect is missing or duplicated",
+                details={
+                    "transaction_id": self._transaction_id,
+                    "effect_id": self._effect_id,
+                },
+            )
+        return MappingProxyType(
+            {checkpoint.name: checkpoint.state for checkpoint in matches[0].checkpoints}
+        )
 
     def write(self, checkpoint: str, state: JsonValue) -> None:
         self._repository.effect_checkpoint(
             self._transaction_id, self._effect_id, checkpoint, state
         )
+        self._snapshot = self._load_snapshot()
+
+    def snapshot(self) -> Mapping[str, JsonValue]:
+        return self._snapshot
+
+    def read(self, checkpoint: str) -> JsonValue | None:
+        return self._snapshot.get(checkpoint)
 
     def write_blob(self, data: bytes) -> str:
         return self._repository.write_blob(self._transaction_id, data)
@@ -681,7 +857,7 @@ class TransactionRepository:
                 details={"transaction_id": transaction_id, "reason": str(error)},
             ) from error
 
-    def active(self) -> TransactionJournal | None:
+    def active(self) -> TransactionJournal | CleanupTombstone | None:
         try:
             pointer = _object(self.filesystem.read_json(self.active_path), "active transaction")
         except FileNotFoundError:
@@ -692,10 +868,17 @@ class TransactionRepository:
                 path=self.filesystem.base / self.active_path,
             ) from error
         try:
-            _exact(pointer, frozenset({"schema_version", "transaction_id"}), "active transaction")
+            state = ActiveTransactionState(
+                _text(pointer.get("state"), "active transaction state")
+            )
+            if state is ActiveTransactionState.CLEANUP:
+                return CleanupTombstone.from_dict(pointer)
+            _exact(pointer, _ACTIVE_KEYS, "active transaction")
             if pointer["schema_version"] != TRANSACTION_SCHEMA_VERSION:
                 raise ValueError("unsupported active transaction schema")
-            transaction_id = _identifier(pointer["transaction_id"], "transaction_id")
+            transaction_id = _identifier(
+                pointer["transaction_id"], "transaction_id"
+            )
         except (TypeError, ValueError, KeyError) as error:
             raise CorruptTransactionError(
                 f"active transaction pointer is invalid: {error}",
@@ -742,7 +925,11 @@ class TransactionRepository:
         self._write(transaction_id, journal)
         self.filesystem.atomic_write_json(
             self.active_path,
-            {"schema_version": TRANSACTION_SCHEMA_VERSION, "transaction_id": transaction_id},
+            {
+                "schema_version": TRANSACTION_SCHEMA_VERSION,
+                "state": ActiveTransactionState.ACTIVE.value,
+                "transaction_id": transaction_id,
+            },
         )
         return journal
 
@@ -963,62 +1150,116 @@ class TransactionRepository:
         *,
         committed_transaction_id: str | None = None,
     ) -> None:
-        journal = self.read(transaction_id)
+        requested_id = _identifier(transaction_id, "transaction_id")
         active = self.active()
-        if active is None or active.transaction_id != transaction_id:
+        if active is None or active.transaction_id != requested_id:
             raise CorruptTransactionError("completed transaction is not the active transaction")
-        if any(blob.status is not BlobStatus.READY for blob in journal.blobs):
-            raise IncompleteTransactionError(
-                "transaction contains an incomplete blob write",
-                details={"transaction_id": transaction_id},
+        if isinstance(active, CleanupTombstone):
+            tombstone = active
+            self._verify_cleanup_proof(
+                tombstone,
+                committed_transaction_id=committed_transaction_id,
             )
-        if journal.operation in {Operation.INSTALL, Operation.UPDATE}:
-            from .manifest import ManifestRepository
-
-            committed = ManifestRepository(
-                self.filesystem,
-                manifest_directory=self.manifest_directory,
-            ).read()
-            if (
-                committed is None
-                or committed.transaction_id != transaction_id
-                or (
-                    committed_transaction_id is not None
-                    and committed_transaction_id != transaction_id
-                )
-                or "manifest_committed" not in journal.operation_checkpoints
-            ):
-                raise CorruptTransactionError(
-                    "committed manifest transaction proof does not match cleanup",
-                    details={
-                        "transaction_id": transaction_id,
-                        "committed_transaction_id": committed_transaction_id,
-                    },
-                )
-        elif "manifest_removed" not in journal.operation_checkpoints:
-            raise CorruptTransactionError(
-                "manifest removal proof is missing for cleanup",
-                details={"transaction_id": transaction_id},
+        else:
+            journal = active
+            tombstone = self._prepare_cleanup_tombstone(
+                journal,
+                committed_transaction_id=committed_transaction_id,
+            )
+            # This durable descriptor contains everything needed after journal
+            # deletion. No destructive cleanup may precede it.
+            self.filesystem.atomic_write_json(
+                self.active_path, tombstone.to_dict()
             )
 
-        for blob in journal.blobs:
+        for digest in tombstone.blobs:
             self.filesystem.unlink(
-                self._blob_path(transaction_id, blob.digest), missing_ok=True
+                self._blob_path(requested_id, digest), missing_ok=True
             )
-        blob_directory = f"{self.transactions_directory}/{transaction_id}/blobs"
+        blob_directory = f"{self.transactions_directory}/{requested_id}/blobs"
         self.filesystem.rmdir_empty(blob_directory, missing_ok=True)
-        self.filesystem.unlink(self._journal_path(transaction_id))
+        self.filesystem.unlink(self._journal_path(requested_id), missing_ok=True)
         self.filesystem.rmdir_empty(
-            f"{self.transactions_directory}/{transaction_id}", missing_ok=True
+            f"{self.transactions_directory}/{requested_id}", missing_ok=True
         )
         # This pointer is the cleanup authority and must be the final unlink.
         self.filesystem.unlink(self.active_path)
         self.filesystem.rmdir_empty(self.transactions_directory, missing_ok=True)
         self.filesystem.rmdir_empty(self.manifest_directory, missing_ok=True)
 
+    def _prepare_cleanup_tombstone(
+        self,
+        journal: TransactionJournal,
+        *,
+        committed_transaction_id: str | None,
+    ) -> CleanupTombstone:
+        if any(blob.status is not BlobStatus.READY for blob in journal.blobs):
+            raise IncompleteTransactionError(
+                "transaction contains an incomplete blob write",
+                details={"transaction_id": journal.transaction_id},
+            )
+        forward = journal.operation in {Operation.INSTALL, Operation.UPDATE}
+        required_checkpoint = "manifest_committed" if forward else "manifest_removed"
+        if required_checkpoint not in journal.operation_checkpoints:
+            raise CorruptTransactionError(
+                "transaction cleanup proof checkpoint is missing",
+                details={"transaction_id": journal.transaction_id},
+            )
+        tombstone = CleanupTombstone(
+            transaction_id=journal.transaction_id,
+            operation=journal.operation,
+            proof_kind=(
+                CleanupProofKind.COMMITTED_MANIFEST
+                if forward
+                else CleanupProofKind.MANIFEST_REMOVED
+            ),
+            proof_transaction_id=journal.transaction_id,
+            blobs=tuple(blob.digest for blob in journal.blobs),
+        )
+        self._verify_cleanup_proof(
+            tombstone,
+            committed_transaction_id=committed_transaction_id,
+        )
+        return tombstone
+
+    def _verify_cleanup_proof(
+        self,
+        tombstone: CleanupTombstone,
+        *,
+        committed_transaction_id: str | None,
+    ) -> None:
+        from .manifest import ManifestRepository
+
+        committed = ManifestRepository(
+            self.filesystem,
+            manifest_directory=self.manifest_directory,
+        ).read()
+        if tombstone.proof_kind is CleanupProofKind.COMMITTED_MANIFEST:
+            valid = (
+                committed is not None
+                and committed.transaction_id == tombstone.proof_transaction_id
+            )
+        else:
+            valid = committed is None
+        if committed_transaction_id is not None:
+            valid = valid and committed_transaction_id == tombstone.transaction_id
+        if not valid:
+            raise CorruptTransactionError(
+                "committed manifest transaction proof does not match cleanup",
+                details={
+                    "transaction_id": tombstone.transaction_id,
+                    "committed_transaction_id": committed_transaction_id,
+                    "proof_kind": tombstone.proof_kind.value,
+                },
+            )
+
 
 __all__ = [
+    "ACTIVE_TRANSACTION_V1_SCHEMA",
+    "ActiveTransactionState",
     "BlobStatus",
+    "CleanupProofKind",
+    "CleanupTombstone",
     "EffectProgress",
     "JournalCheckpoint",
     "TRANSACTION_ENGINE_NAME",

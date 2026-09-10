@@ -348,6 +348,18 @@ def test_provider_and_effect_contracts_are_public_protocols() -> None:
         def write(self, checkpoint: str, state: object) -> None:
             return None
 
+        def snapshot(self) -> dict[str, object]:
+            return {}
+
+        def read(self, checkpoint: str) -> object:
+            return None
+
+        def write_blob(self, data: bytes) -> str:
+            return "digest"
+
+        def read_blob(self, digest: str) -> bytes:
+            return b"blob"
+
     class EffectImplementation:
         type = "example"
         version = 1
@@ -379,6 +391,21 @@ def test_provider_and_effect_contracts_are_public_protocols() -> None:
         "self",
         "checkpoint",
         "state",
+    ]
+    assert list(inspect.signature(api.CheckpointWriter.snapshot).parameters) == [
+        "self"
+    ]
+    assert list(inspect.signature(api.CheckpointWriter.read).parameters) == [
+        "self",
+        "checkpoint",
+    ]
+    assert list(inspect.signature(api.CheckpointWriter.write_blob).parameters) == [
+        "self",
+        "data",
+    ]
+    assert list(inspect.signature(api.CheckpointWriter.read_blob).parameters) == [
+        "self",
+        "digest",
     ]
     assert list(inspect.signature(api.Effect.prepare).parameters) == [
         "self",

@@ -24,7 +24,10 @@ from .errors import (
 )
 from .driver import Driver, Installer, define_installer
 from .journal import (
+    ActiveTransactionState,
     BlobStatus,
+    CleanupProofKind,
+    CleanupTombstone,
     EffectProgress,
     JournalCheckpoint,
     TransactionEffectRecord,
@@ -58,6 +61,9 @@ from .models import (
 __all__ = [
     "CheckpointWriter",
     "BlobStatus",
+    "ActiveTransactionState",
+    "CleanupProofKind",
+    "CleanupTombstone",
     "CorruptManifestError",
     "CorruptTransactionError",
     "Driver",
