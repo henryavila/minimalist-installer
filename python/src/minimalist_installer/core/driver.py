@@ -16,6 +16,7 @@ from .errors import (
     InvalidEffectError,
     InvalidPlanError,
     NoInstallationError,
+    PlanDriftError,
 )
 from .journal import TransactionRepository
 from .locks import (
@@ -24,7 +25,7 @@ from .locks import (
     canonical_resource_identity,
     canonicalize_resources,
 )
-from .manifest import ManifestEffectRecord, ManifestRepository
+from .manifest import CommittedManifest, ManifestEffectRecord, ManifestRepository
 from .models import (
     Effect,
     EffectContext,
@@ -62,17 +63,16 @@ def _validated_identifier(value: object, label: str) -> str:
     return value
 
 
-def _derived_effect_id(plan: EffectPlan) -> str:
-    material = plan.to_dict()
-    material["id"] = ""
+def _manifest_fingerprint(manifest: CommittedManifest | None) -> str:
+    value: JsonValue = manifest.to_dict() if manifest is not None else None
     encoded = json.dumps(
-        material,
+        value,
         allow_nan=False,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return f"{plan.type}:{hashlib.sha256(encoded).hexdigest()[:16]}"
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class Driver:
@@ -142,7 +142,7 @@ class Driver:
             operation=operation,
             installation_id=installation_id,
         )
-        planned: list[EffectPlan] = []
+        emitted_plans: list[EffectPlan] = []
         for provider in self.providers:
             emitted = provider.plan(self.config, context)
             if not isinstance(emitted, Sequence) or isinstance(emitted, str | bytes):
@@ -150,11 +150,32 @@ class Driver:
             for plan in emitted:
                 if not isinstance(plan, EffectPlan):
                     raise InvalidPlanError("provider emitted a value that is not an EffectPlan")
-                effect_id = plan.id.strip()
-                if not effect_id:
-                    effect_id = _derived_effect_id(plan)
-                _validated_identifier(effect_id, "effect id")
-                planned.append(plan if effect_id == plan.id else replace(plan, id=effect_id))
+                emitted_plans.append(
+                    replace(plan, resources=canonicalize_resources(plan.resources))
+                )
+
+        type_counts: dict[str, int] = {}
+        for plan in emitted_plans:
+            type_counts[plan.type] = type_counts.get(plan.type, 0) + 1
+
+        planned: list[EffectPlan] = []
+        for plan in emitted_plans:
+            effect_id = plan.id.strip()
+            if not effect_id:
+                if type_counts[plan.type] != 1:
+                    raise PlanDriftError(
+                        f'effect type "{plan.type}" occurs more than once '
+                        "and requires explicit ids",
+                        details={
+                            "effect_type": plan.type,
+                            "occurrences": type_counts[plan.type],
+                        },
+                    )
+                effect_id = plan.type
+            _validated_identifier(effect_id, "effect id")
+            planned.append(
+                plan if effect_id == plan.id else replace(plan, id=effect_id)
+            )
 
         identifiers = [plan.id for plan in planned]
         duplicates = sorted(
@@ -172,11 +193,61 @@ class Driver:
         return tuple(planned)
 
     @staticmethod
-    def _resources(base_path: Path, plans: Sequence[EffectPlan]) -> tuple[str, ...]:
+    def _resources(
+        base_path: Path,
+        plans: Sequence[EffectPlan],
+        previous: CommittedManifest | None = None,
+    ) -> tuple[str, ...]:
         root = canonical_resource_identity("path", base_path)
-        return canonicalize_resources(
-            (root, *(resource for plan in plans for resource in plan.resources))
+        resources = [
+            root,
+            *(resource for plan in plans for resource in plan.resources),
+        ]
+        if previous is not None:
+            resources.extend(
+                resource
+                for record in previous.effects
+                for resource in record.resources
+            )
+        return canonicalize_resources(resources)
+
+    def _validate_prior(
+        self,
+        previous: CommittedManifest | None,
+        plans: Sequence[EffectPlan],
+    ) -> dict[str, ManifestEffectRecord]:
+        if previous is None:
+            return {}
+        prior_by_id: dict[str, ManifestEffectRecord] = {}
+        for record in previous.effects:
+            self.registry.require(record.type, record.effect_version)
+            prior_by_id[record.id] = record
+
+        planned_ids = {plan.id for plan in plans}
+        missing = tuple(
+            record.id for record in previous.effects if record.id not in planned_ids
         )
+        if missing:
+            raise PlanDriftError(
+                "new desired plan would drop previously committed effects",
+                details={"missing_effect_ids": list(missing)},
+            )
+        for plan in plans:
+            prior = prior_by_id.get(plan.id)
+            if prior is not None and (
+                prior.type != plan.type or prior.effect_version != plan.version
+            ):
+                raise PlanDriftError(
+                    f'effect id "{plan.id}" changed type or version',
+                    details={
+                        "effect_id": plan.id,
+                        "previous_type": prior.type,
+                        "previous_version": prior.effect_version,
+                        "planned_type": plan.type,
+                        "planned_version": plan.version,
+                    },
+                )
+        return prior_by_id
 
     @staticmethod
     def _ensure_prepared_resources_locked(
@@ -200,129 +271,134 @@ class Driver:
             transactions = TransactionRepository(
                 filesystem, manifest_directory=self.manifest_directory
             )
-            active = transactions.active()
-            if active is not None:
-                raise IncompleteTransactionError(
-                    f"transaction {active.transaction_id} is incomplete",
-                    operation=operation,
-                    details={"transaction_id": active.transaction_id},
-                )
-            previous_manifest = manifests.read()
-            if operation is Operation.UPDATE and previous_manifest is None:
-                raise NoInstallationError(
-                    "update requires an existing installation",
-                    operation=operation,
-                    path=manifests.display_path,
-                )
-
-            installation_id = (
-                previous_manifest.installation_id
-                if previous_manifest is not None
-                else _validated_identifier(self._id_factory(), "installation id")
-            )
-            plans = self._plan(
-                base_path=filesystem.base,
-                operation=operation,
-                installation_id=installation_id,
-            )
-            prior_by_id = (
-                {record.id: record for record in previous_manifest.effects}
-                if previous_manifest is not None
-                else {}
-            )
-            for plan in plans:
-                prior = prior_by_id.get(plan.id)
-                if prior is not None and (
-                    prior.type != plan.type or prior.effect_version != plan.version
-                ):
-                    raise InvalidPlanError(
-                        f'effect id "{plan.id}" changed type or version',
-                        details={
-                            "effect_id": plan.id,
-                            "previous_type": prior.type,
-                            "previous_version": prior.effect_version,
-                            "planned_type": plan.type,
-                            "planned_version": plan.version,
-                        },
-                    )
-            resources = self._resources(filesystem.base, plans)
-            transaction_id = _validated_identifier(self._id_factory(), "transaction id")
-
-            with self._manager().acquire(resources, timeout=self.lock_timeout):
-                transactions.begin(
-                    transaction_id=transaction_id,
-                    installation_id=installation_id,
-                    operation=operation,
-                    engine_version=self.engine_version,
-                    plans=plans,
-                    resources=resources,
-                )
-                records: list[ManifestEffectRecord] = []
-                applied: list[str] = []
-                for plan in plans:
-                    effect = self.registry.require(plan.type, plan.version)
-                    context = EffectContext(
-                        base_path=filesystem.base,
-                        manifest_dir=filesystem.base / self.manifest_directory,
+            candidate_installation_id: str | None = None
+            for _attempt in range(3):
+                preliminary = manifests.read()
+                if operation is Operation.UPDATE and preliminary is None:
+                    raise NoInstallationError(
+                        "update requires an existing installation",
                         operation=operation,
-                        transaction_id=transaction_id,
-                        effect_id=plan.id,
+                        path=manifests.display_path,
                     )
-                    prior = prior_by_id.get(plan.id)
-                    args_value = plan.to_dict()["args"]
-                    if not isinstance(args_value, dict):
-                        raise InvalidPlanError("effect args did not serialize to an object")
-                    prepared = effect.prepare(
-                        cast(JsonObject, args_value),
-                        prior.before_state if prior is not None else None,
-                        context,
-                    )
-                    if not isinstance(prepared, PreparedEffect):
-                        raise InvalidEffectError(
-                            f'effect "{plan.type}" prepare must return PreparedEffect'
+                if preliminary is None:
+                    if candidate_installation_id is None:
+                        candidate_installation_id = _validated_identifier(
+                            self._id_factory(), "installation id"
                         )
-                    if not prepared.recoverable:
-                        raise InvalidEffectError(
-                            f'effect "{plan.type}" is not recoverable in durable mode'
-                        )
-                    self._ensure_prepared_resources_locked(prepared, resources)
-                    transactions.record_prepared(transaction_id, plan.id, prepared)
-                    result = effect.apply(
-                        prepared,
-                        transactions.checkpoint_writer(transaction_id, plan.id),
-                    )
-                    result_value = _json_value(result)
-                    transactions.record_applied(transaction_id, plan.id, result_value)
-                    applied.append(plan.id)
-                    records.append(
-                        ManifestEffectRecord(
-                            id=plan.id,
-                            type=plan.type,
-                            effect_version=plan.version,
-                            before_state=prepared.before_state,
-                        )
-                    )
-
-                transactions.checkpoint(transaction_id, "effects_applied")
-                transactions.checkpoint(transaction_id, "committing")
-                manifests.commit(
+                    installation_id = candidate_installation_id
+                else:
+                    installation_id = preliminary.installation_id
+                plans = self._plan(
+                    base_path=filesystem.base,
+                    operation=operation,
                     installation_id=installation_id,
-                    consumer=self.consumer,
-                    consumer_version=self.consumer_version,
-                    transaction_id=transaction_id,
-                    engine_version=self.engine_version,
-                    effects=records,
                 )
-                transactions.checkpoint(transaction_id, "manifest_committed")
-                transactions.complete(transaction_id)
+                resources = self._resources(filesystem.base, plans, preliminary)
+                preliminary_fingerprint = _manifest_fingerprint(preliminary)
 
-            return OperationResult(
+                with self._manager().acquire(resources, timeout=self.lock_timeout):
+                    active = transactions.active()
+                    if active is not None:
+                        raise IncompleteTransactionError(
+                            f"transaction {active.transaction_id} is incomplete",
+                            operation=operation,
+                            details={"transaction_id": active.transaction_id},
+                        )
+                    authoritative = manifests.read()
+                    if _manifest_fingerprint(authoritative) != preliminary_fingerprint:
+                        continue
+                    prior_by_id = self._validate_prior(authoritative, plans)
+                    transaction_id = _validated_identifier(
+                        self._id_factory(), "transaction id"
+                    )
+                    transactions.begin(
+                        transaction_id=transaction_id,
+                        installation_id=installation_id,
+                        operation=operation,
+                        engine_version=self.engine_version,
+                        plans=plans,
+                        resources=resources,
+                    )
+                    records: list[ManifestEffectRecord] = []
+                    applied: list[str] = []
+                    for plan in plans:
+                        effect = self.registry.require(plan.type, plan.version)
+                        context = EffectContext(
+                            base_path=filesystem.base,
+                            manifest_dir=filesystem.base / self.manifest_directory,
+                            operation=operation,
+                            transaction_id=transaction_id,
+                            effect_id=plan.id,
+                        )
+                        prior = prior_by_id.get(plan.id)
+                        args_value = plan.to_dict()["args"]
+                        if not isinstance(args_value, dict):
+                            raise InvalidPlanError(
+                                "effect args did not serialize to an object"
+                            )
+                        prepared = effect.prepare(
+                            cast(JsonObject, args_value),
+                            prior.before_state if prior is not None else None,
+                            context,
+                        )
+                        if not isinstance(prepared, PreparedEffect):
+                            raise InvalidEffectError(
+                                f'effect "{plan.type}" prepare must return PreparedEffect'
+                            )
+                        if not prepared.recoverable:
+                            raise InvalidEffectError(
+                                f'effect "{plan.type}" is not recoverable in durable mode'
+                            )
+                        self._ensure_prepared_resources_locked(prepared, resources)
+                        transactions.record_prepared(
+                            transaction_id, plan.id, prepared
+                        )
+                        result = effect.apply(
+                            prepared,
+                            transactions.checkpoint_writer(
+                                transaction_id, plan.id
+                            ),
+                        )
+                        result_value = _json_value(result)
+                        transactions.record_applied(
+                            transaction_id, plan.id, result_value
+                        )
+                        applied.append(plan.id)
+                        records.append(
+                            ManifestEffectRecord(
+                                id=plan.id,
+                                type=plan.type,
+                                effect_version=plan.version,
+                                before_state=prepared.before_state,
+                                resources=plan.resources,
+                            )
+                        )
+
+                    transactions.checkpoint(transaction_id, "effects_applied")
+                    transactions.checkpoint(transaction_id, "committing")
+                    manifests.commit(
+                        installation_id=installation_id,
+                        consumer=self.consumer,
+                        consumer_version=self.consumer_version,
+                        transaction_id=transaction_id,
+                        engine_version=self.engine_version,
+                        effects=records,
+                    )
+                    transactions.checkpoint(transaction_id, "manifest_committed")
+                    transactions.complete(transaction_id)
+
+                    return OperationResult(
+                        operation=operation,
+                        status=OperationStatus.COMPLETED,
+                        transaction_id=transaction_id,
+                        installation_id=installation_id,
+                        planned=tuple(plan.id for plan in plans),
+                        applied=tuple(applied),
+                    )
+            raise PlanDriftError(
+                "committed manifest changed repeatedly while acquiring authority",
                 operation=operation,
-                status=OperationStatus.COMPLETED,
-                transaction_id=transaction_id,
-                installation_id=installation_id,
-                planned=tuple(plan.id for plan in plans),
-                applied=tuple(applied),
+                path=manifests.display_path,
             )
 
     def install(self, *, base_path: Path) -> OperationResult:
@@ -345,81 +421,110 @@ class Driver:
             transactions = TransactionRepository(
                 filesystem, manifest_directory=self.manifest_directory
             )
-            active = transactions.active()
-            if active is not None:
-                raise IncompleteTransactionError(
-                    f"transaction {active.transaction_id} is incomplete",
-                    operation=Operation.UNINSTALL,
-                    details={"transaction_id": active.transaction_id},
-                )
-            manifest = manifests.read()
-            if manifest is None:
-                return OperationResult(
-                    operation=Operation.UNINSTALL,
-                    status=OperationStatus.COMPLETED,
-                )
+            for _attempt in range(3):
+                preliminary = manifests.read()
+                if preliminary is None:
+                    return OperationResult(
+                        operation=Operation.UNINSTALL,
+                        status=OperationStatus.COMPLETED,
+                    )
 
-            # Fail closed for every record before taking locks or reverting any one.
-            effects: dict[str, Effect] = {}
-            for record in manifest.effects:
-                effects[record.id] = self.registry.require(
-                    record.type, record.effect_version
-                )
-            root_resource = canonical_resource_identity("path", filesystem.base)
-            resources = canonicalize_resources((root_resource,))
-            transaction_id = _validated_identifier(self._id_factory(), "transaction id")
-            plans = tuple(
-                EffectPlan(
-                    id=record.id,
-                    type=record.type,
-                    version=record.effect_version,
-                    args={},
-                    resources=resources,
-                )
-                for record in manifest.effects
-            )
+                resources = self._resources(filesystem.base, (), preliminary)
+                preliminary_fingerprint = _manifest_fingerprint(preliminary)
 
-            reverted: list[str] = []
-            with self._manager().acquire(resources, timeout=self.lock_timeout):
-                transactions.begin(
-                    transaction_id=transaction_id,
-                    installation_id=manifest.installation_id,
-                    operation=Operation.UNINSTALL,
-                    engine_version=self.engine_version,
-                    plans=plans,
-                    resources=resources,
-                )
-                for record in reversed(manifest.effects):
-                    prepared = PreparedEffect(
-                        before_state=record.before_state,
-                        payload=None,
+                with self._manager().acquire(
+                    resources, timeout=self.lock_timeout
+                ):
+                    active = transactions.active()
+                    if active is not None:
+                        raise IncompleteTransactionError(
+                            f"transaction {active.transaction_id} is incomplete",
+                            operation=Operation.UNINSTALL,
+                            details={"transaction_id": active.transaction_id},
+                        )
+                    authoritative = manifests.read()
+                    if (
+                        _manifest_fingerprint(authoritative)
+                        != preliminary_fingerprint
+                    ):
+                        continue
+                    if authoritative is None:
+                        continue
+
+                    effects: dict[str, Effect] = {}
+                    for record in authoritative.effects:
+                        effects[record.id] = self.registry.require(
+                            record.type, record.effect_version
+                        )
+                    transaction_id = _validated_identifier(
+                        self._id_factory(), "transaction id"
+                    )
+                    plans = tuple(
+                        EffectPlan(
+                            id=record.id,
+                            type=record.type,
+                            version=record.effect_version,
+                            args={},
+                            resources=record.resources,
+                        )
+                        for record in authoritative.effects
+                    )
+                    transactions.begin(
+                        transaction_id=transaction_id,
+                        installation_id=authoritative.installation_id,
+                        operation=Operation.UNINSTALL,
+                        engine_version=self.engine_version,
+                        plans=plans,
                         resources=resources,
                     )
-                    transactions.record_prepared(transaction_id, record.id, prepared)
-                    context = EffectContext(
-                        base_path=filesystem.base,
-                        manifest_dir=filesystem.base / self.manifest_directory,
-                        operation=Operation.UNINSTALL,
-                        transaction_id=transaction_id,
-                        effect_id=record.id,
+                    reverted: list[str] = []
+                    for record in reversed(authoritative.effects):
+                        prepared = PreparedEffect(
+                            before_state=record.before_state,
+                            payload=None,
+                            resources=record.resources,
+                        )
+                        transactions.record_prepared(
+                            transaction_id, record.id, prepared
+                        )
+                        context = EffectContext(
+                            base_path=filesystem.base,
+                            manifest_dir=filesystem.base
+                            / self.manifest_directory,
+                            operation=Operation.UNINSTALL,
+                            transaction_id=transaction_id,
+                            effect_id=record.id,
+                        )
+                        effects[record.id].revert(context, record.before_state)
+                        transactions.record_reverted(
+                            transaction_id, record.id
+                        )
+                        reverted.append(record.id)
+
+                    transactions.checkpoint(
+                        transaction_id, "effects_reverted"
                     )
-                    effects[record.id].revert(context, record.before_state)
-                    transactions.record_reverted(transaction_id, record.id)
-                    reverted.append(record.id)
+                    transactions.checkpoint(transaction_id, "committing")
+                    manifests.remove()
+                    transactions.checkpoint(
+                        transaction_id, "manifest_removed"
+                    )
+                    transactions.complete(transaction_id)
 
-                transactions.checkpoint(transaction_id, "effects_reverted")
-                transactions.checkpoint(transaction_id, "committing")
-                manifests.remove()
-                transactions.checkpoint(transaction_id, "manifest_removed")
-                transactions.complete(transaction_id)
-
-            return OperationResult(
+                    return OperationResult(
+                        operation=Operation.UNINSTALL,
+                        status=OperationStatus.COMPLETED,
+                        transaction_id=transaction_id,
+                        installation_id=authoritative.installation_id,
+                        planned=tuple(
+                            record.id for record in authoritative.effects
+                        ),
+                        reverted=tuple(reverted),
+                    )
+            raise PlanDriftError(
+                "committed manifest changed repeatedly while acquiring authority",
                 operation=Operation.UNINSTALL,
-                status=OperationStatus.COMPLETED,
-                transaction_id=transaction_id,
-                installation_id=manifest.installation_id,
-                planned=tuple(record.id for record in manifest.effects),
-                reverted=tuple(reverted),
+                path=manifests.display_path,
             )
 
     def status(self, *, base_path: Path) -> StatusResult:

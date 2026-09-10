@@ -478,18 +478,40 @@ class TransactionRepository:
     def _blob_path(self, transaction_id: str, digest: str) -> str:
         if _DIGEST.fullmatch(digest) is None:
             raise ValueError("blob id must be a SHA-256 digest")
-        return f"{self.transactions_directory}/{_identifier(transaction_id, 'transaction_id')}/blobs/{digest}.blob"
+        safe_id = _identifier(transaction_id, "transaction_id")
+        return f"{self.transactions_directory}/{safe_id}/blobs/{digest}.blob"
 
-    def _write(self, journal: TransactionJournal) -> None:
+    def _write(
+        self, transaction_id: str, journal: TransactionJournal
+    ) -> None:
+        requested_id = _identifier(transaction_id, "transaction_id")
+        if journal.transaction_id != requested_id:
+            raise CorruptTransactionError(
+                "transaction journal id does not match the requested path",
+                details={
+                    "requested_transaction_id": requested_id,
+                    "journal_transaction_id": journal.transaction_id,
+                },
+            )
         value = journal.to_dict()
         TransactionJournal.from_dict(value)
-        self.filesystem.atomic_write_json(self._journal_path(journal.transaction_id), value)
+        self.filesystem.atomic_write_json(self._journal_path(requested_id), value)
 
     def read(self, transaction_id: str) -> TransactionJournal:
         path = self._journal_path(transaction_id)
         try:
             value = self.filesystem.read_json(path)
-            return TransactionJournal.from_dict(value)
+            journal = TransactionJournal.from_dict(value)
+            if journal.transaction_id != transaction_id:
+                raise CorruptTransactionError(
+                    "transaction journal id does not match the requested path",
+                    path=self.filesystem.base / path,
+                    details={
+                        "requested_transaction_id": transaction_id,
+                        "journal_transaction_id": journal.transaction_id,
+                    },
+                )
+            return journal
         except CorruptTransactionError:
             raise
         except (FileNotFoundError, UnicodeDecodeError, TypeError, ValueError, KeyError) as error:
@@ -550,7 +572,7 @@ class TransactionRepository:
         )
         # The full journal lands first. The active pointer becomes discoverable
         # before callers receive permission to prepare or mutate.
-        self._write(journal)
+        self._write(transaction_id, journal)
         self.filesystem.atomic_write_json(
             self.active_path,
             {"schema_version": TRANSACTION_SCHEMA_VERSION, "transaction_id": transaction_id},
@@ -576,7 +598,7 @@ class TransactionRepository:
         index = matches[0]
         effects[index] = update(effects[index])
         changed = replace(journal, effects=tuple(effects), phase=phase or journal.phase)
-        self._write(changed)
+        self._write(transaction_id, changed)
         return changed
 
     def record_prepared(
@@ -656,7 +678,7 @@ class TransactionRepository:
         elif name in {"manifest_committed", "manifest_removed"}:
             phase = TransactionPhase.COMMITTED
         changed = replace(journal, operation_checkpoints=checkpoints, phase=phase)
-        self._write(changed)
+        self._write(transaction_id, changed)
         return changed
 
     def checkpoint_writer(self, transaction_id: str, effect_id: str) -> CheckpointWriter:
@@ -669,7 +691,10 @@ class TransactionRepository:
         self.filesystem.atomic_write_bytes(self._blob_path(transaction_id, digest), data)
         journal = self.read(transaction_id)
         if digest not in journal.blobs:
-            self._write(replace(journal, blobs=(*journal.blobs, digest)))
+            self._write(
+                transaction_id,
+                replace(journal, blobs=(*journal.blobs, digest)),
+            )
         return digest
 
     def read_blob(self, transaction_id: str, digest: str) -> bytes:

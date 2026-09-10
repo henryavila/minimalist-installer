@@ -22,6 +22,7 @@ def _effect(effect_id: str = "skills:user") -> ManifestEffectRecord:
         type="reconcile_file_set",
         effect_version=1,
         before_state={"files": []},
+        resources=("path:/tmp/skills",),
     )
 
 
@@ -41,6 +42,7 @@ def _manifest(**overrides: object) -> dict[str, object]:
                 "type": "reconcile_file_set",
                 "effect_version": 1,
                 "before_state": {"files": []},
+                "resources": ["path:/tmp/skills"],
             }
         ],
         "installed_at": "2026-09-10T12:00:00Z",
@@ -56,6 +58,7 @@ def _manifest_with_duplicate_effect_ids() -> dict[str, object]:
         "type": "effect",
         "effect_version": 1,
         "before_state": None,
+        "resources": [],
     }
     return _manifest(effects=[duplicate, {**duplicate, "type": "other"}])
 
@@ -283,12 +286,14 @@ def test_remove_refuses_invalid_manifest_without_changing_its_bytes(
                         "type": "one",
                         "effect_version": 1,
                         "before_state": None,
+                        "resources": [],
                     },
                     {
                         "id": "same",
                         "type": "two",
                         "effect_version": 1,
                         "before_state": None,
+                        "resources": [],
                     },
                 ]
             },

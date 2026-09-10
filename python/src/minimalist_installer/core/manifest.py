@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Final, cast
 
 from .errors import CorruptManifestError
+from .locks import canonicalize_resources
 from .models import JsonObject, JsonValue, _freeze_json, _json_value
 from .path_safety import SafeFilesystem
 
@@ -63,12 +64,22 @@ MANIFEST_V1_SCHEMA: JsonObject = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["id", "type", "effect_version", "before_state"],
+                "required": [
+                    "id",
+                    "type",
+                    "effect_version",
+                    "before_state",
+                    "resources",
+                ],
                 "properties": {
                     "id": {"type": "string", "minLength": 1},
                     "type": {"type": "string", "minLength": 1},
                     "effect_version": {"type": "integer", "minimum": 1},
                     "before_state": {},
+                    "resources": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                    },
                 },
             },
         },
@@ -98,7 +109,9 @@ _MANIFEST_KEYS = frozenset(
 )
 _ENGINE_KEYS = frozenset({"name", "version"})
 _INSTALLATION_KEYS = frozenset({"id", "consumer", "consumer_version"})
-_EFFECT_KEYS = frozenset({"id", "type", "effect_version", "before_state"})
+_EFFECT_KEYS = frozenset(
+    {"id", "type", "effect_version", "before_state", "resources"}
+)
 
 
 def _require_exact_keys(
@@ -164,12 +177,17 @@ class ManifestEffectRecord:
     type: str
     effect_version: int
     before_state: JsonValue
+    resources: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.id, "effect.id")
         _require_text(self.type, "effect.type")
         _require_positive_integer(self.effect_version, "effect.effect_version")
         object.__setattr__(self, "before_state", _freeze_json(self.before_state))
+        canonical = canonicalize_resources(self.resources)
+        if canonical != self.resources:
+            raise ValueError("effect resources must be canonical, unique, and sorted")
+        object.__setattr__(self, "resources", canonical)
 
     def to_dict(self) -> JsonObject:
         return {
@@ -177,12 +195,16 @@ class ManifestEffectRecord:
             "type": self.type,
             "effect_version": self.effect_version,
             "before_state": _json_value(self.before_state),
+            "resources": list(self.resources),
         }
 
     @classmethod
     def from_dict(cls, value: object) -> ManifestEffectRecord:
         effect = _require_mapping(value, "effect")
         _require_exact_keys(effect, _EFFECT_KEYS, "effect")
+        resources_value = effect["resources"]
+        if not isinstance(resources_value, list | tuple):
+            raise TypeError("effect.resources must be an array")
         return cls(
             id=_require_text(effect["id"], "effect.id"),
             type=_require_text(effect["type"], "effect.type"),
@@ -190,6 +212,10 @@ class ManifestEffectRecord:
                 effect["effect_version"], "effect.effect_version"
             ),
             before_state=cast(JsonValue, effect["before_state"]),
+            resources=tuple(
+                _require_text(resource, "effect.resource")
+                for resource in resources_value
+            ),
         )
 
 

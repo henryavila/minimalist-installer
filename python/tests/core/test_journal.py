@@ -178,6 +178,35 @@ def test_corrupt_or_foreign_transaction_fails_closed(tmp_path: Path) -> None:
         repository.read("tx-1")
 
 
+def test_requested_transaction_id_must_match_the_journal_and_cannot_redirect_writes(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    journal = repository.begin(
+        transaction_id="tx-a",
+        installation_id="install-1",
+        operation=Operation.INSTALL,
+        engine_version="0.1.0",
+        plans=(),
+        resources=("kind:a",),
+    )
+    forged = journal.to_dict()
+    forged["transaction_id"] = "tx-b"
+    repository.filesystem.atomic_write_json(
+        "state/transactions/tx-a/journal.json", forged
+    )
+    redirected = tmp_path / "state/transactions/tx-b/journal.json"
+    redirected.parent.mkdir(parents=True)
+    redirected.write_bytes(b"do-not-touch")
+
+    with pytest.raises(CorruptTransactionError, match="does not match"):
+        repository.read("tx-a")
+    with pytest.raises(CorruptTransactionError, match="does not match"):
+        repository.checkpoint("tx-a", "must-not-write")
+
+    assert redirected.read_bytes() == b"do-not-touch"
+
+
 def test_transaction_and_effect_identifiers_cannot_escape_wal_directory(
     tmp_path: Path,
 ) -> None:

@@ -40,12 +40,16 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "type", "effect_version", "before_state"],
+        "required": ["id", "type", "effect_version", "before_state", "resources"],
         "properties": {
           "id": { "type": "string", "minLength": 1 },
           "type": { "type": "string", "minLength": 1 },
           "effect_version": { "type": "integer", "minimum": 1 },
-          "before_state": {}
+          "before_state": {},
+          "resources": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
         }
       }
     },

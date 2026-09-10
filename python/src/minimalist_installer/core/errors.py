@@ -22,6 +22,7 @@ class ErrorCode(StrEnum):
     CORRUPT_TRANSACTION = "corrupt_transaction"
     INVALID_EFFECT = "invalid_effect"
     INVALID_PLAN = "invalid_plan"
+    PLAN_DRIFT = "plan_drift"
     NO_INSTALLATION = "no_installation"
     UNKNOWN_EFFECT = "unknown_effect"
     UNSUPPORTED_EFFECT_VERSION = "unsupported_effect_version"
@@ -100,6 +101,10 @@ class InvalidEffectError(InstallerError, ValueError):
 
 class InvalidPlanError(InstallerError, ValueError):
     code = ErrorCode.INVALID_PLAN
+
+
+class PlanDriftError(InvalidPlanError):
+    code = ErrorCode.PLAN_DRIFT
 
 
 class NoInstallationError(InstallerError):

@@ -15,6 +15,7 @@ from minimalist_installer import (
     NoInstallationError,
     Operation,
     OperationStatus,
+    PlanDriftError,
     PlanContext,
     PreparedEffect,
     UnknownEffectError,
@@ -22,6 +23,7 @@ from minimalist_installer import (
     define_installer,
 )
 from minimalist_installer.core.driver import Driver
+from minimalist_installer.core.journal import TransactionRepository
 from minimalist_installer.core.locks import canonical_resource_identity, canonicalize_resources
 from minimalist_installer.core.manifest import ManifestRepository
 from minimalist_installer.core.path_safety import SafeFilesystem
@@ -29,12 +31,19 @@ from minimalist_installer.core.registry import EffectRegistry
 
 
 class _Lease:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        on_enter: Callable[[], None] | None = None,
+    ) -> None:
         self.events = events
+        self.on_enter = on_enter
         self.released = False
 
     def __enter__(self) -> Self:
         self.events.append("locks:entered")
+        if self.on_enter is not None:
+            self.on_enter()
         return self
 
     def __exit__(
@@ -48,8 +57,14 @@ class _Lease:
 
 
 class _LockManager:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        on_enters: Iterable[Callable[[], None] | None] = (),
+    ) -> None:
         self.events = events
+        self.on_enters = iter(on_enters)
         self.acquisitions: list[tuple[str, ...]] = []
         self.leases: list[_Lease] = []
 
@@ -57,7 +72,7 @@ class _LockManager:
         ordered = tuple(resources)
         self.events.append("locks:acquire")
         self.acquisitions.append(ordered)
-        lease = _Lease(self.events)
+        lease = _Lease(self.events, next(self.on_enters, None))
         self.leases.append(lease)
         return lease
 
@@ -305,9 +320,25 @@ def test_reinstall_is_idempotent_and_matches_previous_state_by_effect_id(
     assert tuple(record.id for record in manifest.effects) == ("b", "a")
 
 
-def test_empty_effect_id_gets_a_deterministic_derived_fallback(tmp_path: Path) -> None:
+def test_single_missing_effect_id_falls_back_to_type_and_matches_across_updates(
+    tmp_path: Path,
+) -> None:
     events: list[str] = []
-    provider = _Provider(events, lambda _config, _context: (_plan(""),))
+    plans = iter(
+        (
+            (
+                EffectPlan(
+                    id="", type="record", version=1, args={"value": "v1"}
+                ),
+            ),
+            (
+                EffectPlan(
+                    id="", type="record", version=1, args={"value": "v2"}
+                ),
+            ),
+        )
+    )
+    provider = _Provider(events, lambda _config, _context: next(plans))
     locks = _LockManager(events)
     effect = _Effect(events)
     driver = _driver(
@@ -317,8 +348,220 @@ def test_empty_effect_id_gets_a_deterministic_derived_fallback(tmp_path: Path) -
     first = driver.install(base_path=tmp_path)
     second = driver.install(base_path=tmp_path)
 
-    assert first.planned == second.planned
-    assert first.planned[0].startswith("record:")
+    assert first.planned == second.planned == ("record",)
+    assert effect.previous == [None, {"prior": "v1"}]
+
+
+def test_multiple_missing_ids_for_the_same_type_are_rejected_before_mutation(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    provider = _Provider(
+        events,
+        lambda _config, _context: (
+            EffectPlan(id="", type="record", version=1, args={"value": "a"}),
+            EffectPlan(id="", type="record", version=1, args={"value": "b"}),
+        ),
+    )
+    locks = _LockManager(events)
+    driver = _driver(tmp_path, provider, _Effect(events), locks, ("install-1",))
+
+    with pytest.raises(PlanDriftError, match="explicit ids"):
+        driver.install(base_path=tmp_path)
+
+    assert locks.acquisitions == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_reinstall_rejects_dropped_effect_ids_and_preserves_committed_state(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    plans = iter(((_plan("a"), _plan("b")), (_plan("a"),)))
+    provider = _Provider(events, lambda _config, _context: next(plans))
+    locks = _LockManager(events)
+    driver = _driver(
+        tmp_path, provider, _Effect(events), locks, ("install-1", "tx-1")
+    )
+    driver.install(base_path=tmp_path)
+    manifest_path = tmp_path / "state/manifest.json"
+    committed = manifest_path.read_bytes()
+    acquisitions = len(locks.acquisitions)
+
+    with pytest.raises(PlanDriftError, match="would drop"):
+        driver.install(base_path=tmp_path)
+
+    assert len(locks.acquisitions) == acquisitions + 1
+    assert locks.leases[-1].released
+    assert manifest_path.read_bytes() == committed
+    assert not (tmp_path / "state/transactions").exists()
+
+
+def test_reinstall_validates_every_prior_effect_before_plan_drift_check(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    plans = iter(((_plan("a"), _plan("b")), (_plan("a"),)))
+    provider = _Provider(events, lambda _config, _context: next(plans))
+    locks = _LockManager(events)
+    driver = _driver(
+        tmp_path, provider, _Effect(events), locks, ("install-1", "tx-1")
+    )
+    driver.install(base_path=tmp_path)
+    manifest_path = tmp_path / "state/manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["effects"][1]["type"] = "removed-extension"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    acquisitions = len(locks.acquisitions)
+
+    with pytest.raises(UnknownEffectError, match="removed-extension"):
+        driver.install(base_path=tmp_path)
+
+    assert len(locks.acquisitions) == acquisitions + 1
+    assert locks.leases[-1].released
+
+
+def test_authoritative_incomplete_wal_takes_precedence_over_plan_drift(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    plans = iter(((_plan("a"), _plan("b")), (_plan("a"),)))
+    provider = _Provider(events, lambda _config, _context: next(plans))
+    locks = _LockManager(events)
+    driver = _driver(
+        tmp_path, provider, _Effect(events), locks, ("install-1", "tx-1")
+    )
+    driver.install(base_path=tmp_path)
+    repository = TransactionRepository(
+        SafeFilesystem(tmp_path), manifest_directory="state"
+    )
+    repository.begin(
+        transaction_id="active-tx",
+        installation_id="install-1",
+        operation=Operation.UPDATE,
+        engine_version="0.1.0",
+        plans=(),
+        resources=("kind:a",),
+    )
+
+    with pytest.raises(IncompleteTransactionError, match="active-tx"):
+        driver.install(base_path=tmp_path)
+
+
+def test_install_retries_planning_when_manifest_changes_before_lock_authority(
+    tmp_path: Path,
+) -> None:
+    setup_events: list[str] = []
+    setup = _driver(
+        tmp_path,
+        _Provider(setup_events, lambda _config, _context: (_plan("one"),)),
+        _Effect(setup_events),
+        _LockManager(setup_events),
+        ("install-1", "tx-1"),
+    )
+    setup.install(base_path=tmp_path)
+    manifest_path = tmp_path / "state/manifest.json"
+
+    def change_manifest() -> None:
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        manifest["transaction_id"] = "external-update"
+        manifest["effects"][0]["before_state"] = {"prior": "authoritative"}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    events: list[str] = []
+    provider = _Provider(events, lambda _config, _context: (_plan("one"),))
+    locks = _LockManager(events, on_enters=(change_manifest, None))
+    effect = _Effect(events)
+    driver = _driver(tmp_path, provider, effect, locks, ("tx-2",))
+
+    driver.install(base_path=tmp_path)
+
+    assert len(locks.acquisitions) == 2
+    assert effect.previous == [{"prior": "authoritative"}]
+    assert events.count("provider:plan") == 2
+
+
+def test_uninstall_retries_and_relocks_if_manifest_resources_change(
+    tmp_path: Path,
+) -> None:
+    setup_events: list[str] = []
+    setup = _driver(
+        tmp_path,
+        _Provider(
+            setup_events,
+            lambda _config, _context: (
+                _plan("one", resources=("kind:old",)),
+            ),
+        ),
+        _Effect(setup_events),
+        _LockManager(setup_events),
+        ("install-1", "tx-1"),
+    )
+    setup.install(base_path=tmp_path)
+    manifest_path = tmp_path / "state/manifest.json"
+
+    def change_manifest() -> None:
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        manifest["transaction_id"] = "external-update"
+        manifest["effects"][0]["resources"] = ["kind:new"]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    events: list[str] = []
+    locks = _LockManager(events, on_enters=(change_manifest, None))
+    effect = _Effect(events)
+    driver = _driver(
+        tmp_path,
+        _Provider(events, lambda _config, _context: (_plan("unused"),)),
+        effect,
+        locks,
+        ("tx-2",),
+    )
+
+    driver.uninstall(base_path=tmp_path)
+
+    assert "kind:old" in locks.acquisitions[0]
+    assert "kind:new" in locks.acquisitions[1]
+    assert effect.reverted == ["one"]
+
+
+def test_effect_resources_persist_and_serialize_shared_external_locks(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    locks = _LockManager(events)
+    shared = "external:shared-destination"
+    roots = (tmp_path / "one", tmp_path / "two")
+    for root in roots:
+        root.mkdir()
+    drivers = tuple(
+        _driver(
+            root,
+            _Provider(
+                events,
+                lambda _config, _context: (
+                    _plan("one", resources=(shared,)),
+                ),
+            ),
+            _Effect(events),
+            locks,
+            (f"install-{index}", f"tx-install-{index}", f"tx-remove-{index}"),
+        )
+        for index, root in enumerate(roots, start=1)
+    )
+
+    for driver, root in zip(drivers, roots, strict=True):
+        driver.install(base_path=root)
+        manifest = ManifestRepository(
+            SafeFilesystem(root), manifest_directory="state"
+        ).read()
+        assert manifest is not None
+        assert manifest.effects[0].resources == (shared,)
+
+    for driver, root in zip(drivers, roots, strict=True):
+        driver.uninstall(base_path=root)
+
+    assert len(locks.acquisitions) == 4
+    assert all(shared in acquisition for acquisition in locks.acquisitions)
 
 
 def test_update_rejects_an_absent_installation_without_locks_or_writes(
@@ -362,7 +605,7 @@ def test_uninstall_validates_all_versions_then_replays_in_reverse_order(
     assert not (tmp_path / "state/manifest.json").exists()
 
 
-def test_uninstall_refuses_unknown_effect_version_before_locks_or_mutation(
+def test_uninstall_refuses_unknown_effect_version_before_revert_or_mutation(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
@@ -381,7 +624,8 @@ def test_uninstall_refuses_unknown_effect_version_before_locks_or_mutation(
     with pytest.raises(UnsupportedEffectVersionError):
         driver.uninstall(base_path=tmp_path)
 
-    assert locks.acquisitions == []
+    assert len(locks.acquisitions) == 1
+    assert locks.leases[-1].released
     assert manifest_path.is_file()
 
 
