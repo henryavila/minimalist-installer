@@ -537,3 +537,58 @@ def test_missing_orphan_directory_cleanup_is_checkpointed_and_reversible(
         effect.revert(_context(tmp_path, filesystem), prepared.before_state, writer)
 
     assert (tmp_path / "owned/deep").is_dir()
+
+
+def test_rollback_restores_only_released_parents_that_existed_before_apply(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "b-existing/deep").mkdir(parents=True)
+    effect = ReconcileFileSetEffect()
+    checkpoints: dict[str, object] = {}
+    blobs: dict[str, bytes] = {}
+    with SafeFilesystem(tmp_path) as safe:
+        filesystem = DirectoryCreationFailureFilesystem(safe)
+        prepared = effect.prepare(
+            {
+                "desired": [
+                    {"path": "z-failure/deep/file.txt", "content": "new"}
+                ]
+            },
+            {
+                "version": 1,
+                "files": [
+                    {
+                        "path": "a-absent/deep/missing.txt",
+                        "installed_hash": _digest(b"absent"),
+                    },
+                    {
+                        "path": "b-existing/deep/missing.txt",
+                        "installed_hash": _digest(b"existing"),
+                    },
+                ],
+                "created_parents": [
+                    "a-absent",
+                    "a-absent/deep",
+                    "b-existing",
+                    "b-existing/deep",
+                ],
+            },
+            _context(tmp_path, filesystem),
+        )
+        writer = DurableMemoryWriter(
+            filesystem,
+            FaultController(None),
+            checkpoints=checkpoints,
+            blobs=blobs,
+        )
+
+        with pytest.raises(InjectedFailure, match="parent creation"):
+            effect.apply(prepared, writer)
+        assert not (tmp_path / "a-absent").exists()
+        assert not (tmp_path / "b-existing").exists()
+
+        effect.revert(_context(tmp_path, filesystem), prepared.before_state, writer)
+
+    assert not (tmp_path / "a-absent").exists()
+    assert (tmp_path / "b-existing/deep").is_dir()
+    assert not (tmp_path / "z-failure").exists()
