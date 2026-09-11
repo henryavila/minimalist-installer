@@ -43,6 +43,13 @@ def test_wheel_and_sdist_include_typing_marker_and_root_license(tmp_path: Path) 
         assert "minimalist_installer/py.typed" in names
         assert archive.read(license_name) == root_license
         assert metadata.get_all("License-File") == ["LICENSE"]
+        host_descriptors = [
+            name
+            for name in names
+            if name.startswith("minimalist_installer/skills/hosts/")
+            and name.endswith(".toml")
+        ]
+        assert len(host_descriptors) == 7
 
     with tarfile.open(sdist, "r:gz") as archive:
         names = archive.getnames()

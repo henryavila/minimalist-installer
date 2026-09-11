@@ -1,0 +1,12 @@
+id = "grok"
+display_name = "Grok Build"
+support_tier = "verified"
+
+[destinations]
+user = [".grok/skills", ".agents/skills"]
+project = [".grok/skills", ".agents/skills"]
+
+[detection]
+executables = ["grok"]
+environment = ["GROK_*"]
+config_dirs = [".grok"]

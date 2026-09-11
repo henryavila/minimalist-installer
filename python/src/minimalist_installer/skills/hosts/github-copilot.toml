@@ -1,0 +1,12 @@
+id = "github-copilot"
+display_name = "GitHub Copilot"
+support_tier = "layout-only"
+
+[destinations]
+user = [".github/skills"]
+project = [".github/skills"]
+
+[detection]
+executables = []
+environment = ["COPILOT_*", "GITHUB_COPILOT_*"]
+config_dirs = [".github"]

@@ -53,3 +53,5 @@ packages = ["src/minimalist_installer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# core and skills both ship a test_registry.py module.
+addopts = ["--import-mode=importlib"]

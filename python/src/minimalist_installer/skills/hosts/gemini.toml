@@ -1,0 +1,12 @@
+id = "gemini"
+display_name = "Gemini CLI"
+support_tier = "layout-only"
+
+[destinations]
+user = [".gemini/skills", ".agents/skills"]
+project = [".gemini/skills", ".agents/skills"]
+
+[detection]
+executables = ["gemini"]
+environment = ["GEMINI_*"]
+config_dirs = [".gemini"]
