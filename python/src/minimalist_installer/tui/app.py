@@ -26,7 +26,7 @@ from ..skills import (
     plan_distribution,
 )
 from . import messages
-from .theme import Theme, resolve_theme
+from .theme import Theme, detect_unicode_ok, resolve_theme
 
 # Preselect when confidence >= 30 (environment or better). One executable
 # alone scores 40 and therefore also preselects. Users still confirm.
@@ -194,7 +194,7 @@ def run_install_flow(
     ui_lang = messages.normalize_lang(lang)
     text = messages.catalog(ui_lang)
     pkg_version = version if version is not None else _package_version
-    active_theme = theme or resolve_theme()
+    active_theme = theme or resolve_theme(unicode_ok=detect_unicode_ok())
     console.rule()
     console.print(text["intro"].format(version=pkg_version))
 
@@ -253,14 +253,8 @@ def run_install_flow(
             for item in detection.detections
         ]
         if not choices:
-            # Offer nothing detected — still an error path after empty pick.
             console.print(text["no_hosts"])
-            return FlowOutcome(
-                cancelled=True,
-                detection=detection,
-                scope=resolved_scope,
-                lang=ui_lang,
-            )
+            raise NoHostDetectedError(text["no_hosts"])
         picked = prompts.checkbox(text["select_hosts"], choices)
         if picked is None:
             console.print(text["cancelled"])
@@ -390,12 +384,15 @@ def run_uninstall_flow(
     prompts: PromptPort,
     console: ConsolePort,
     scope: Scope | str,
-    hosts: Sequence[str],
+    hosts: Sequence[str] | None = None,
     lang: str = "en",
     yes: bool = False,
     home: Path | None = None,
     project: Path | None = None,
     registry: HostRegistry | None = None,
+    environ: Mapping[str, str] | None = None,
+    search_path: str | None = None,
+    detect_hosts: Callable[..., DetectionResult] = _detect_hosts,
     installer_factory: Callable[..., Installer] | None = None,
 ) -> FlowOutcome:
     """Plan then uninstall using the same presentation ports."""
@@ -403,8 +400,56 @@ def run_uninstall_flow(
     ui_lang = messages.normalize_lang(lang)
     text = messages.catalog(ui_lang)
     resolved_scope = scope if isinstance(scope, Scope) else Scope(scope)
-    selected = tuple(dict.fromkeys(hosts))
+
+    detection: DetectionResult | None = None
+    selected: tuple[str, ...]
+    if hosts is not None:
+        selected = tuple(dict.fromkeys(hosts))
+    else:
+        detection = detect_hosts(
+            scope=resolved_scope,
+            registry=registry,
+            home=home,
+            project=project,
+            environ=environ,
+            search_path=search_path,
+        )
+        console.print(text["detected_header"])
+        for item in detection.detections:
+            console.print(
+                text["evidence_line"].format(
+                    name=item.host.display_name,
+                    confidence=item.confidence,
+                    evidence=_format_evidence(item),
+                )
+            )
+        choices = [
+            Choice(
+                value=item.host.id,
+                label=f"{item.host.display_name} ({item.confidence})",
+                checked=True,
+            )
+            for item in detection.detections
+        ]
+        if not choices:
+            console.print(text["no_hosts"])
+            raise NoHostDetectedError(text["no_hosts"])
+        if yes:
+            selected = tuple(item.host.id for item in detection.detections)
+        else:
+            picked = prompts.checkbox(text["select_hosts"], choices)
+            if picked is None:
+                console.print(text["cancelled"])
+                return FlowOutcome(
+                    cancelled=True,
+                    detection=detection,
+                    scope=resolved_scope,
+                    lang=ui_lang,
+                )
+            selected = tuple(dict.fromkeys(picked))
+
     if not selected:
+        console.print(text["no_hosts"])
         raise NoHostDetectedError(text["no_hosts"])
 
     planned = plan_distribution(
@@ -414,6 +459,8 @@ def run_uninstall_flow(
         home=home,
         project=project,
         registry=registry,
+        environ=environ,
+        search_path=search_path,
     )
     if not yes:
         answer = prompts.confirm(text["confirm_uninstall"], default=False)
@@ -421,6 +468,7 @@ def run_uninstall_flow(
             console.print(text["cancelled"])
             return FlowOutcome(
                 cancelled=True,
+                detection=detection,
                 selected_hosts=selected,
                 scope=resolved_scope,
                 lang=ui_lang,
@@ -443,6 +491,7 @@ def run_uninstall_flow(
     return FlowOutcome(
         cancelled=False,
         result=result,
+        detection=detection,
         selected_hosts=selected,
         scope=resolved_scope,
         lang=ui_lang,
@@ -526,25 +575,42 @@ def create_questionary_prompts() -> PromptPort:
     return QuestionaryPrompts()
 
 
-def create_rich_console(*, theme: Theme | None = None) -> ConsolePort:
+def create_rich_console(
+    *,
+    theme: Theme | None = None,
+    file: object | None = None,
+) -> ConsolePort:
     """Lazy-import Rich and return a console adapter."""
 
     require_tui_dependencies()
     from rich.console import Console
 
-    active = theme or resolve_theme()
-    rich_console = Console(
-        no_color=not active.color,
-        emoji=active.unicode,
-        highlight=False,
+    stream = file if hasattr(file, "encoding") or file is None else None
+    active = theme or resolve_theme(
+        unicode_ok=detect_unicode_ok(stream=stream)  # type: ignore[arg-type]
     )
+    console_kwargs: dict[str, object] = {
+        "no_color": not active.color,
+        "emoji": active.unicode,
+        "highlight": False,
+        "safe_box": True,
+    }
+    if file is not None:
+        console_kwargs["file"] = file
+    if not active.unicode:
+        console_kwargs["legacy_windows"] = True
+    rich_console = Console(**console_kwargs)  # type: ignore[arg-type]
 
     class RichConsoleAdapter:
         def print(self, message: str = "") -> None:
             rich_console.print(message)
 
         def rule(self, message: str = "") -> None:
-            rich_console.rule(message)
+            if active.unicode:
+                rich_console.rule(message)
+            else:
+                label = f" {message} " if message else ""
+                rich_console.print(f"==={label}===" if message else "===")
 
         @contextmanager
         def status(self, message: str) -> Iterator[None]:

@@ -24,10 +24,10 @@ _EN: dict[str, str] = {
     "planned_file": "  {path} [{hosts}]",
     "conflicts_header": "Existing paths (conflicts preserved unless adopted)",
     "conflict_line": "  conflict: {path}",
-    "installing": "Installing…",
-    "updating": "Updating…",
-    "uninstalling": "Uninstalling…",
-    "repairing": "Repairing…",
+    "installing": "Installing...",
+    "updating": "Updating...",
+    "uninstalling": "Uninstalling...",
+    "repairing": "Repairing...",
     "done": "Done.",
     "summary_header": "Summary",
     "summary_host": "  {host}: installed",
@@ -35,7 +35,7 @@ _EN: dict[str, str] = {
     "next_restart": "Restart the host or start a new conversation.",
     "missing_tui": "Interactive mode requires the optional tui extra: pip install 'minimalist-installer[tui]'",
     "no_tty": "Interactive prompts require a TTY. Re-run with --yes and --hosts, or use a terminal.",
-    "progress": "Applying changes…",
+    "progress": "Applying changes...",
 }
 
 _PT: dict[str, str] = {
@@ -58,10 +58,10 @@ _PT: dict[str, str] = {
     "planned_file": "  {path} [{hosts}]",
     "conflicts_header": "Caminhos existentes (conflitos preservados salvo adoção)",
     "conflict_line": "  conflito: {path}",
-    "installing": "Instalando…",
-    "updating": "Atualizando…",
-    "uninstalling": "Desinstalando…",
-    "repairing": "Reparando…",
+    "installing": "Instalando...",
+    "updating": "Atualizando...",
+    "uninstalling": "Desinstalando...",
+    "repairing": "Reparando...",
     "done": "Concluído.",
     "summary_header": "Resumo",
     "summary_host": "  {host}: instalado",
@@ -69,7 +69,7 @@ _PT: dict[str, str] = {
     "next_restart": "Reinicie o host ou inicie uma nova conversa.",
     "missing_tui": "O modo interativo exige o extra opcional tui: pip install 'minimalist-installer[tui]'",
     "no_tty": "Prompts interativos exigem um TTY. Use --yes e --hosts, ou um terminal.",
-    "progress": "Aplicando alterações…",
+    "progress": "Aplicando alterações...",
 }
 
 _CATALOGS: dict[str, dict[str, str]] = {"en": _EN, "pt": _PT}

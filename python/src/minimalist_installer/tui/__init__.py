@@ -19,7 +19,7 @@ from .app import (
     should_preselect,
 )
 from .messages import catalog, normalize_lang
-from .theme import Theme, resolve_theme
+from .theme import Theme, detect_unicode_ok, resolve_theme
 
 __all__ = [
     "PRESELECT_MIN_CONFIDENCE",
@@ -35,6 +35,7 @@ __all__ = [
     "catalog",
     "create_questionary_prompts",
     "create_rich_console",
+    "detect_unicode_ok",
     "normalize_lang",
     "require_interactive_tty",
     "require_tui_dependencies",

@@ -39,6 +39,7 @@ from .tui.app import (
     should_preselect,
 )
 from .tui.messages import catalog, normalize_lang
+from .tui.theme import detect_unicode_ok, resolve_theme
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -170,6 +171,7 @@ def _status_payload(status: StatusResult) -> dict[str, object]:
 def _result_payload(result: OperationResult) -> dict[str, object]:
     data = result.to_dict()
     data["schema_version"] = JSON_SCHEMA_VERSION
+    data["cancelled"] = False
     return data
 
 
@@ -177,6 +179,38 @@ def _detection_payload(result: object) -> dict[str, object]:
     data = result.to_dict()  # type: ignore[attr-defined]
     data["schema_version"] = JSON_SCHEMA_VERSION
     return data
+
+
+def _cancelled_payload(*, operation: str) -> dict[str, object]:
+    return {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "cancelled": True,
+        "operation": operation,
+    }
+
+
+def _error_payload(error: InstallerError) -> dict[str, object]:
+    data = error.to_dict()
+    data["schema_version"] = JSON_SCHEMA_VERSION
+    return data
+
+
+def _human_stream(*, json_mode: bool, stdout: TextIO, stderr: TextIO) -> TextIO:
+    return stderr if json_mode else stdout
+
+
+def _console_for(
+    *,
+    json_mode: bool,
+    stdout: TextIO,
+    stderr: TextIO,
+    interactive: bool,
+):
+    human = _human_stream(json_mode=json_mode, stdout=stdout, stderr=stderr)
+    theme = resolve_theme(unicode_ok=detect_unicode_ok(stream=human))
+    if interactive:
+        return create_rich_console(theme=theme, file=human)
+    return RecordingConsole(stream=human)
 
 
 def _load_distribution(path: Path) -> SkillDistribution:
@@ -367,12 +401,19 @@ def _cmd_mutate(
     lang = normalize_lang(args.lang)
     text = catalog(lang)
     interactive = _is_tty() and not args.yes
+    human = _human_stream(json_mode=args.json, stdout=stdout, stderr=stderr)
 
     if interactive:
         require_tui_dependencies()
         require_interactive_tty(is_tty=True)
         prompts = create_questionary_prompts()
-        console = create_rich_console()
+        console = _console_for(
+            json_mode=args.json,
+            stdout=stdout,
+            stderr=stderr,
+            interactive=True,
+        )
+        theme = resolve_theme(unicode_ok=detect_unicode_ok(stream=human))
         outcome = run_install_flow(
             distribution,
             prompts=prompts,
@@ -386,9 +427,15 @@ def _cmd_mutate(
             project=args.project,
             registry=registry,
             search_path=_resolve_search_path(args.search_path),
+            theme=theme,
         )
         if outcome.cancelled:
-            _human(stderr if args.json else stdout, text["cancelled"])
+            _human(human, text["cancelled"])
+            if args.json:
+                _emit_json(
+                    _cancelled_payload(operation=operation.value),
+                    stdout=stdout,
+                )
             return EXIT_OK
         if args.json and outcome.result is not None:
             _emit_json(_result_payload(outcome.result), stdout=stdout)
@@ -402,7 +449,13 @@ def _cmd_mutate(
 
     hosts = _determine_hosts(args, registry=registry, interactive=False)
     scope = _default_scope(args)
-    console = RecordingConsole(stream=stderr if args.json else stdout)
+    console = _console_for(
+        json_mode=args.json,
+        stdout=stdout,
+        stderr=stderr,
+        interactive=False,
+    )
+    theme = resolve_theme(unicode_ok=detect_unicode_ok(stream=human))
     # Use run_install_flow with yes=True and scripted-free ports.
     from dataclasses import dataclass, field
 
@@ -432,6 +485,7 @@ def _cmd_mutate(
         project=args.project,
         registry=registry,
         search_path=_resolve_search_path(args.search_path),
+        theme=theme,
     )
     if outcome.result is None:
         return EXIT_ERROR
@@ -451,44 +505,50 @@ def _cmd_uninstall(
     lang = normalize_lang(args.lang)
     text = catalog(lang)
     interactive = _is_tty() and not args.yes
-    hosts = _determine_hosts(args, registry=registry, interactive=interactive)
+    explicit_hosts = _parse_hosts(args.hosts)
     scope = _default_scope(args)
+    human = _human_stream(json_mode=args.json, stdout=stdout, stderr=stderr)
 
     if interactive and not args.yes:
         require_tui_dependencies()
+        require_interactive_tty(is_tty=True)
         prompts = create_questionary_prompts()
-        console = create_rich_console()
-        if not hosts:
-            # Fall through to interactive host selection via install-like flow
-            detection = detect_hosts(
-                scope=scope,
-                registry=registry,
-                home=args.home,
-                project=args.project,
-                search_path=_resolve_search_path(args.search_path),
-            )
-            hosts = tuple(item.host.id for item in detection.detections)
+        console = _console_for(
+            json_mode=args.json,
+            stdout=stdout,
+            stderr=stderr,
+            interactive=True,
+        )
         outcome = run_uninstall_flow(
             distribution,
             prompts=prompts,
             console=console,
             scope=scope,
-            hosts=hosts,
+            hosts=explicit_hosts,
             lang=lang,
             yes=False,
             home=args.home,
             project=args.project,
             registry=registry,
+            search_path=_resolve_search_path(args.search_path),
         )
         if outcome.cancelled:
-            _human(stdout, text["cancelled"])
+            _human(human, text["cancelled"])
+            if args.json:
+                _emit_json(
+                    _cancelled_payload(operation=Operation.UNINSTALL.value),
+                    stdout=stdout,
+                )
             return EXIT_OK
+        if args.json and outcome.result is not None:
+            _emit_json(_result_payload(outcome.result), stdout=stdout)
         return EXIT_OK
 
     if not args.yes:
         raise NonInteractiveInputRequiredError(
             "non-interactive uninstall requires --yes"
         )
+    hosts = _determine_hosts(args, registry=registry, interactive=False)
     if not hosts:
         raise NoHostDetectedError(text["no_hosts"])
 
@@ -529,6 +589,7 @@ def main(
         return int(code) if isinstance(code, int) else EXIT_USAGE
 
     active_registry = registry if registry is not None else HostRegistry.bundled()
+    json_mode = bool(getattr(args, "json", False))
     try:
         if args.command == "detect":
             return _cmd_detect(args, registry=active_registry, stdout=out, stderr=err)
@@ -560,6 +621,12 @@ def main(
         return EXIT_USAGE
     except BrokenPipeError:
         return EXIT_ERROR
+    except InstallerError as error:
+        message = str(error) or type(error).__name__
+        _human(err, message)
+        if json_mode:
+            _emit_json(_error_payload(error), stdout=out)
+        return _exit_for_error(error)
     except Exception as error:
         message = str(error) or type(error).__name__
         _human(err, message)
