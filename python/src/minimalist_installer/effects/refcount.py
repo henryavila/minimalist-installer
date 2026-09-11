@@ -27,7 +27,6 @@ from .file_set import (
     _normalize_relative,
     _parent_paths,
     _read_optional,
-    _remove_owned_parents,
     _sorted_parents,
     sha256_bytes,
 )
@@ -519,6 +518,22 @@ class RefcountEffect:
             ):
                 raise InvalidEffectError("refcount release checkpoint is invalid")
             release_done = phase == "done"
+        directory_states: list[tuple[str, str, Mapping[str, JsonValue] | None]] = []
+        parents = _sorted_parents(
+            (owners_dir, *cast(Sequence[str], state["created_parents"])),
+            deepest_first=True,
+        )
+        for index, parent in enumerate(parents):
+            directory_name = f"uninstall-dir:{index:06d}"
+            raw = checkpoint.read(directory_name)
+            if raw is not None:
+                if not isinstance(raw, Mapping):
+                    raise InvalidEffectError("refcount uninstall directory checkpoint is invalid")
+                phase = raw.get("phase")
+                expected = {"phase", "path", "outcome"} if phase == "done" else {"phase", "path"}
+                if phase not in {"ready", "done"} or set(raw) != expected or raw.get("path") != parent:
+                    raise InvalidEffectError("refcount uninstall directory checkpoint is invalid")
+            directory_states.append((directory_name, parent, cast(Mapping[str, JsonValue] | None, raw)))
         if not release_done:
             if release is None:
                 checkpoint.write("release", {"phase": "ready", "marker_path": marker_path, "marker_hash": state["marker_hash"]})
@@ -532,65 +547,71 @@ class RefcountEffect:
                 outcome = "preserved_modified"
             checkpoint.write("release", {"phase": "done", "marker_path": marker_path, "marker_hash": state["marker_hash"], "outcome": outcome})
 
-        if not filesystem.directory_exists(owners_dir):
-            _remove_owned_parents(filesystem, cast(Sequence[str], state["created_parents"]))
-            return
-        for name, kind in filesystem.list_directory(owners_dir):
-            path = f"{owners_dir}/{name}"
-            if kind is not PathEntryKind.FILE or _DIGEST.fullmatch(name) is None:
-                continue
-            try:
-                marker = filesystem.read_bytes(path)
-                owner_id, manifest_path = _parse_marker(marker)
-            except (FileNotFoundError, UnicodeDecodeError, ValueError, TypeError):
-                continue
-            if owner_key(owner_id) != name:
-                continue
-            if _manifest_proves_owner(
-                filesystem,
-                owner_id=owner_id,
-                owner_manifest_path=manifest_path,
-                key=name,
-                owners_dir=owners_dir,
-            ):
-                continue
-            checkpoint_name = f"orphan:{name}"
-            existing = checkpoint.read(checkpoint_name)
-            expected_hash = sha256_bytes(marker)
-            if existing is not None:
-                if not isinstance(existing, Mapping):
-                    raise InvalidEffectError("refcount orphan checkpoint is invalid")
-                phase = existing.get("phase")
-                expected = (
-                    {"phase", "path", "hash", "outcome"}
-                    if phase == "done"
-                    else {"phase", "path", "hash"}
-                )
-                if (
-                    phase not in {"ready", "done"}
-                    or set(existing) != expected
-                    or existing.get("path") != path
-                ):
-                    raise InvalidEffectError("refcount orphan checkpoint is invalid")
-                if phase == "done":
+        if filesystem.directory_exists(owners_dir):
+            for name, kind in filesystem.list_directory(owners_dir):
+                path = f"{owners_dir}/{name}"
+                if kind is not PathEntryKind.FILE or _DIGEST.fullmatch(name) is None:
                     continue
-                expected_hash = existing["hash"]
-            if existing is None:
-                checkpoint.write(checkpoint_name, {"phase": "ready", "path": path, "hash": expected_hash})
-            current = _read_optional(filesystem, path)
-            outcome = "missing"
-            if current is not None and sha256_bytes(current) == expected_hash:
-                filesystem.unlink(path)
-                outcome = "removed"
-            elif current is not None:
-                outcome = "preserved_modified"
-            checkpoint.write(checkpoint_name, {"phase": "done", "path": path, "hash": expected_hash, "outcome": outcome})
+                try:
+                    marker = filesystem.read_bytes(path)
+                    owner_id, manifest_path = _parse_marker(marker)
+                except (FileNotFoundError, UnicodeDecodeError, ValueError, TypeError):
+                    continue
+                if owner_key(owner_id) != name:
+                    continue
+                if _manifest_proves_owner(
+                    filesystem,
+                    owner_id=owner_id,
+                    owner_manifest_path=manifest_path,
+                    key=name,
+                    owners_dir=owners_dir,
+                ):
+                    continue
+                checkpoint_name = f"orphan:{name}"
+                existing = checkpoint.read(checkpoint_name)
+                expected_hash = sha256_bytes(marker)
+                if existing is not None:
+                    if not isinstance(existing, Mapping):
+                        raise InvalidEffectError("refcount orphan checkpoint is invalid")
+                    phase = existing.get("phase")
+                    expected = (
+                        {"phase", "path", "hash", "outcome"}
+                        if phase == "done"
+                        else {"phase", "path", "hash"}
+                    )
+                    if (
+                        phase not in {"ready", "done"}
+                        or set(existing) != expected
+                        or existing.get("path") != path
+                    ):
+                        raise InvalidEffectError("refcount orphan checkpoint is invalid")
+                    if phase == "done":
+                        continue
+                    expected_hash = existing["hash"]
+                if existing is None:
+                    checkpoint.write(checkpoint_name, {"phase": "ready", "path": path, "hash": expected_hash})
+                current = _read_optional(filesystem, path)
+                outcome = "missing"
+                if current is not None and sha256_bytes(current) == expected_hash:
+                    filesystem.unlink(path)
+                    outcome = "removed"
+                elif current is not None:
+                    outcome = "preserved_modified"
+                checkpoint.write(checkpoint_name, {"phase": "done", "path": path, "hash": expected_hash, "outcome": outcome})
 
-        removed = filesystem.rmdir_empty(owners_dir, missing_ok=True)
-        if removed:
-            _remove_owned_parents(
-                filesystem,
-                tuple(parent for parent in cast(Sequence[str], state["created_parents"]) if parent != owners_dir),
+        for directory_name, parent, raw in directory_states:
+            if raw is not None and raw["phase"] == "done":
+                continue
+            if raw is None:
+                checkpoint.write(directory_name, {"phase": "ready", "path": parent})
+            removed = filesystem.rmdir_empty(parent, missing_ok=True)
+            checkpoint.write(
+                directory_name,
+                {
+                    "phase": "done",
+                    "path": parent,
+                    "outcome": "removed" if removed else "preserved_nonempty",
+                },
             )
 
 
