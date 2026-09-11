@@ -154,22 +154,34 @@ def test_shared_agents_skills_is_one_physical_file_with_host_attribution(
         home=home,
         registry=registry,
     )
-    desired = list(planned.plans[0].args["desired"])
-    paths = [item["path"] for item in desired]
+    by_destination = {
+        plan.args["destination"]: plan for plan in planned.plans
+    }
+    agents_plan = by_destination[".agents/skills"]
+    grok_plan = by_destination[".grok/skills"]
+    agents_desired = list(agents_plan.args["desired"])
+    grok_desired = list(grok_plan.args["desired"])
+    agents_paths = [item["path"] for item in agents_desired]
+    grok_paths = [item["path"] for item in grok_desired]
     shared = ".agents/skills/demo/SKILL.md"
     grok_only = ".grok/skills/demo/SKILL.md"
     attribution = {item.relative: item.host_ids for item in planned.files}
 
-    assert len(planned.plans) == 1
-    assert planned.plans[0].type == "reconcile_file_set"
-    assert planned.plans[0].version == 1
-    assert paths.count(shared) == 1
-    assert grok_only in paths
+    assert len(planned.plans) == 2
+    assert agents_plan.type == "reconcile_file_set"
+    assert agents_plan.version == 1
+    assert agents_paths.count("demo/SKILL.md") == 1
+    assert grok_paths.count("demo/SKILL.md") == 1
     assert attribution[shared] == ("codex", "grok")
     assert attribution[grok_only] == ("grok",)
-    assert "Use bar." in next(item["content"] for item in desired if item["path"] == shared)
-    assert planned.plans[0].resources == (
-        canonical_resource_identity("path", home),
+    assert "Use bar." in next(
+        item["content"] for item in agents_desired if item["path"] == "demo/SKILL.md"
+    )
+    assert agents_plan.resources == (
+        canonical_resource_identity("path", home / ".agents/skills"),
+    )
+    assert grok_plan.resources == (
+        canonical_resource_identity("path", home / ".grok/skills"),
     )
     assert not (home / ".agents").exists()
     assert tuple(planned) == planned.plans
