@@ -27,6 +27,7 @@ from minimalist_installer.core.journal import (
     CleanupProofKind,
     CleanupTombstone,
     TransactionPhase,
+    TransactionRepository,
 )
 from minimalist_installer.core.locks import canonical_resource_identity
 from minimalist_installer.core.path_safety import SafeFilesystem
@@ -691,6 +692,141 @@ def test_resume_incompatible_plan_is_rejected_without_mutation(tmp_path: Path) -
     assert (tmp_path / "files/a.txt").read_bytes() == b"A"
     assert not (tmp_path / "files/b.txt").exists()
     assert _active(tmp_path) is not None
+
+
+def _interrupt_uninstall(
+    tmp_path: Path,
+    *,
+    fail_revert_of: str,
+) -> tuple[Any, _PathEffect, bytes]:
+    first = _PathEffect()
+    installed = _installer(
+        tmp_path,
+        _StaticProvider(
+            (_plan("a", "files/a.txt", "A"), _plan("b", "files/b.txt", "B"))
+        ),
+        first,
+        ("install-1", "tx-0"),
+    )
+    installed.install(base_path=tmp_path)
+    manifest_before = (tmp_path / "state/manifest.json").read_bytes()
+    effect = _PathEffect(fail_revert_of=fail_revert_of)
+    installer = _installer(
+        tmp_path,
+        _StaticProvider(
+            (_plan("a", "files/a.txt", "A"), _plan("b", "files/b.txt", "B"))
+        ),
+        effect,
+        ("tx-1",),
+    )
+    with pytest.raises(RuntimeError, match=f"revert interrupted:{fail_revert_of}"):
+        installer.uninstall(base_path=tmp_path)
+    return installer, effect, manifest_before
+
+
+def test_default_repair_aborts_unmutated_uninstall_and_keeps_installation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer, _effect, manifest_before = _interrupt_uninstall(
+        tmp_path, fail_revert_of="b"
+    )
+    assert (tmp_path / "files/a.txt").read_bytes() == b"A"
+    assert (tmp_path / "files/b.txt").read_bytes() == b"B"
+    report = installer.inspect_recovery(base_path=tmp_path)
+    assert report.operation is Operation.UNINSTALL
+    assert report.reverted == ()
+    assert report.rollback_supported is True
+    assert report.resumable is True
+
+    real_unlink = SafeFilesystem.unlink
+
+    def fail_journal(
+        self: SafeFilesystem,
+        relative: str,
+        *,
+        missing_ok: bool = False,
+    ) -> bool:
+        if str(relative).endswith("journal.json"):
+            raise OSError("cleanup interrupted")
+        return real_unlink(self, relative, missing_ok=missing_ok)
+
+    monkeypatch.setattr(SafeFilesystem, "unlink", fail_journal)
+    with pytest.raises(OSError, match="cleanup interrupted"):
+        installer.repair(base_path=tmp_path)
+    monkeypatch.setattr(SafeFilesystem, "unlink", real_unlink)
+
+    active = _active(tmp_path)
+    assert active is not None
+    assert active["proof"]["kind"] == CleanupProofKind.ROLLED_BACK.value
+    assert (tmp_path / "files/a.txt").read_bytes() == b"A"
+    assert (tmp_path / "files/b.txt").read_bytes() == b"B"
+    assert (tmp_path / "state/manifest.json").read_bytes() == manifest_before
+
+    result = installer.repair(base_path=tmp_path)
+    assert result.status is OperationStatus.COMPLETED
+    assert _active(tmp_path) is None
+    assert (tmp_path / "files/a.txt").read_bytes() == b"A"
+    assert (tmp_path / "files/b.txt").read_bytes() == b"B"
+    assert (tmp_path / "state/manifest.json").read_bytes() == manifest_before
+
+
+def test_default_repair_fails_closed_after_partial_uninstall_revert(
+    tmp_path: Path,
+) -> None:
+    installer, _effect, manifest_before = _interrupt_uninstall(
+        tmp_path, fail_revert_of="a"
+    )
+    assert (tmp_path / "files/a.txt").read_bytes() == b"A"
+    assert not (tmp_path / "files/b.txt").exists()
+    report = installer.inspect_recovery(base_path=tmp_path)
+    assert report.operation is Operation.UNINSTALL
+    assert "b" in report.reverted
+    assert report.rollback_supported is False
+    assert report.resumable is True
+    before = _snapshot(tmp_path)
+
+    with pytest.raises(RecoveryBlockedError) as blocked:
+        installer.repair(base_path=tmp_path)
+
+    assert blocked.value.details.get("rollback_supported") is False
+    assert _snapshot(tmp_path) == before
+    assert (tmp_path / "files/a.txt").read_bytes() == b"A"
+    assert not (tmp_path / "files/b.txt").exists()
+    assert (tmp_path / "state/manifest.json").read_bytes() == manifest_before
+    assert _active(tmp_path) is not None
+    with pytest.raises(IncompleteTransactionError):
+        installer.install(base_path=tmp_path)
+
+
+def test_resume_true_continues_interrupted_uninstall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer, _effect, _manifest_before = _interrupt_uninstall(
+        tmp_path, fail_revert_of="a"
+    )
+    assert (tmp_path / "files/a.txt").is_file()
+    assert not (tmp_path / "files/b.txt").exists()
+    began: list[str] = []
+    original = TransactionRepository.begin_repair
+
+    def tracking_begin_repair(self: TransactionRepository, transaction_id: str):
+        began.append(transaction_id)
+        return original(self, transaction_id)
+
+    monkeypatch.setattr(
+        TransactionRepository, "begin_repair", tracking_begin_repair
+    )
+
+    result = installer.repair(base_path=tmp_path, resume=True)
+
+    assert began == ["tx-1"]
+    assert result.status is OperationStatus.COMPLETED
+    assert not (tmp_path / "files/a.txt").exists()
+    assert not (tmp_path / "files/b.txt").exists()
+    assert not (tmp_path / "state/manifest.json").exists()
+    assert _active(tmp_path) is None
 
 
 def test_resume_compatible_plan_continues_from_wal_progress(tmp_path: Path) -> None:

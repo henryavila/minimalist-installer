@@ -11,7 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from minimalist_installer import IncompleteTransactionError, OperationStatus
+from minimalist_installer import (
+    IncompleteTransactionError,
+    OperationStatus,
+    RecoveryBlockedError,
+)
 
 _WORKER_PATH = Path(__file__).with_name("crash_worker.py")
 _SPEC = importlib.util.spec_from_file_location("crash_worker", _WORKER_PATH)
@@ -40,10 +44,34 @@ INSTALL_BOUNDARIES = (
     "manifest",
     "tombstone",
 )
-UPDATE_BOUNDARIES = ("applied", "committing", "manifest")
-UNINSTALL_BOUNDARIES = ("reverted", "effects_reverted", "manifest_removed", "tombstone")
-REPAIR_BOUNDARIES = ("repairing", "reverted", "rolled_back", "tombstone")
+UPDATE_BOUNDARIES = (
+    "journal",
+    "prepared",
+    "applied",
+    "effects_applied",
+    "committing",
+    "manifest",
+    "tombstone",
+)
+UNINSTALL_BOUNDARIES = (
+    "journal",
+    "prepared",
+    "reverted",
+    "effects_reverted",
+    "committing",
+    "manifest_removed",
+    "tombstone",
+)
+REPAIR_BOUNDARIES = (
+    "repairing",
+    "reverted",
+    "effects_reverted",
+    "rolled_back",
+    "tombstone",
+)
 COMMITTED_HOLD_POINTS = frozenset({"manifest", "manifest_committed", "tombstone"})
+UNINSTALL_PRE_REVERT = frozenset({"journal", "prepared"})
+UNINSTALL_CLEANUP = frozenset({"manifest_removed", "tombstone"})
 
 
 def _run_worker(
@@ -168,7 +196,25 @@ def test_crash_at_durable_boundary_is_inspectable_and_repairable(
         installer.install(base_path=tmp_path)
     assert _snapshot(tmp_path) == crashed
 
-    result = installer.repair(base_path=tmp_path)
+    manifest_path = tmp_path / "state/manifest.json"
+    if (
+        operation == "uninstall"
+        and hold_after not in UNINSTALL_PRE_REVERT
+        and hold_after not in UNINSTALL_CLEANUP
+    ):
+        blocked = installer.inspect_recovery(base_path=tmp_path)
+        assert blocked.rollback_supported is False
+        assert blocked.resumable is True
+        with pytest.raises(RecoveryBlockedError):
+            installer.repair(base_path=tmp_path)
+        assert (tmp_path / SENTINEL_NAME).read_bytes() == SENTINEL_BYTES
+        assert _active(tmp_path) is not None
+        assert manifest_path.is_file()
+        if hold_after == "reverted":
+            assert (tmp_path / README_PATH).is_file()
+        result = installer.repair(base_path=tmp_path, resume=True)
+    else:
+        result = installer.repair(base_path=tmp_path)
     assert result.status is OperationStatus.COMPLETED
     assert (tmp_path / SENTINEL_NAME).read_bytes() == SENTINEL_BYTES
     assert _active(tmp_path) is None
@@ -176,8 +222,14 @@ def test_crash_at_durable_boundary_is_inspectable_and_repairable(
     assert final_status.incomplete_transaction_id is None
     assert final_status.status is OperationStatus.COMPLETED
 
-    manifest_path = tmp_path / "state/manifest.json"
     if operation == "uninstall":
+        if hold_after in UNINSTALL_PRE_REVERT:
+            assert json.loads(manifest_path.read_text("utf-8"))["transaction_id"] == (
+                seed_transaction
+            )
+            assert (tmp_path / README_PATH).read_bytes() == b"version-1"
+            assert (tmp_path / SETTINGS_PATH).is_file()
+            return
         assert not manifest_path.exists()
         assert not (tmp_path / README_PATH).exists()
         return
