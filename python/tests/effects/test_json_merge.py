@@ -6,7 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from minimalist_installer import EffectContext, InvalidEffectError, Operation, PreparedEffect
+from minimalist_installer import (
+    EffectContext,
+    EffectPlan,
+    InvalidEffectError,
+    Operation,
+    PlanContext,
+    PreparedEffect,
+    define_installer,
+)
+from minimalist_installer.core.locks import canonical_resource_identity
 from minimalist_installer.core.path_safety import SafeFilesystem
 from minimalist_installer.effects import JsonMergeEffect
 
@@ -258,7 +267,11 @@ def test_interrupted_apply_and_rollback_resume_idempotently(tmp_path: Path) -> N
     with SafeFilesystem(tmp_path) as safe:
         prepared = _prepared(effect, safe, tmp_path, {"ours": True})
         writer = MemoryCheckpoints()
-        writer.write("apply", {**prepared.payload["checkpoint"], "phase": "ready"})
+        blob = writer.write_blob(original)
+        writer.write(
+            "apply",
+            {**prepared.payload["checkpoint"], "phase": "ready", "blob": blob},
+        )
         safe.atomic_write_bytes("settings.json", prepared.payload["after_bytes"].encode("latin1"))
         effect.apply(prepared, writer)
         effect.revert(_context(tmp_path, safe, Operation.UPDATE), prepared.before_state, writer)
@@ -278,3 +291,84 @@ def test_corrupt_prepared_and_before_state_fail_closed(tmp_path: Path) -> None:
         with pytest.raises((InvalidEffectError, ValueError, TypeError)):
             effect.revert(_context(tmp_path, safe, Operation.UNINSTALL), {"version": 99}, MemoryCheckpoints())
     assert target.read_bytes() == b"{}\n"
+
+
+def test_nonfinite_exponent_and_inconsistent_owned_state_fail_closed(tmp_path: Path) -> None:
+    target = tmp_path / "settings.json"
+    target.write_bytes(b'{"huge":1e999}\n')
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        with pytest.raises(ValueError, match="finite"):
+            _prepared(effect, safe, tmp_path, {"added": True})
+
+        target.write_bytes(b"{}\n")
+        prepared = _prepared(effect, safe, tmp_path, {"added": True})
+        corrupt = dict(prepared.to_dict()["before_state"])
+        corrupt["path"] = "other.json"
+        forged = PreparedEffect(
+            before_state=corrupt,
+            payload=prepared.to_dict()["payload"],
+            filesystem=safe,
+        )
+        with pytest.raises(InvalidEffectError, match="state"):
+            effect.apply(forged, MemoryCheckpoints())
+    assert target.read_bytes() == b"{}\n"
+
+
+def test_corrupt_done_uninstall_checkpoint_cannot_skip_revert(tmp_path: Path) -> None:
+    target = tmp_path / "settings.json"
+    target.write_bytes(b"{}\n")
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared, _ = _apply(effect, safe, tmp_path, {"ours": True})
+        writer = MemoryCheckpoints()
+        writer.checkpoints["uninstall"] = {"phase": "done", "path": "other.json"}
+        with pytest.raises(InvalidEffectError, match="checkpoint"):
+            effect.revert(
+                _context(tmp_path, safe, Operation.UNINSTALL),
+                prepared.before_state,
+                writer,
+            )
+    assert json.loads(target.read_text("utf-8"))["ours"] is True
+
+
+def test_driver_update_then_uninstall_retains_merge_ownership(tmp_path: Path) -> None:
+    class MergeProvider:
+        def plan(
+            self,
+            config: Mapping[str, object],
+            context: PlanContext,
+        ) -> tuple[EffectPlan, ...]:
+            path = ".claude/settings.json"
+            return (
+                EffectPlan(
+                    id="settings",
+                    type="json_merge",
+                    version=1,
+                    args={"path": path, "delta": config["delta"]},
+                    resources=(
+                        canonical_resource_identity(
+                            "path", context.base_path / path
+                        ),
+                    ),
+                ),
+            )
+
+    target = tmp_path / ".claude/settings.json"
+    target.parent.mkdir()
+    original = b'{\n  "third_party": true\n}\n'
+    target.write_bytes(original)
+    installer = define_installer(
+        config={
+            "consumer": "tests",
+            "consumer_version": "1",
+            "manifest_dir": "state",
+            "delta": {"ours": [1]},
+        },
+        providers=[MergeProvider()],
+        id_factory=iter(("install", "tx-1", "tx-2", "tx-3")).__next__,
+    )
+    installer.install(base_path=tmp_path)
+    installer.install(base_path=tmp_path)
+    installer.uninstall(base_path=tmp_path)
+    assert target.read_bytes() == original

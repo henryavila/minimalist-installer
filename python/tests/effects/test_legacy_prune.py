@@ -240,3 +240,52 @@ def test_corrupt_prepared_and_before_state_fail_closed(tmp_path: Path) -> None:
         with pytest.raises((InvalidEffectError, ValueError, TypeError)):
             effect.revert(_context(tmp_path, safe, Operation.UNINSTALL), {"version": 99}, MemoryCheckpoints())
     assert sentinel.is_file()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"---\nname: fix\nname: historical-name\n---\n",
+        b"---\nname: \"fix'\n---\n",
+    ],
+)
+def test_ambiguous_frontmatter_is_not_an_ownership_signature(content: bytes) -> None:
+    assert read_frontmatter_name(content) is None
+
+
+def test_prepared_delete_must_be_owned_by_persisted_before_state(tmp_path: Path) -> None:
+    target = _write(tmp_path, ".claude/commands/atomic-skills/fix.md", b"---\nname: fix\n---\n")
+    effect = LegacyPruneEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared = _prepare(effect, safe, tmp_path)
+        forged = PreparedEffect(
+            before_state={"version": 1, "pruned": []},
+            payload=prepared.to_dict()["payload"],
+            filesystem=safe,
+        )
+        with pytest.raises(InvalidEffectError, match="state"):
+            effect.apply(forged, MemoryCheckpoints())
+    assert target.is_file()
+
+
+def test_corrupt_done_restore_checkpoint_cannot_skip_restore(tmp_path: Path) -> None:
+    content = b"---\nname: fix\n---\n"
+    target = _write(tmp_path, ".claude/commands/atomic-skills/fix.md", content)
+    effect = LegacyPruneEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared = _prepare(effect, safe, tmp_path)
+        effect.apply(prepared, MemoryCheckpoints())
+        writer = MemoryCheckpoints()
+        writer.checkpoints["uninstall:000000"] = {
+            "phase": "done",
+            "path": "other.md",
+            "sha256": "0" * 64,
+            "outcome": "restored",
+        }
+        with pytest.raises(InvalidEffectError, match="checkpoint"):
+            effect.revert(
+                _context(tmp_path, safe, Operation.UNINSTALL),
+                prepared.before_state,
+                writer,
+            )
+    assert not target.exists()

@@ -61,6 +61,13 @@ def _apply(effect: RefcountEffect, safe: object, root: Path, owner: str, previou
 
 
 def _write_manifest(root: Path, owner: str, state: object) -> None:
+    def thaw(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {key: thaw(item) for key, item in value.items()}
+        if isinstance(value, list | tuple):
+            return [thaw(item) for item in value]
+        return value
+
     path = root / f"manifests/{owner}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     value = {
@@ -68,7 +75,7 @@ def _write_manifest(root: Path, owner: str, state: object) -> None:
         "engine": {"name": "minimalist-installer", "version": "0.1.0"},
         "installation": {"id": owner, "consumer": "tests", "consumer_version": "1"},
         "transaction_id": f"tx-{owner}",
-        "effects": [{"id": "shared", "type": "refcount", "effect_version": 1, "before_state": state, "resources": [f"path:{(root / 'shared/owners').as_posix()}"]}],
+        "effects": [{"id": "shared", "type": "refcount", "effect_version": 1, "before_state": thaw(state), "resources": [f"path:{(root / 'shared/owners').as_posix()}"]}],
         "installed_at": "2026-09-10T00:00:00Z",
         "updated_at": "2026-09-10T00:00:00Z",
     }
@@ -232,3 +239,23 @@ def test_default_installer_registers_all_four_builtins() -> None:
         ("reconcile_file_set", 1),
         ("refcount", 1),
     )
+
+
+def test_corrupt_done_release_checkpoint_cannot_skip_owner_removal(tmp_path: Path) -> None:
+    effect = RefcountEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared, _ = _apply(effect, safe, tmp_path, "owner")
+        writer = MemoryCheckpoints()
+        writer.checkpoints["release"] = {
+            "phase": "done",
+            "marker_path": "other/path",
+            "marker_hash": "0" * 64,
+            "outcome": "removed",
+        }
+        with pytest.raises(InvalidEffectError, match="release checkpoint"):
+            effect.revert(
+                _context(tmp_path, safe, Operation.UNINSTALL),
+                prepared.before_state,
+                writer,
+            )
+    assert _marker(tmp_path, "owner").is_file()

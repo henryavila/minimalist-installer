@@ -259,6 +259,10 @@ class _Backend(Protocol):
 
     def directory_exists(self, parts: tuple[str, ...]) -> bool: ...
 
+    def list_directory(
+        self, parts: tuple[str, ...]
+    ) -> tuple[tuple[str, PathEntryKind], ...]: ...
+
     def ensure_directory(self, parts: tuple[str, ...]) -> None: ...
 
     def atomic_write_bytes(
@@ -431,6 +435,36 @@ class _PosixBackend:
                 return True
         except FileNotFoundError:
             return False
+
+    def list_directory(
+        self, parts: tuple[str, ...]
+    ) -> tuple[tuple[str, PathEntryKind], ...]:
+        """List one real directory through held no-follow descriptors."""
+
+        descriptors = [self._open_base()]
+        current_fd = descriptors[0]
+        walked = self.base
+        try:
+            for component in parts:
+                walked /= component
+                child_fd = self._open_directory_at(current_fd, component, walked)
+                descriptors.append(child_fd)
+                current_fd = child_fd
+            entries: list[tuple[str, PathEntryKind]] = []
+            for name in os.listdir(current_fd):
+                if not isinstance(name, str):
+                    raise _unsafe("directory entry name is not text", walked)
+                try:
+                    entry = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                entries.append(
+                    (name, classify_entry(entry, platform_name=self.platform_name))
+                )
+            return tuple(sorted(entries, key=lambda item: item[0].encode("utf-8")))
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
     def ensure_directory(self, parts: tuple[str, ...]) -> None:
         descriptors = [self._open_base()]
@@ -662,6 +696,13 @@ class SafeFilesystem:
         """Check for a real directory without following link-like entries."""
 
         return self._backend.directory_exists(self._parts(relative))
+
+    def list_directory(
+        self, relative: os.PathLike[str] | str
+    ) -> tuple[tuple[str, PathEntryKind], ...]:
+        """List direct children and no-follow kinds below the trusted base."""
+
+        return self._backend.list_directory(self._parts(relative))
 
     def ensure_directory(self, relative: os.PathLike[str] | str) -> None:
         """Create one directory path safely and idempotently below the base."""

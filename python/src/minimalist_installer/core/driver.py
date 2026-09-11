@@ -671,9 +671,22 @@ def define_installer(
         if not isinstance(configured_manifest, str) or not configured_manifest:
             raise ValueError("config.manifest_dir must be non-empty text")
         manifest_directory = configured_manifest
-    from ..effects import ReconcileFileSetEffect
+    from ..effects import (
+        JsonMergeEffect,
+        LegacyPruneEffect,
+        ReconcileFileSetEffect,
+        RefcountEffect,
+    )
 
-    registry = EffectRegistry((ReconcileFileSetEffect(), *effects))
+    registry = EffectRegistry(
+        (
+            ReconcileFileSetEffect(),
+            JsonMergeEffect(),
+            RefcountEffect(),
+            LegacyPruneEffect(),
+            *effects,
+        )
+    )
     return Installer(
         Driver(
             registry=registry,

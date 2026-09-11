@@ -57,7 +57,17 @@ from .core import (
     UpdateResult,
     define_installer,
 )
-from .effects import FileDecision, ReconcileFileSetEffect, classify_file, sha256_bytes
+from .effects import (
+    FileDecision,
+    JsonMergeEffect,
+    LegacyPruneEffect,
+    ReconcileFileSetEffect,
+    RefcountEffect,
+    classify_file,
+    owner_key,
+    read_frontmatter_name,
+    sha256_bytes,
+)
 from .providers import FileSetProvider
 
 __all__ = [
@@ -115,8 +125,13 @@ __all__ = [
     "UpdateResult",
     "FileSetProvider",
     "FileDecision",
+    "JsonMergeEffect",
+    "LegacyPruneEffect",
     "ReconcileFileSetEffect",
+    "RefcountEffect",
     "classify_file",
+    "owner_key",
+    "read_frontmatter_name",
     "sha256_bytes",
     "define_installer",
 ]
