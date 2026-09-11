@@ -799,6 +799,144 @@ def test_default_repair_fails_closed_after_partial_uninstall_revert(
         installer.install(base_path=tmp_path)
 
 
+def test_prepared_uninstall_with_effect_checkpoints_is_mutated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer = define_installer(
+        config={
+            "consumer": "tests",
+            "consumer_version": "1",
+            "files": [{"path": "owned.txt", "content": "owned-bytes"}],
+        },
+        providers=(FileSetProvider(effect_id="files:owned"),),
+        manifest_directory="state",
+        id_factory=iter(("install-1", "tx-0", "tx-1")).__next__,
+    )
+    installer.install(base_path=tmp_path)
+    manifest_before = (tmp_path / "state/manifest.json").read_bytes()
+    assert (tmp_path / "owned.txt").read_bytes() == b"owned-bytes"
+
+    original = TransactionRepository.effect_checkpoint
+
+    def crash_after_uninstall_checkpoint(
+        self: TransactionRepository,
+        transaction_id: str,
+        effect_id: str,
+        checkpoint: str,
+        state: object,
+    ):
+        journal = original(self, transaction_id, effect_id, checkpoint, state)
+        if (
+            str(checkpoint).startswith("uninstall:")
+            and isinstance(state, Mapping)
+            and state.get("phase") == "done"
+        ):
+            raise OSError("crash after uninstall checkpoint")
+        return journal
+
+    monkeypatch.setattr(
+        TransactionRepository, "effect_checkpoint", crash_after_uninstall_checkpoint
+    )
+    with pytest.raises(OSError, match="crash after uninstall checkpoint"):
+        installer.uninstall(base_path=tmp_path)
+    monkeypatch.setattr(TransactionRepository, "effect_checkpoint", original)
+
+    journal = _journal(tmp_path, "tx-1")
+    effect = journal["effects"][0]
+    assert journal["operation"] == "uninstall"
+    assert effect["status"] == "prepared"
+    assert effect["checkpoints"]
+    assert any(
+        checkpoint["name"].startswith("uninstall:")
+        and isinstance(checkpoint["state"], Mapping)
+        and checkpoint["state"].get("phase") in {"ready", "done"}
+        for checkpoint in effect["checkpoints"]
+    )
+    assert not (tmp_path / "owned.txt").exists()
+    assert (tmp_path / "state/manifest.json").read_bytes() == manifest_before
+
+    report = installer.inspect_recovery(base_path=tmp_path)
+    assert report.operation is Operation.UNINSTALL
+    assert report.reverted == ()
+    assert report.prepared == ("files:owned",)
+    assert report.rollback_supported is False
+    assert report.resumable is True
+    before = _snapshot(tmp_path)
+
+    with pytest.raises(RecoveryBlockedError) as blocked:
+        installer.repair(base_path=tmp_path)
+
+    assert blocked.value.details.get("rollback_supported") is False
+    assert _snapshot(tmp_path) == before
+    assert _active(tmp_path) is not None
+    assert (tmp_path / "state/manifest.json").read_bytes() == manifest_before
+    assert _journal(tmp_path, "tx-1")["effects"][0]["status"] == "prepared"
+    assert "rolled_back" not in _journal(tmp_path, "tx-1")["operation_checkpoints"]
+    with pytest.raises(IncompleteTransactionError):
+        installer.install(base_path=tmp_path)
+
+    result = installer.repair(base_path=tmp_path, resume=True)
+
+    assert result.status is OperationStatus.COMPLETED
+    assert _active(tmp_path) is None
+    assert not (tmp_path / "owned.txt").exists()
+    assert not (tmp_path / "state/manifest.json").exists()
+
+
+def test_default_repair_completes_uninstall_after_manifest_remove_before_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer = define_installer(
+        config={
+            "consumer": "tests",
+            "consumer_version": "1",
+            "files": [{"path": "owned.txt", "content": "owned-bytes"}],
+        },
+        providers=(FileSetProvider(effect_id="files:owned"),),
+        manifest_directory="state",
+        id_factory=iter(("install-1", "tx-0", "tx-1")).__next__,
+    )
+    installer.install(base_path=tmp_path)
+    assert (tmp_path / "owned.txt").read_bytes() == b"owned-bytes"
+
+    original = TransactionRepository.checkpoint
+
+    def crash_before_manifest_removed(
+        self: TransactionRepository,
+        transaction_id: str,
+        name: str,
+    ):
+        if name == "manifest_removed":
+            raise OSError("crash before manifest_removed")
+        return original(self, transaction_id, name)
+
+    monkeypatch.setattr(
+        TransactionRepository, "checkpoint", crash_before_manifest_removed
+    )
+    with pytest.raises(OSError, match="crash before manifest_removed"):
+        installer.uninstall(base_path=tmp_path)
+    monkeypatch.setattr(TransactionRepository, "checkpoint", original)
+
+    assert not (tmp_path / "state/manifest.json").exists()
+    assert not (tmp_path / "owned.txt").exists()
+    journal = _journal(tmp_path, "tx-1")
+    assert journal["operation"] == "uninstall"
+    assert "manifest_removed" not in journal["operation_checkpoints"]
+    assert all(effect["status"] == "reverted" for effect in journal["effects"])
+    assert _active(tmp_path) is not None
+
+    result = installer.repair(base_path=tmp_path)
+
+    assert result.status is OperationStatus.COMPLETED
+    assert result.transaction_id == "tx-1"
+    assert _active(tmp_path) is None
+    assert not (tmp_path / "state/manifest.json").exists()
+    assert not (tmp_path / "owned.txt").exists()
+    assert installer.status(base_path=tmp_path).incomplete_transaction_id is None
+
+
 def test_resume_unmutated_uninstall_survives_crash_before_first_revert(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
