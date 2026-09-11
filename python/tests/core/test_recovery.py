@@ -799,6 +799,96 @@ def test_default_repair_fails_closed_after_partial_uninstall_revert(
         installer.install(base_path=tmp_path)
 
 
+def test_resume_unmutated_uninstall_survives_crash_before_first_revert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer, _effect, _manifest_before = _interrupt_uninstall(
+        tmp_path, fail_revert_of="b"
+    )
+    assert (tmp_path / "files/a.txt").read_bytes() == b"A"
+    assert (tmp_path / "files/b.txt").read_bytes() == b"B"
+    original = TransactionRepository.begin_repair
+
+    def crash_after_begin_repair(
+        self: TransactionRepository,
+        transaction_id: str,
+        *args: object,
+        **kwargs: object,
+    ):
+        journal = original(self, transaction_id, *args, **kwargs)
+        raise OSError("crash after resume checkpoint")
+
+    monkeypatch.setattr(
+        TransactionRepository, "begin_repair", crash_after_begin_repair
+    )
+    with pytest.raises(OSError, match="crash after resume checkpoint"):
+        installer.repair(base_path=tmp_path, resume=True)
+    monkeypatch.setattr(TransactionRepository, "begin_repair", original)
+
+    journal = _journal(tmp_path, "tx-1")
+    assert "resuming" in journal["operation_checkpoints"]
+    assert "repairing" not in journal["operation_checkpoints"]
+    assert all(effect["status"] != "reverted" for effect in journal["effects"])
+    assert (tmp_path / "files/a.txt").read_bytes() == b"A"
+    assert (tmp_path / "files/b.txt").read_bytes() == b"B"
+    assert (tmp_path / "state/manifest.json").is_file()
+
+    real_unlink = SafeFilesystem.unlink
+
+    def fail_journal(
+        self: SafeFilesystem,
+        relative: str,
+        *,
+        missing_ok: bool = False,
+    ) -> bool:
+        if str(relative).endswith("journal.json"):
+            raise OSError("cleanup interrupted")
+        return real_unlink(self, relative, missing_ok=missing_ok)
+
+    monkeypatch.setattr(SafeFilesystem, "unlink", fail_journal)
+    with pytest.raises(OSError, match="cleanup interrupted"):
+        installer.repair(base_path=tmp_path)
+    monkeypatch.setattr(SafeFilesystem, "unlink", real_unlink)
+
+    active = _active(tmp_path)
+    assert active is not None
+    assert active["proof"]["kind"] == CleanupProofKind.MANIFEST_REMOVED.value
+    assert not (tmp_path / "files/a.txt").exists()
+    assert not (tmp_path / "files/b.txt").exists()
+    assert not (tmp_path / "state/manifest.json").exists()
+
+    result = installer.repair(base_path=tmp_path)
+    assert result.status is OperationStatus.COMPLETED
+    assert _active(tmp_path) is None
+    assert not (tmp_path / "files/a.txt").exists()
+    assert not (tmp_path / "files/b.txt").exists()
+    assert not (tmp_path / "state/manifest.json").exists()
+
+
+def test_abort_unmutated_uninstall_still_keeps_installation_after_repairing_checkpoint(
+    tmp_path: Path,
+) -> None:
+    installer, _effect, manifest_before = _interrupt_uninstall(
+        tmp_path, fail_revert_of="b"
+    )
+    journal_path = tmp_path / "state/transactions/tx-1/journal.json"
+    payload = json.loads(journal_path.read_text("utf-8"))
+    payload["operation_checkpoints"] = ["repairing"]
+    payload["phase"] = TransactionPhase.REVERTING.value
+    journal_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert "resuming" not in payload["operation_checkpoints"]
+    assert all(effect["status"] != "reverted" for effect in payload["effects"])
+
+    result = installer.repair(base_path=tmp_path)
+
+    assert result.status is OperationStatus.COMPLETED
+    assert _active(tmp_path) is None
+    assert (tmp_path / "files/a.txt").read_bytes() == b"A"
+    assert (tmp_path / "files/b.txt").read_bytes() == b"B"
+    assert (tmp_path / "state/manifest.json").read_bytes() == manifest_before
+
+
 def test_resume_true_continues_interrupted_uninstall(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
