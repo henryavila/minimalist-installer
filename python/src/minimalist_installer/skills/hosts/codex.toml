@@ -1,0 +1,12 @@
+id = "codex"
+display_name = "Codex"
+support_tier = "verified"
+
+[destinations]
+user = [".agents/skills"]
+project = [".agents/skills"]
+
+[detection]
+executables = ["codex"]
+environment = ["CODEX_*"]
+config_dirs = [".codex"]

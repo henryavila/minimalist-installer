@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "hash": "sha256-bytes",
+  "classification": [
+    {
+      "name": "greenfield missing writes",
+      "desired": "desired",
+      "installed": null,
+      "disk": null,
+      "decision": "write"
+    },
+    {
+      "name": "greenfield collision refuses",
+      "desired": "desired",
+      "installed": null,
+      "disk": "desired",
+      "decision": "conflict"
+    },
+    {
+      "name": "greenfield identical explicit adoption",
+      "desired": "desired",
+      "installed": null,
+      "disk": "desired",
+      "adopt_identical": true,
+      "decision": "adopt"
+    },
+    {
+      "name": "greenfield non-identical adoption refuses",
+      "desired": "desired",
+      "installed": null,
+      "disk": "other",
+      "adopt_identical": true,
+      "decision": "conflict"
+    },
+    {
+      "name": "owned unchanged remains unchanged",
+      "desired": "same",
+      "installed": "same",
+      "disk": "same",
+      "decision": "unchanged"
+    },
+    {
+      "name": "owned unmodified is replaced",
+      "desired": "new",
+      "installed": "old",
+      "disk": "old",
+      "decision": "replace"
+    },
+    {
+      "name": "desired missing on disk is restored",
+      "desired": "new",
+      "installed": "old",
+      "disk": null,
+      "decision": "write_missing"
+    },
+    {
+      "name": "disk already equals new desired",
+      "desired": "new",
+      "installed": "old",
+      "disk": "new",
+      "decision": "already_desired"
+    },
+    {
+      "name": "modified disk with unchanged desired is preserved",
+      "desired": "old",
+      "installed": "old",
+      "disk": "user",
+      "decision": "preserve_modified"
+    },
+    {
+      "name": "both desired and disk changed is a conflict",
+      "desired": "new",
+      "installed": "old",
+      "disk": "user",
+      "decision": "conflict"
+    },
+    {
+      "name": "unmodified orphan is deleted",
+      "desired": null,
+      "installed": "old",
+      "disk": "old",
+      "decision": "delete"
+    },
+    {
+      "name": "modified orphan is preserved",
+      "desired": null,
+      "installed": "old",
+      "disk": "user",
+      "decision": "preserve_orphan"
+    },
+    {
+      "name": "missing orphan remains missing",
+      "desired": null,
+      "installed": "old",
+      "disk": null,
+      "decision": "missing"
+    }
+  ]
+}

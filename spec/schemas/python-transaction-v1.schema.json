@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/henryavila/minimalist-installer/spec/schemas/python-transaction-v1.schema.json",
+  "title": "Minimalist Installer Python transaction journal v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "engine",
+    "transaction_id",
+    "installation_id",
+    "operation",
+    "phase",
+    "planned_effect_ids",
+    "resources",
+    "effects",
+    "operation_checkpoints",
+    "blobs"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "minimalist-installer" },
+        "version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "transaction_id": { "type": "string", "minLength": 1 },
+    "installation_id": { "type": "string", "minLength": 1 },
+    "operation": { "enum": ["install", "update", "repair", "uninstall"] },
+    "phase": { "enum": ["planned", "applying", "reverting", "committing", "committed"] },
+    "planned_effect_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "resources": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "effects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "type",
+          "effect_version",
+          "args",
+          "resources",
+          "status",
+          "prepared",
+          "result",
+          "checkpoints"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "type": { "type": "string", "minLength": 1 },
+          "effect_version": { "type": "integer", "minimum": 1 },
+          "args": { "type": "object" },
+          "resources": { "type": "array", "items": { "type": "string" } },
+          "status": { "enum": ["planned", "prepared", "applied", "reverted"] },
+          "prepared": { "type": ["object", "null"] },
+          "result": {},
+          "checkpoints": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "state"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "state": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "operation_checkpoints": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "blobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["digest", "status"],
+        "properties": {
+          "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "status": { "enum": ["pending", "ready"] }
+        }
+      }
+    }
+  }
+}

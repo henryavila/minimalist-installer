@@ -1,0 +1,12 @@
+id = "opencode"
+display_name = "OpenCode"
+support_tier = "layout-only"
+
+[destinations]
+user = [".config/opencode/skills"]
+project = [".opencode/skills"]
+
+[detection]
+executables = ["opencode"]
+environment = ["OPENCODE_*"]
+config_dirs = [".opencode"]

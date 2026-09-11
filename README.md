@@ -39,26 +39,48 @@ round-trip).
 
 ## Install
 
+### JavaScript (npm)
+
 ```sh
 npm install @henryavila/minimalist-installer
+```
+
+### Python (PyPI / source)
+
+```sh
+pip install minimalist-installer
+# optional interactive TUI:
+pip install 'minimalist-installer[tui]'
+```
+
+From this repository:
+
+```sh
+pip install -e './python[dev,tui]'
 ```
 
 ## Status
 
 **v0.1.0.** The engine core, extracted from `@henryavila/atomic-skills` (its first
-consumer) and now published to npm.
+consumer) and now published to npm. A Python distribution under `python/` provides
+an equivalent reversible engine plus an official skills installer (CLI/TUI).
 
-Delivered: the effect kernel + journal + 3-hash file reconciler + the three
-built-in non-file effects (`json-merge`, `refcount`, `legacy-prune`), each with a
-round-trip / adversarial test suite; the **Provider contract** + a reference
+Delivered (JavaScript): the effect kernel + journal + 3-hash file reconciler + the
+three built-in non-file effects (`json-merge`, `refcount`, `legacy-prune`), each
+with a round-trip / adversarial test suite; the **Provider contract** + a reference
 `createFileSetProvider()`; the **Driver** (`install` / `uninstall` / **update**,
 structural round-trip, no-clobber on user edits); **`defineInstaller`** (the
 two-tier config factory); and a **runtime-layer worked example**
 ([`examples/symlink-runtime-layer.js`](examples/symlink-runtime-layer.js)) — see
 [`docs/design/provider-driver.md`](docs/design/provider-driver.md).
 
-There is no CLI — this is a **library**; the consumer owns its own CLI (lib-only
-by design).
+The JavaScript package remains a **library** (no CLI; the consumer owns its CLI).
+The Python package additionally ships `minimalist-installer` for skill
+distributions.
+
+Cross-language parity is tracked in
+[`spec/capability-matrix.json`](spec/capability-matrix.json)
+(`equivalent` | `python-extension` | `node-extension` | `not-applicable`).
 
 ## API
 
@@ -106,11 +128,75 @@ import {
 - **Journal** (`recordEffect`/`readEffects`/`replayReverse`) + **manifest**
   (`readManifest`/`writeManifest`, consumer-overridable directory).
 
+## Python API
+
+```python
+from pathlib import Path
+from minimalist_installer import FileSetProvider, define_installer
+from minimalist_installer.skills import (
+    HostRegistry,
+    Scope,
+    SkillDistribution,
+    plan_distribution,
+)
+from minimalist_installer.tui.app import build_installer
+
+# Generic reversible install
+installer = define_installer(
+    config={
+        "consumer": "my-tool",
+        "consumer_version": "1.0.0",
+        "files": [{"path": "README.generated.md", "content": "hello\n"}],
+    },
+    providers=[FileSetProvider()],
+)
+installer.install(base_path=Path.home() / "projects" / "demo")
+installer.uninstall(base_path=Path.home() / "projects" / "demo")
+
+# Official skill distribution (host adapters are data-driven)
+distribution = SkillDistribution(
+    name="demo",
+    version="0.1.0",
+    bundle=Path("agent_skill"),
+    variables={"DEMO_BIN": "/usr/bin/demo"},
+)
+planned = plan_distribution(
+    distribution,
+    hosts=("codex", "claude-code"),
+    scope=Scope.USER,
+    home=Path.home(),
+    registry=HostRegistry.bundled(),
+)
+skills = build_installer(distribution, planned)
+skills.install(base_path=Path.home())
+```
+
+Non-interactive CLI:
+
+```sh
+minimalist-installer detect --json
+minimalist-installer install ./distribution.toml --yes --scope user --hosts codex
+minimalist-installer uninstall ./distribution.toml --yes --scope user --hosts codex
+```
+
+### Host support tiers
+
+| Tier | Meaning | Bundled hosts |
+|---|---|---|
+| `verified` | Layout + install path exercised in automated gates | `claude-code`, `cursor`, `codex`, `grok` |
+| `layout-only` | Destination layout known; real-agent workflow not yet qualified | `gemini`, `opencode`, `github-copilot` |
+| `external` | Third-party adapter loaded via entry points | (none bundled) |
+
 ## Test
 
 ```sh
-npm test    # node --test "test/**/*.test.js"  (requires Node >= 21 for glob expansion)
+npm test           # node --test "test/**/*.test.js"  (requires Node >= 21 for glob expansion)
+npm run test:python  # pytest via python/.venv (after pip install -e './python[dev,tui]')
 ```
+
+CI runs the Node suite on Ubuntu and the Python suite on Linux/macOS/Windows for
+Python 3.11–3.13. Windows crash SIGKILL matrices and SafeFilesystem mutations stay
+fail-closed / skipped until a verified Windows mutation backend ships.
 
 ## License
 

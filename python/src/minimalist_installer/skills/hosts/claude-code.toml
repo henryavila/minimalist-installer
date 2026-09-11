@@ -1,0 +1,12 @@
+id = "claude-code"
+display_name = "Claude Code"
+support_tier = "verified"
+
+[destinations]
+user = [".claude/skills"]
+project = [".claude/skills"]
+
+[detection]
+executables = ["claude"]
+environment = ["CLAUDECODE"]
+config_dirs = [".claude"]
