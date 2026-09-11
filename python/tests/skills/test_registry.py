@@ -114,14 +114,15 @@ def test_bundled_toml_loads_all_seven_hosts_with_ids_tiers_and_paths() -> None:
     opencode = hosts["opencode"]
     assert opencode.display_name == "OpenCode"
     assert opencode.support_tier is SupportTier.LAYOUT_ONLY
-    assert opencode.destinations.user == (".opencode/skills",)
+    assert opencode.destinations.user == (".config/opencode/skills",)
     assert opencode.destinations.project == (".opencode/skills",)
 
     copilot = hosts["github-copilot"]
     assert copilot.display_name == "GitHub Copilot"
     assert copilot.support_tier is SupportTier.LAYOUT_ONLY
-    assert copilot.destinations.user == (".github/skills",)
+    assert copilot.destinations.user == (".copilot/skills",)
     assert copilot.destinations.project == (".github/skills",)
+    assert copilot.detection.config_dirs == (".github/skills",)
 
 
 def test_support_tiers_are_explicit_verified_layout_only_or_external() -> None:
@@ -260,8 +261,58 @@ def test_entry_point_adapter_object_appears_in_registry(
 
 def test_core_modules_do_not_contain_host_id_literals() -> None:
     root = Path(path_safety.__file__).parent
-    forbidden = ("claude-code", "cursor", "codex", "gemini", "grok")
+    forbidden = (
+        "claude-code",
+        "cursor",
+        "codex",
+        "gemini",
+        "grok",
+        "opencode",
+        "github-copilot",
+    )
     for path in sorted(root.glob("*.py")):
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             assert token not in text, f"{path.name} must not contain {token!r}"
+
+
+def test_relative_destination_rejects_dot_as_scope_root() -> None:
+    with pytest.raises(ValueError, match="relative"):
+        HostDestinations(user=(".",), project=(".skills",))
+    with pytest.raises(ValueError, match="relative"):
+        HostDestinations(user=(".skills",), project=(".",))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"config_dirs": ("/etc",)},
+        {"config_dirs": ("C:\\Windows",)},
+        {"config_dirs": (".",)},
+        {"config_dirs": ("..",)},
+        {"config_dirs": ("foo/../bar",)},
+        {"config_dirs": ("foo/./bar",)},
+        {"config_dirs": ("foo//bar",)},
+        {"environment": ("*",)},
+        {"executables": ("/usr/bin/true",)},
+        {"executables": ("bin/true",)},
+    ),
+)
+def test_detection_signals_reject_unsafe_values(kwargs: dict[str, tuple[str, ...]]) -> None:
+    with pytest.raises(ValueError):
+        DetectionSignals(**kwargs)
+
+
+def test_descriptor_rejects_unsafe_detection_signals() -> None:
+    with pytest.raises(InvalidDistributionError):
+        load_host_descriptor(
+            _VALID_EXTERNAL.replace('config_dirs = [".extra"]', 'config_dirs = ["/etc"]')
+        )
+    with pytest.raises(InvalidDistributionError):
+        load_host_descriptor(
+            _VALID_EXTERNAL.replace('executables = ["extra-host"]', 'executables = ["/usr/bin/true"]')
+        )
+    with pytest.raises(InvalidDistributionError):
+        load_host_descriptor(
+            _VALID_EXTERNAL.replace("environment = []", 'environment = ["*"]')
+        )

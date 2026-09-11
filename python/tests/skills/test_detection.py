@@ -263,3 +263,70 @@ def test_project_config_directory_is_evidence(tmp_path: Path) -> None:
         item.kind is EvidenceKind.CONFIG_DIRECTORY
         for item in result.detections[0].evidence
     )
+
+
+def test_github_copilot_is_not_detected_from_github_workflows_only(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    project = _git_worktree(tmp_path / "project")
+    workflows = project / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text("name: ci\n", encoding="utf-8")
+
+    result = _detect(tmp_path, home=home, project=project, scope=Scope.PROJECT)
+
+    assert all(item.host.id != "github-copilot" for item in result.detections)
+
+
+def test_github_copilot_is_detected_from_github_skills_directory(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    project = _git_worktree(tmp_path / "project")
+    (project / ".github" / "skills").mkdir(parents=True)
+
+    result = _detect(tmp_path, home=home, project=project, scope=Scope.PROJECT)
+
+    assert any(item.host.id == "github-copilot" for item in result.detections)
+
+
+def test_copilot_and_opencode_user_destinations_use_user_config_roots(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+
+    result = _detect(
+        tmp_path,
+        home=home,
+        environ={"COPILOT_TOKEN": "1", "OPENCODE_API_KEY": "1"},
+    )
+    paths = {item.path for item in result.destinations}
+    by_host = {
+        detection.host.id: {
+            item.path for item in result.destinations if detection.host.id in item.host_ids
+        }
+        for detection in result.detections
+    }
+
+    assert by_host["github-copilot"] == {home / ".copilot" / "skills"}
+    assert by_host["opencode"] == {home / ".config" / "opencode" / "skills"}
+    assert home / ".github" / "skills" not in paths
+    assert home / ".opencode" / "skills" not in paths
+
+
+def test_copilot_and_opencode_project_destinations_keep_project_layout(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    project = _git_worktree(tmp_path / "project")
+
+    result = _detect(
+        tmp_path,
+        home=home,
+        project=project,
+        scope=Scope.PROJECT,
+        environ={"COPILOT_TOKEN": "1", "OPENCODE_API_KEY": "1"},
+    )
+    paths = {item.path for item in result.destinations}
+
+    assert project / ".github" / "skills" in paths
+    assert project / ".opencode" / "skills" in paths
+    assert project / ".copilot" / "skills" not in paths
+    assert project / ".config" / "opencode" / "skills" not in paths

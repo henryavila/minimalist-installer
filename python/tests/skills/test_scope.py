@@ -105,6 +105,18 @@ def test_project_scope_refuses_filesystem_root(tmp_path: Path) -> None:
         resolve_project_root(Path("/"), home=home)
 
 
+def test_missing_git_repository_reports_git_root_not_filesystem_root(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    nested = tmp_path / "nongit" / "nested"
+    nested.mkdir(parents=True)
+
+    with pytest.raises(UnsafePathError, match="git root") as excinfo:
+        resolve_project_root(nested, home=home)
+
+    assert "filesystem root" not in str(excinfo.value)
+
+
 def test_project_scope_refuses_home_as_project(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _git_worktree(home)
