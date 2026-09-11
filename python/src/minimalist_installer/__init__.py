@@ -57,6 +57,7 @@ from .core import (
     UpdateResult,
     define_installer,
 )
+from .effects import FileDecision, ReconcileFileSetEffect, classify_file, sha256_bytes
 from .providers import FileSetProvider
 
 __all__ = [
@@ -113,6 +114,10 @@ __all__ = [
     "UnsupportedHostError",
     "UpdateResult",
     "FileSetProvider",
+    "FileDecision",
+    "ReconcileFileSetEffect",
+    "classify_file",
+    "sha256_bytes",
     "define_installer",
 ]
 

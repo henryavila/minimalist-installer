@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
@@ -148,6 +148,11 @@ class EffectContext:
     operation: Operation
     transaction_id: str
     effect_id: str
+    filesystem: object | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def to_dict(self) -> JsonObject:
         """Return a stable JSON representation of the effect context."""
@@ -169,6 +174,11 @@ class PreparedEffect:
     payload: JsonValue
     resources: tuple[str, ...] = ()
     recoverable: bool = True
+    filesystem: object | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if any(not isinstance(resource, str) or not resource for resource in self.resources):

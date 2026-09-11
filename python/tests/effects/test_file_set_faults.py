@@ -126,6 +126,7 @@ def _previous() -> dict[str, object]:
         "files": [
             {"path": "create-parent/replace.txt", "installed_hash": _digest(b"v1")},
             {"path": "orphan.txt", "installed_hash": _digest(b"orphan-v1")},
+            {"path": "stable.txt", "installed_hash": _digest(b"stable")},
         ],
     }
 
@@ -134,6 +135,7 @@ def _seed(root: Path) -> Path:
     (root / "create-parent").mkdir()
     (root / "create-parent/replace.txt").write_bytes(b"v1")
     (root / "orphan.txt").write_bytes(b"orphan-v1")
+    (root / "stable.txt").write_bytes(b"stable")
     sentinel = root.parent / f"{root.name}-sentinel.txt"
     sentinel.write_bytes(b"outside")
     return sentinel
@@ -149,6 +151,7 @@ def _prepare_update(
             "desired": [
                 {"path": "create-parent/replace.txt", "content": "v2"},
                 {"path": "new-parent/new.txt", "content": "new"},
+                {"path": "stable.txt", "content": "stable"},
             ]
         },
         _previous(),
@@ -160,6 +163,7 @@ def _assert_prior(root: Path, sentinel: Path) -> None:
     assert (root / "create-parent/replace.txt").read_bytes() == b"v1"
     assert (root / "orphan.txt").read_bytes() == b"orphan-v1"
     assert not (root / "new-parent/new.txt").exists()
+    assert (root / "stable.txt").read_bytes() == b"stable"
     assert sentinel.read_bytes() == b"outside"
 
 
@@ -187,7 +191,7 @@ def test_failure_at_every_apply_operation_can_be_reverted_exactly(
         root = tmp_path / f"apply-{fail_at}"
         root.mkdir()
         sentinel = _seed(root)
-        controller = FaultController(fail_at)
+        controller = FaultController(None)
         checkpoints: dict[str, object] = {}
         blobs: dict[str, bytes] = {}
         effect = ReconcileFileSetEffect()
@@ -196,6 +200,7 @@ def test_failure_at_every_apply_operation_can_be_reverted_exactly(
             filesystem = FaultingFilesystem(safe, controller)
             prepared = _prepare_update(effect, root, filesystem)
             controller.boundaries.clear()
+            controller.fail_at = fail_at
             writer = DurableMemoryWriter(
                 filesystem,
                 controller,
@@ -313,4 +318,3 @@ def test_interrupted_revert_resumes_from_durable_checkpoint_snapshot(
             )
 
         _assert_prior(root, sentinel)
-

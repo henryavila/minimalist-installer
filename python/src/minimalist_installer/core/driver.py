@@ -363,6 +363,7 @@ class Driver:
                             operation=operation,
                             transaction_id=transaction_id,
                             effect_id=plan.id,
+                            filesystem=filesystem,
                         )
                         prior = prior_by_id.get(plan.id)
                         args_value = plan.to_dict()["args"]
@@ -547,6 +548,7 @@ class Driver:
                             operation=Operation.UNINSTALL,
                             transaction_id=transaction_id,
                             effect_id=record.id,
+                            filesystem=filesystem,
                         )
                         effects[record.id].revert(
                             context,
@@ -669,7 +671,9 @@ def define_installer(
         if not isinstance(configured_manifest, str) or not configured_manifest:
             raise ValueError("config.manifest_dir must be non-empty text")
         manifest_directory = configured_manifest
-    registry = EffectRegistry(effects)
+    from ..effects import ReconcileFileSetEffect
+
+    registry = EffectRegistry((ReconcileFileSetEffect(), *effects))
     return Installer(
         Driver(
             registry=registry,

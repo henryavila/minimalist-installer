@@ -203,9 +203,10 @@ def test_greenfield_prepare_is_read_only_and_apply_writes_exact_utf8_bytes(
 
         assert safe.read_bytes("first.bin") == "\u0000\ud7ff".encode("utf-8")
         assert safe.read_bytes("nested/second.txt") == "olá\r\n".encode("utf-8")
+        serialized = prepared.to_dict()
         assert result == {
-            "files": prepared.before_state["files"],
-            "decisions": prepared.payload["decisions"],
+            "files": serialized["before_state"]["files"],
+            "decisions": serialized["payload"]["decisions"],
         }
         assert tuple(writer.checkpoints) == ("apply:000000", "apply:000001")
         assert all(state["phase"] == "done" for state in writer.checkpoints.values())
@@ -437,6 +438,30 @@ def test_apply_and_uninstall_revert_are_idempotent_and_preserve_modifications(
         )
 
 
+def test_apply_validates_manifest_state_before_the_first_mutation(
+    tmp_path: Path,
+) -> None:
+    effect = ReconcileFileSetEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        valid = _prepare(
+            effect,
+            safe,
+            tmp_path,
+            [{"path": "created.txt", "content": "owned"}],
+        )
+        invalid = PreparedEffect(
+            before_state={"version": 1, "files": []},
+            payload=valid.payload,
+            resources=valid.resources,
+            filesystem=safe,
+        )
+
+        with pytest.raises(ValueError, match="tracking state"):
+            effect.apply(invalid, RecordingCheckpointWriter(safe))
+
+    assert not (tmp_path / "created.txt").exists()
+
+
 def test_replace_and_delete_back_up_old_bytes_before_each_mutation(
     tmp_path: Path,
 ) -> None:
@@ -521,7 +546,8 @@ def test_define_installer_registers_only_the_file_set_builtin_and_round_trips(
     )
 
     installed = installer.install(base_path=tmp_path)
-    assert installed.applied == (installer.registry.require("reconcile_file_set", 1).type,)
+    assert len(installed.applied) == 1
+    assert installed.applied[0].startswith("reconcile_file_set:")
     assert (tmp_path / "nested/file.txt").read_bytes() == b"content"
     manifest = json.loads((tmp_path / "state/manifest.json").read_text("utf-8"))
     assert manifest["effects"][0]["before_state"]["files"][0]["path"] == (
@@ -530,4 +556,3 @@ def test_define_installer_registers_only_the_file_set_builtin_and_round_trips(
 
     installer.uninstall(base_path=tmp_path)
     assert not (tmp_path / "nested/file.txt").exists()
-
