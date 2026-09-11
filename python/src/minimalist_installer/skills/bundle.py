@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -10,7 +9,7 @@ from pathlib import Path
 
 from ..core.errors import InvalidDistributionError, UnsafePathError
 from ..core.models import JsonObject
-from ..core.path_safety import PathEntryKind, SafeFilesystem, classify_entry
+from ..core.path_safety import PathEntryKind, SafeFilesystem
 
 _TOKEN = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 _LEFTOVER = re.compile(r"\{\{[^{}]*\}\}|\{\{")
@@ -35,22 +34,9 @@ def reject_secret_variable(name: str) -> None:
 def _list_entries(
     filesystem: SafeFilesystem, relative: str
 ) -> tuple[tuple[str, PathEntryKind], ...]:
-    if relative:
-        return filesystem.list_directory(relative)
-    entries: list[tuple[str, PathEntryKind]] = []
-    try:
-        names = os.listdir(filesystem.base)
-    except OSError as error:
-        raise UnsafePathError("skill bundle could not be listed", path=filesystem.base) from error
-    for name in names:
-        path = filesystem.base / name
-        try:
-            info = os.lstat(path)
-        except FileNotFoundError:
-            continue
-        entries.append((name, classify_entry(info)))
-    entries.sort(key=lambda item: item[0].encode("utf-8", "surrogateescape"))
-    return tuple(entries)
+    """List one directory through the held SafeFilesystem descriptor."""
+
+    return filesystem.list_directory(relative)
 
 
 def _join_relative(prefix: str, name: str) -> str:

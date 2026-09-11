@@ -703,11 +703,22 @@ class SafeFilesystem:
 
         return self._backend.directory_exists(self._parts(relative))
 
+    def list_base(self) -> tuple[tuple[str, PathEntryKind], ...]:
+        """List the trusted base through the held directory descriptor."""
+
+        return self._backend.list_directory(())
+
     def list_directory(
         self, relative: os.PathLike[str] | str
     ) -> tuple[tuple[str, PathEntryKind], ...]:
-        """List direct children and no-follow kinds below the trusted base."""
+        """List direct children and no-follow kinds below the trusted base.
 
+        An empty relative lists the trusted base itself through the held
+        descriptor. Mutation APIs still refuse empty paths via ``_parts``.
+        """
+
+        if isinstance(relative, str) and relative == "":
+            return self.list_base()
         return self._backend.list_directory(self._parts(relative))
 
     def ensure_directory(self, relative: os.PathLike[str] | str) -> None:
