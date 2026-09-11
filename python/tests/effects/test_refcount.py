@@ -56,6 +56,24 @@ class InterruptingOrphanWriter(MemoryCheckpoints):
         super().write(checkpoint, state)
 
 
+class InterruptingCheckpoints(MemoryCheckpoints):
+    def __init__(self, checkpoint_name: str, phase: str) -> None:
+        super().__init__()
+        self.checkpoint_name = checkpoint_name
+        self.phase = phase
+        self.interrupted = False
+
+    def write(self, checkpoint: str, state: object) -> None:
+        if (
+            not self.interrupted
+            and checkpoint == self.checkpoint_name
+            and state["phase"] == self.phase
+        ):
+            self.interrupted = True
+            raise RuntimeError(f"interrupted:{checkpoint}:{self.phase}")
+        super().write(checkpoint, state)
+
+
 def _context(root: Path, safe: object, operation: Operation = Operation.INSTALL) -> EffectContext:
     return EffectContext(root, root / "state", operation, "tx", "shared", safe)
 
@@ -420,3 +438,37 @@ def test_orphan_ready_checkpoint_preserves_rewritten_marker_and_completes(
         )
     assert marker.read_bytes() == rewritten
     assert not _marker(tmp_path, "releasing").exists()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_name", "phase"),
+    [
+        ("uninstall-dir:000000", "ready"),
+        ("uninstall-dir:000000", "done"),
+        ("uninstall-dir:000001", "ready"),
+        ("uninstall-dir:000001", "done"),
+    ],
+)
+def test_refcount_uninstall_parent_cleanup_resumes_after_each_durable_boundary(
+    tmp_path: Path,
+    checkpoint_name: str,
+    phase: str,
+) -> None:
+    effect = RefcountEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared, _ = _apply(effect, safe, tmp_path, "owner")
+        writer = InterruptingCheckpoints(checkpoint_name, phase)
+        with pytest.raises(RuntimeError, match="interrupted:uninstall-dir"):
+            effect.revert(
+                _context(tmp_path, safe, Operation.UNINSTALL),
+                prepared.before_state,
+                writer,
+            )
+        effect.revert(
+            _context(tmp_path, safe, Operation.UNINSTALL),
+            prepared.before_state,
+            writer,
+        )
+    assert not (tmp_path / "shared").exists()
+    assert writer.checkpoints["uninstall-dir:000000"]["phase"] == "done"
+    assert writer.checkpoints["uninstall-dir:000001"]["phase"] == "done"
