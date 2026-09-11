@@ -18,8 +18,7 @@
     "src"
   ],
   "scripts": {
-    "test": "node --test \"test/**/*.test.js\"",
-    "test:python": "python/.venv/bin/pytest python/tests -q"
+    "test": "node --test \"test/**/*.test.js\""
   },
   "keywords": [
     "installer",

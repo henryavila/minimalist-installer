@@ -4,12 +4,3 @@ node_modules/
 coverage/
 dist/
 .worktrees/
-
-# Python distribution
-python/.venv/
-python/.pytest_cache/
-python/.coverage
-python/.hypothesis/
-__pycache__/
-*.py[cod]
-*.egg-info/
