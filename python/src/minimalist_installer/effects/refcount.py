@@ -570,11 +570,11 @@ class RefcountEffect:
                     phase not in {"ready", "done"}
                     or set(existing) != expected
                     or existing.get("path") != path
-                    or existing.get("hash") != expected_hash
                 ):
                     raise InvalidEffectError("refcount orphan checkpoint is invalid")
                 if phase == "done":
                     continue
+                expected_hash = existing["hash"]
             if existing is None:
                 checkpoint.write(checkpoint_name, {"phase": "ready", "path": path, "hash": expected_hash})
             current = _read_optional(filesystem, path)
