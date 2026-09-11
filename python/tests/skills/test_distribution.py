@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -183,6 +184,11 @@ def test_shared_agents_skills_is_one_physical_file_with_host_attribution(
     assert grok_plan.resources == (
         canonical_resource_identity("path", home / ".grok/skills"),
     )
+    effect_id = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+    assert agents_plan.id == "skills:demo:user:.agents:skills"
+    assert grok_plan.id == "skills:demo:user:.grok:skills"
+    assert effect_id.fullmatch(agents_plan.id)
+    assert effect_id.fullmatch(grok_plan.id)
     assert not (home / ".agents").exists()
     assert tuple(planned) == planned.plans
 
