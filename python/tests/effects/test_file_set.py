@@ -594,3 +594,46 @@ def test_define_installer_registers_only_the_file_set_builtin_and_round_trips(
 
     installer.uninstall(base_path=tmp_path)
     assert not (tmp_path / "nested/file.txt").exists()
+
+
+def test_update_cleans_missing_orphan_parents_without_reclaiming_other_paths(
+    tmp_path: Path,
+) -> None:
+    preexisting = tmp_path / "preexisting-empty"
+    preexisting.mkdir()
+    files = [
+        {"path": "owned-dropped/deep/file.txt", "content": "drop"},
+        {"path": "owned-modified/deep/file.txt", "content": "modify"},
+        {"path": "preexisting-empty/file.txt", "content": "preexisting"},
+        {"path": "owned-desired/deep/file.txt", "content": "desired-v1"},
+    ]
+    ids = iter(("install-1", "tx-1", "tx-2"))
+    installer = define_installer(
+        config={
+            "consumer": "tests",
+            "consumer_version": "1",
+            "files": files,
+        },
+        providers=(FileSetProvider(),),
+        manifest_directory="state",
+        id_factory=lambda: next(ids),
+    )
+    installer.install(base_path=tmp_path)
+
+    (tmp_path / "owned-dropped/deep/file.txt").unlink()
+    (tmp_path / "preexisting-empty/file.txt").unlink()
+    (tmp_path / "owned-modified/deep/file.txt").write_bytes(b"USER")
+    (tmp_path / "owned-desired/deep/file.txt").unlink()
+    (tmp_path / "owned-desired/deep").rmdir()
+    (tmp_path / "owned-desired").rmdir()
+    files[:] = [
+        {"path": "owned-desired/deep/file.txt", "content": "desired-v2"}
+    ]
+
+    installer.update(base_path=tmp_path)
+
+    assert not (tmp_path / "owned-dropped").exists()
+    assert (tmp_path / "owned-modified/deep/file.txt").read_bytes() == b"USER"
+    assert preexisting.is_dir()
+    assert list(preexisting.iterdir()) == []
+    assert (tmp_path / "owned-desired/deep/file.txt").read_bytes() == b"desired-v2"
