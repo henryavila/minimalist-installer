@@ -34,7 +34,13 @@
           "additionalProperties": false,
           "required": ["kind", "transaction_id"],
           "properties": {
-            "kind": { "enum": ["committed_manifest", "manifest_removed"] },
+            "kind": {
+              "enum": [
+                "committed_manifest",
+                "manifest_removed",
+                "rolled_back"
+              ]
+            },
             "transaction_id": { "type": "string", "minLength": 1 }
           }
         },

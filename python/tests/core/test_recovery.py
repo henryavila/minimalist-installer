@@ -102,6 +102,7 @@ class _PathEffect:
     ) -> None:
         self.fail_apply_of = fail_apply_of
         self.fail_revert_of = fail_revert_of
+        self._apply_interrupted = False
         self._revert_interrupted = False
         self.applied: list[str] = []
         self.reverted: list[str] = []
@@ -142,7 +143,8 @@ class _PathEffect:
         relative = str(prepared.payload["path"])
         content = str(prepared.payload["content"]).encode("utf-8")
         checkpoint.write("apply", {"phase": "ready", "path": relative})
-        if effect_id == self.fail_apply_of:
+        if effect_id == self.fail_apply_of and not self._apply_interrupted:
+            self._apply_interrupted = True
             raise RuntimeError(f"apply interrupted:{effect_id}")
         prepared.filesystem.atomic_write_bytes(relative, content)
         checkpoint.write("apply", {"phase": "done", "path": relative})

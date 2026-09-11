@@ -60,6 +60,20 @@ class ActiveTransactionState(StrEnum):
 class CleanupProofKind(StrEnum):
     COMMITTED_MANIFEST = "committed_manifest"
     MANIFEST_REMOVED = "manifest_removed"
+    ROLLED_BACK = "rolled_back"
+
+
+FORWARD_APPLY_CHECKPOINTS: Final = (
+    "effects_applied",
+    "committing",
+    "manifest_committed",
+)
+REVERSE_APPLY_CHECKPOINTS: Final = (
+    "effects_reverted",
+    "committing",
+    "manifest_removed",
+)
+ROLLBACK_CHECKPOINTS: Final = ("repairing", "effects_reverted", "rolled_back")
 
 
 TRANSACTION_V1_SCHEMA: JsonObject = {
@@ -205,7 +219,11 @@ ACTIVE_TRANSACTION_V1_SCHEMA: JsonObject = {
                     "required": ["kind", "transaction_id"],
                     "properties": {
                         "kind": {
-                            "enum": ["committed_manifest", "manifest_removed"]
+                            "enum": [
+                                "committed_manifest",
+                                "manifest_removed",
+                                "rolled_back",
+                            ]
                         },
                         "transaction_id": {"type": "string", "minLength": 1},
                     },
@@ -364,14 +382,18 @@ class CleanupTombstone:
             raise ValueError("cleanup operation is invalid")
         if not isinstance(self.proof_kind, CleanupProofKind):
             raise TypeError("cleanup proof kind is invalid")
-        forward = self.operation in {Operation.INSTALL, Operation.UPDATE}
-        expected = (
-            CleanupProofKind.COMMITTED_MANIFEST
-            if forward
-            else CleanupProofKind.MANIFEST_REMOVED
-        )
-        if self.proof_kind is not expected:
-            raise ValueError("cleanup proof kind does not match operation")
+        if self.proof_kind is CleanupProofKind.ROLLED_BACK:
+            if self.operation is Operation.STATUS:
+                raise ValueError("cleanup operation is invalid")
+        else:
+            forward = self.operation in {Operation.INSTALL, Operation.UPDATE}
+            expected = (
+                CleanupProofKind.COMMITTED_MANIFEST
+                if forward
+                else CleanupProofKind.MANIFEST_REMOVED
+            )
+            if self.proof_kind is not expected:
+                raise ValueError("cleanup proof kind does not match operation")
         object.__setattr__(self, "blobs", tuple(self.blobs))
         if len(self.blobs) != len(set(self.blobs)) or any(
             not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None
@@ -572,6 +594,9 @@ class TransactionJournal:
             raise ValueError("blob digests must be unique")
         self._validate_semantics()
 
+    def repairing(self) -> bool:
+        return "repairing" in self.operation_checkpoints
+
     def _validate_semantics(self) -> None:
         transaction_resources = set(self.resources)
         for effect in self.effects:
@@ -600,45 +625,81 @@ class TransactionJournal:
                 raise ValueError("terminal effect status requires prepared state")
 
         forward = self.operation in {Operation.INSTALL, Operation.UPDATE}
-        allowed = (
-            {EffectProgress.PLANNED, EffectProgress.PREPARED, EffectProgress.APPLIED}
-            if forward
-            else {EffectProgress.PLANNED, EffectProgress.PREPARED, EffectProgress.REVERTED}
-        )
+        repairing = self.repairing()
+        if repairing:
+            allowed = {
+                EffectProgress.PLANNED,
+                EffectProgress.PREPARED,
+                EffectProgress.APPLIED,
+                EffectProgress.REVERTED,
+            }
+        elif forward:
+            allowed = {
+                EffectProgress.PLANNED,
+                EffectProgress.PREPARED,
+                EffectProgress.APPLIED,
+            }
+        else:
+            allowed = {
+                EffectProgress.PLANNED,
+                EffectProgress.PREPARED,
+                EffectProgress.REVERTED,
+            }
         statuses = tuple(effect.status for effect in self.effects)
         if any(status not in allowed for status in statuses):
             raise ValueError("effect status has the wrong transaction direction")
         if statuses.count(EffectProgress.PREPARED) > 1:
             raise ValueError("at most one effect may be in prepared progress")
-        ranks = (
-            {
+        if repairing:
+            ranks = {
+                EffectProgress.APPLIED: 0,
+                EffectProgress.PREPARED: 1,
+                EffectProgress.REVERTED: 2,
+                EffectProgress.PLANNED: 3,
+            }
+        elif forward:
+            ranks = {
                 EffectProgress.APPLIED: 0,
                 EffectProgress.PREPARED: 1,
                 EffectProgress.PLANNED: 2,
             }
-            if forward
-            else {
+        else:
+            ranks = {
                 EffectProgress.PLANNED: 0,
                 EffectProgress.PREPARED: 1,
                 EffectProgress.REVERTED: 2,
             }
-        )
         status_ranks = tuple(ranks[status] for status in statuses)
         if status_ranks != tuple(sorted(status_ranks)):
             raise ValueError("effect progress order is impossible")
 
-        terminal = EffectProgress.APPLIED if forward else EffectProgress.REVERTED
-        all_terminal = all(status is terminal for status in statuses)
-        expected = (
-            ("effects_applied", "committing", "manifest_committed")
-            if forward
-            else ("effects_reverted", "committing", "manifest_removed")
-        )
+        expected = FORWARD_APPLY_CHECKPOINTS if forward else REVERSE_APPLY_CHECKPOINTS
         checkpoints = self.operation_checkpoints
-        if checkpoints != expected[: len(checkpoints)]:
-            raise ValueError("operation checkpoint order is impossible")
-        if checkpoints and not all_terminal:
-            raise ValueError("operation checkpoint precedes terminal effects")
+        rollback_done = all(
+            status in {EffectProgress.REVERTED, EffectProgress.PLANNED}
+            for status in statuses
+        )
+        if repairing:
+            index = checkpoints.index("repairing")
+            prefix = checkpoints[:index]
+            suffix = checkpoints[index:]
+            if "manifest_committed" in prefix or "manifest_removed" in prefix:
+                raise ValueError("repair rollback after commit proof")
+            if prefix != expected[: len(prefix)]:
+                raise ValueError("operation checkpoint order is impossible")
+            if suffix != ROLLBACK_CHECKPOINTS[: len(suffix)]:
+                raise ValueError("repair checkpoint order is impossible")
+            if any(
+                name in suffix for name in ("effects_reverted", "rolled_back")
+            ) and not rollback_done:
+                raise ValueError("operation checkpoint precedes terminal effects")
+        else:
+            terminal = EffectProgress.APPLIED if forward else EffectProgress.REVERTED
+            all_terminal = all(status is terminal for status in statuses)
+            if checkpoints != expected[: len(checkpoints)]:
+                raise ValueError("operation checkpoint order is impossible")
+            if checkpoints and not all_terminal:
+                raise ValueError("operation checkpoint precedes terminal effects")
 
         if self.phase is TransactionPhase.PLANNED:
             if statuses and any(
@@ -648,30 +709,54 @@ class TransactionJournal:
             if checkpoints:
                 raise ValueError("planned phase contains operation checkpoints")
         elif self.phase is TransactionPhase.APPLYING:
-            if not forward or len(checkpoints) > 1:
+            if repairing or not forward or len(checkpoints) > 1:
                 raise ValueError("applying phase is inconsistent")
             if not checkpoints and all(
                 status is EffectProgress.PLANNED for status in statuses
             ):
                 raise ValueError("applying phase has no effect progress")
         elif self.phase is TransactionPhase.REVERTING:
-            if forward or len(checkpoints) > 1:
-                raise ValueError("reverting phase is inconsistent")
-            if not checkpoints and all(
-                status is EffectProgress.PLANNED for status in statuses
-            ):
-                raise ValueError("reverting phase has no effect progress")
+            if repairing:
+                suffix = checkpoints[checkpoints.index("repairing") :]
+                if "rolled_back" in suffix:
+                    raise ValueError("rolled_back belongs in committing phase")
+            else:
+                if forward or len(checkpoints) > 1:
+                    raise ValueError("reverting phase is inconsistent")
+                if not checkpoints and all(
+                    status is EffectProgress.PLANNED for status in statuses
+                ):
+                    raise ValueError("reverting phase has no effect progress")
         elif self.phase is TransactionPhase.COMMITTING:
-            if len(checkpoints) < 2 or not all_terminal:
-                raise ValueError("committing phase lacks terminal proof")
+            if repairing:
+                if "rolled_back" not in checkpoints or not rollback_done:
+                    raise ValueError("committing phase lacks terminal proof")
+            else:
+                all_terminal = all(
+                    status
+                    is (
+                        EffectProgress.APPLIED
+                        if forward
+                        else EffectProgress.REVERTED
+                    )
+                    for status in statuses
+                )
+                if len(checkpoints) < 2 or not all_terminal:
+                    raise ValueError("committing phase lacks terminal proof")
         elif self.phase is TransactionPhase.COMMITTED:
-            if len(checkpoints) != len(expected) or not all_terminal:
+            all_terminal = all(
+                status
+                is (EffectProgress.APPLIED if forward else EffectProgress.REVERTED)
+                for status in statuses
+            )
+            if repairing or len(checkpoints) != len(expected) or not all_terminal:
                 raise ValueError("committed phase lacks completion proof")
 
         if any(blob.status is BlobStatus.PENDING for blob in self.blobs) and not any(
             status is EffectProgress.PREPARED for status in statuses
         ):
-            raise ValueError("pending blob exists without a prepared effect")
+            if not repairing:
+                raise ValueError("pending blob exists without a prepared effect")
         if self.blobs and not any(
             status is not EffectProgress.PLANNED for status in statuses
         ):
@@ -1030,6 +1115,41 @@ class TransactionRepository:
             transition,
         )
 
+    def begin_repair(self, transaction_id: str) -> TransactionJournal:
+        journal = self.read(transaction_id)
+        if "manifest_committed" in journal.operation_checkpoints:
+            raise CorruptTransactionError(
+                "committed transaction cannot enter repair rollback",
+                details={"transaction_id": transaction_id},
+            )
+        if "manifest_removed" in journal.operation_checkpoints:
+            raise CorruptTransactionError(
+                "removed-manifest transaction cannot enter repair rollback",
+                details={"transaction_id": transaction_id},
+            )
+        if "repairing" in journal.operation_checkpoints:
+            return journal
+        return self.checkpoint(transaction_id, "repairing")
+
+    def record_reverting(
+        self, transaction_id: str, effect_id: str
+    ) -> TransactionJournal:
+        def transition(effect: TransactionEffectRecord) -> TransactionEffectRecord:
+            if effect.status is EffectProgress.PREPARED:
+                return effect
+            if effect.status is not EffectProgress.APPLIED:
+                raise CorruptTransactionError(
+                    "effect progress transition to reverting is invalid",
+                    details={
+                        "transaction_id": transaction_id,
+                        "effect_id": effect_id,
+                        "status": effect.status.value,
+                    },
+                )
+            return replace(effect, status=EffectProgress.PREPARED, result=None)
+
+        return self._replace_effect(transaction_id, effect_id, transition)
+
     def effect_checkpoint(
         self,
         transaction_id: str,
@@ -1066,9 +1186,9 @@ class TransactionRepository:
         phase = journal.phase
         if name == "effects_applied":
             phase = TransactionPhase.APPLYING
-        elif name == "effects_reverted":
+        elif name in {"effects_reverted", "repairing"}:
             phase = TransactionPhase.REVERTING
-        elif name == "committing":
+        elif name in {"committing", "rolled_back"}:
             phase = TransactionPhase.COMMITTING
         changed = replace(journal, operation_checkpoints=checkpoints, phase=phase)
         self._write(transaction_id, changed)
@@ -1172,16 +1292,7 @@ class TransactionRepository:
                 self.active_path, tombstone.to_dict()
             )
 
-        for digest in tombstone.blobs:
-            self.filesystem.unlink(
-                self._blob_path(requested_id, digest), missing_ok=True
-            )
-        blob_directory = f"{self.transactions_directory}/{requested_id}/blobs"
-        self.filesystem.rmdir_empty(blob_directory, missing_ok=True)
-        self.filesystem.unlink(self._journal_path(requested_id), missing_ok=True)
-        self.filesystem.rmdir_empty(
-            f"{self.transactions_directory}/{requested_id}", missing_ok=True
-        )
+        self._delete_transaction_tree(requested_id, tombstone.blobs)
         # This pointer is the cleanup authority and must be the final unlink.
         self.filesystem.unlink(self.active_path)
         self.filesystem.rmdir_empty(self.transactions_directory, missing_ok=True)
@@ -1193,13 +1304,24 @@ class TransactionRepository:
         *,
         committed_transaction_id: str | None,
     ) -> CleanupTombstone:
-        if any(blob.status is not BlobStatus.READY for blob in journal.blobs):
+        rolled_back = "rolled_back" in journal.operation_checkpoints
+        if not rolled_back and any(
+            blob.status is not BlobStatus.READY for blob in journal.blobs
+        ):
             raise IncompleteTransactionError(
                 "transaction contains an incomplete blob write",
                 details={"transaction_id": journal.transaction_id},
             )
         forward = journal.operation in {Operation.INSTALL, Operation.UPDATE}
-        required_checkpoint = "manifest_committed" if forward else "manifest_removed"
+        if rolled_back:
+            required_checkpoint = "rolled_back"
+            proof_kind = CleanupProofKind.ROLLED_BACK
+        elif forward:
+            required_checkpoint = "manifest_committed"
+            proof_kind = CleanupProofKind.COMMITTED_MANIFEST
+        else:
+            required_checkpoint = "manifest_removed"
+            proof_kind = CleanupProofKind.MANIFEST_REMOVED
         if required_checkpoint not in journal.operation_checkpoints:
             raise CorruptTransactionError(
                 "transaction cleanup proof checkpoint is missing",
@@ -1208,11 +1330,7 @@ class TransactionRepository:
         tombstone = CleanupTombstone(
             transaction_id=journal.transaction_id,
             operation=journal.operation,
-            proof_kind=(
-                CleanupProofKind.COMMITTED_MANIFEST
-                if forward
-                else CleanupProofKind.MANIFEST_REMOVED
-            ),
+            proof_kind=proof_kind,
             proof_transaction_id=journal.transaction_id,
             blobs=tuple(blob.digest for blob in journal.blobs),
         )
@@ -1239,9 +1357,19 @@ class TransactionRepository:
                 committed is not None
                 and committed.transaction_id == tombstone.proof_transaction_id
             )
-        else:
+        elif tombstone.proof_kind is CleanupProofKind.MANIFEST_REMOVED:
             valid = committed is None
-        if committed_transaction_id is not None:
+        elif tombstone.proof_kind is CleanupProofKind.ROLLED_BACK:
+            valid = (
+                committed is None
+                or committed.transaction_id != tombstone.proof_transaction_id
+            )
+        else:
+            valid = False
+        if (
+            committed_transaction_id is not None
+            and tombstone.proof_kind is not CleanupProofKind.ROLLED_BACK
+        ):
             valid = valid and committed_transaction_id == tombstone.transaction_id
         if not valid:
             raise CorruptTransactionError(
@@ -1252,6 +1380,92 @@ class TransactionRepository:
                     "proof_kind": tombstone.proof_kind.value,
                 },
             )
+
+    def transaction_ids(self) -> tuple[str, ...]:
+        from .path_safety import PathEntryKind
+
+        if not self.filesystem.directory_exists(self.transactions_directory):
+            return ()
+        names: list[str] = []
+        for name, kind in self.filesystem.list_directory(self.transactions_directory):
+            if name == "active.json" or kind is not PathEntryKind.DIRECTORY:
+                continue
+            try:
+                names.append(_identifier(name, "transaction_id"))
+            except ValueError:
+                continue
+        return tuple(names)
+
+    def _delete_transaction_tree(
+        self, transaction_id: str, blobs: Sequence[str]
+    ) -> None:
+        requested_id = _identifier(transaction_id, "transaction_id")
+        for digest in blobs:
+            if _DIGEST.fullmatch(digest) is None:
+                continue
+            self.filesystem.unlink(
+                self._blob_path(requested_id, digest), missing_ok=True
+            )
+        blob_directory = f"{self.transactions_directory}/{requested_id}/blobs"
+        self.filesystem.rmdir_empty(blob_directory, missing_ok=True)
+        self.filesystem.unlink(self._journal_path(requested_id), missing_ok=True)
+        self.filesystem.rmdir_empty(
+            f"{self.transactions_directory}/{requested_id}", missing_ok=True
+        )
+
+    def remnant_proof_kind(self, transaction_id: str) -> CleanupProofKind | None:
+        from .manifest import ManifestRepository
+
+        try:
+            journal = self.read(transaction_id)
+        except CorruptTransactionError:
+            return None
+        committed = ManifestRepository(
+            self.filesystem,
+            manifest_directory=self.manifest_directory,
+        ).read()
+        if (
+            "manifest_committed" in journal.operation_checkpoints
+            or journal.phase is TransactionPhase.COMMITTED
+        ):
+            if (
+                committed is not None
+                and committed.transaction_id == journal.transaction_id
+            ):
+                return CleanupProofKind.COMMITTED_MANIFEST
+            return None
+        if "rolled_back" in journal.operation_checkpoints:
+            if (
+                committed is None
+                or committed.transaction_id != journal.transaction_id
+            ):
+                return CleanupProofKind.ROLLED_BACK
+            return None
+        if "manifest_removed" in journal.operation_checkpoints:
+            if committed is None:
+                return CleanupProofKind.MANIFEST_REMOVED
+            return None
+        return None
+
+    def gc_remnant(self, transaction_id: str) -> bool:
+        requested_id = _identifier(transaction_id, "transaction_id")
+        active = self.active()
+        if active is not None and active.transaction_id == requested_id:
+            raise CorruptTransactionError(
+                "cannot garbage-collect the active transaction",
+                details={"transaction_id": requested_id},
+            )
+        proof = self.remnant_proof_kind(requested_id)
+        if proof is None:
+            return False
+        try:
+            journal = self.read(requested_id)
+            blobs = tuple(blob.digest for blob in journal.blobs)
+        except CorruptTransactionError:
+            blobs = ()
+        self._delete_transaction_tree(requested_id, blobs)
+        self.filesystem.rmdir_empty(self.transactions_directory, missing_ok=True)
+        return True
 
 
 __all__ = [

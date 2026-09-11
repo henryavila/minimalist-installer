@@ -18,7 +18,7 @@ from .errors import (
     NoInstallationError,
     PlanDriftError,
 )
-from .journal import TransactionRepository
+from .journal import TransactionJournal, TransactionRepository
 from .locks import (
     ResourceLockLease,
     ResourceLockManager,
@@ -42,6 +42,7 @@ from .models import (
     _json_value,
 )
 from .path_safety import SafeFilesystem
+from .recovery import RecoveryCoordinator, RecoveryReport
 from .registry import EffectRegistry
 
 _STABLE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
@@ -626,6 +627,72 @@ class Driver:
                     ),
                 )
 
+    def _recovery(
+        self, filesystem: SafeFilesystem
+    ) -> tuple[ManifestRepository, TransactionRepository, RecoveryCoordinator]:
+        manifests = ManifestRepository(
+            filesystem, manifest_directory=self.manifest_directory
+        )
+        transactions = TransactionRepository(
+            filesystem, manifest_directory=self.manifest_directory
+        )
+        coordinator = RecoveryCoordinator(
+            registry=self.registry,
+            filesystem=filesystem,
+            manifests=manifests,
+            transactions=transactions,
+            engine_version=self.engine_version,
+            consumer=self.consumer,
+            consumer_version=self.consumer_version,
+            manifest_directory=self.manifest_directory,
+        )
+        return manifests, transactions, coordinator
+
+    def inspect_recovery(self, *, base_path: Path) -> RecoveryReport:
+        """Return a read-only diagnostic for incomplete or residual transactions."""
+
+        with SafeFilesystem(base_path) as filesystem:
+            _manifests, _transactions, coordinator = self._recovery(filesystem)
+            root_resources = canonicalize_resources(
+                (canonical_resource_identity("path", filesystem.base),)
+            )
+            with self._manager().acquire(
+                root_resources, timeout=self.lock_timeout
+            ):
+                return coordinator.inspect()
+
+    def repair(self, *, base_path: Path, resume: bool = False) -> OperationResult:
+        """Roll back, resume, or finish cleanup of the active transaction."""
+
+        with SafeFilesystem(base_path) as filesystem:
+            _manifests, transactions, coordinator = self._recovery(filesystem)
+            root_resources = canonicalize_resources(
+                (canonical_resource_identity("path", filesystem.base),)
+            )
+            with self._manager().acquire(
+                root_resources, timeout=self.lock_timeout
+            ):
+                active = transactions.active()
+                resources = root_resources
+                if isinstance(active, TransactionJournal) and active.resources:
+                    resources = active.resources
+            with self._manager().acquire(resources, timeout=self.lock_timeout):
+                active = transactions.active()
+                plans = None
+                if (
+                    resume
+                    and isinstance(active, TransactionJournal)
+                    and not active.repairing()
+                    and active.operation
+                    in {Operation.INSTALL, Operation.UPDATE}
+                ):
+                    plans = self._plan(
+                        base_path=filesystem.base,
+                        operation=active.operation,
+                        installation_id=active.installation_id,
+                    )
+                return coordinator.repair(resume=resume, plans=plans)
+
 
 class Installer:
     """Bound declarative config with a small Pythonic operation surface."""
@@ -645,6 +712,12 @@ class Installer:
 
     def status(self, *, base_path: Path) -> StatusResult:
         return self.driver.status(base_path=base_path)
+
+    def inspect_recovery(self, *, base_path: Path) -> RecoveryReport:
+        return self.driver.inspect_recovery(base_path=base_path)
+
+    def repair(self, *, base_path: Path, resume: bool = False) -> OperationResult:
+        return self.driver.repair(base_path=base_path, resume=resume)
 
 
 def define_installer(

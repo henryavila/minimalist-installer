@@ -23,6 +23,7 @@ from .errors import (
     UnsupportedHostError,
 )
 from .driver import Driver, Installer, define_installer
+from .recovery import RecoveryCoordinator, RecoveryReport
 from .journal import (
     ActiveTransactionState,
     BlobStatus,
@@ -97,6 +98,8 @@ __all__ = [
     "Provider",
     "PlanDriftError",
     "RecoveryBlockedError",
+    "RecoveryCoordinator",
+    "RecoveryReport",
     "RepairResult",
     "StatusResult",
     "JournalCheckpoint",
