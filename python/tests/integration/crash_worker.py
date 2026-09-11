@@ -50,6 +50,7 @@ HOLD_POINTS = frozenset(
         "manifest_removed",
         "tombstone",
         "repairing",
+        "resuming",
         "effects_reverted",
         "rolled_back",
     }
@@ -175,7 +176,12 @@ def install_holds(hold_after: str, ready: Path) -> None:
     if original_begin_repair is not None:
         def begin_repair(self, *args, **kwargs):
             journal = original_begin_repair(self, *args, **kwargs)
-            _pause(hold_after, ready, "repairing")
+            hold_name = (
+                "resuming"
+                if "resuming" in journal.operation_checkpoints
+                else "repairing"
+            )
+            _pause(hold_after, ready, hold_name)
             return journal
 
         TransactionRepository.begin_repair = begin_repair
@@ -192,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hold-after", required=True, choices=sorted(HOLD_POINTS))
     parser.add_argument("--ready", required=True)
     parser.add_argument("--version", default="v1", choices=sorted(VERSIONS))
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
 
     base = Path(args.base)
@@ -206,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.operation == "uninstall":
         installer.uninstall(base_path=base)
     else:
-        installer.repair(base_path=base)
+        installer.repair(base_path=base, resume=args.resume)
     return 0
 
 

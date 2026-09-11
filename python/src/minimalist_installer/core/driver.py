@@ -683,6 +683,7 @@ class Driver:
                     resume
                     and isinstance(active, TransactionJournal)
                     and not active.repairing()
+                    and not active.resuming()
                     and active.operation
                     in {
                         Operation.INSTALL,

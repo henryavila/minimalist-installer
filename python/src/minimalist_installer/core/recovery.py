@@ -223,6 +223,7 @@ class RecoveryCoordinator:
         cleanup = committed_this or removed_this
         trusted = effect_error is None
         repairing = active.repairing()
+        resuming = active.resuming()
         uninstall = active.operation is Operation.UNINSTALL
         uninstall_reverted = uninstall and bool(reverted)
         rollback_supported = (
@@ -230,6 +231,7 @@ class RecoveryCoordinator:
             and not cleanup
             and not missing_blobs
             and not uninstall_reverted
+            and not resuming
             and all(
                 effect.prepared is None or effect.prepared.recoverable
                 for effect in active.effects
@@ -250,6 +252,8 @@ class RecoveryCoordinator:
             reason = "transaction blob is missing"
         elif cleanup:
             reason = "committed transaction awaiting cleanup"
+        elif resuming:
+            reason = "repair resume in progress"
         elif repairing:
             reason = "repair rollback in progress"
         elif uninstall_reverted:
@@ -475,7 +479,9 @@ class RecoveryCoordinator:
         error = self._effect_error(journal)
         if error is not None:
             raise error
-        journal = self.transactions.begin_repair(journal.transaction_id)
+        journal = self.transactions.begin_repair(
+            journal.transaction_id, resume=True
+        )
         committed = self.manifests.read()
         prior = (
             {record.id: record for record in committed.effects}
@@ -524,11 +530,15 @@ class RecoveryCoordinator:
             journal = self.transactions.checkpoint(
                 journal.transaction_id, "effects_reverted"
             )
+        if "committing" not in journal.operation_checkpoints:
+            journal = self.transactions.checkpoint(
+                journal.transaction_id, "committing"
+            )
         if self.manifests.read() is not None:
             self.manifests.remove()
-        if "rolled_back" not in journal.operation_checkpoints:
+        if "manifest_removed" not in journal.operation_checkpoints:
             journal = self.transactions.checkpoint(
-                journal.transaction_id, "rolled_back"
+                journal.transaction_id, "manifest_removed"
             )
         self.transactions.complete(journal.transaction_id)
         self._gc_remnants(None)
@@ -727,10 +737,22 @@ class RecoveryCoordinator:
         ) or "manifest_removed" in journal.operation_checkpoints:
             return self._complete_committed(journal)
 
+        if journal.resuming():
+            if journal.operation is Operation.UNINSTALL:
+                return self._continue_uninstall(journal)
+            return self._resume_forward(journal)
+
         if journal.repairing():
             if journal.operation is Operation.UNINSTALL:
                 if self._has_reverted(journal):
-                    return self._continue_uninstall(journal)
+                    raise RecoveryBlockedError(
+                        "interrupted uninstall cannot restore the previous installation",
+                        operation=Operation.REPAIR,
+                        details={
+                            "transaction_id": journal.transaction_id,
+                            "rollback_supported": False,
+                        },
+                    )
                 return self._abort_unmutated_uninstall(journal)
             return self._rollback(journal)
 

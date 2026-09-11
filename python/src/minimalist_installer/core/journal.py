@@ -597,6 +597,9 @@ class TransactionJournal:
     def repairing(self) -> bool:
         return "repairing" in self.operation_checkpoints
 
+    def resuming(self) -> bool:
+        return "resuming" in self.operation_checkpoints
+
     def _validate_semantics(self) -> None:
         transaction_resources = set(self.resources)
         for effect in self.effects:
@@ -626,6 +629,9 @@ class TransactionJournal:
 
         forward = self.operation in {Operation.INSTALL, Operation.UPDATE}
         repairing = self.repairing()
+        resuming = self.resuming()
+        if repairing and resuming:
+            raise ValueError("repair abort and resume intents cannot coexist")
         if repairing and forward:
             allowed = {
                 EffectProgress.PLANNED,
@@ -701,6 +707,25 @@ class TransactionJournal:
                 name in suffix for name in ("effects_reverted", "rolled_back")
             ) and not terminal_ok:
                 raise ValueError("operation checkpoint precedes terminal effects")
+        elif resuming:
+            if forward:
+                raise ValueError("resume checkpoint is invalid for forward apply")
+            index = checkpoints.index("resuming")
+            prefix = checkpoints[:index]
+            suffix = checkpoints[index:]
+            if "manifest_committed" in prefix or "manifest_removed" in prefix:
+                raise ValueError("repair resume after commit proof")
+            if prefix != expected[: len(prefix)]:
+                raise ValueError("operation checkpoint order is impossible")
+            expected_suffix = ("resuming", *expected[len(prefix) :])
+            if suffix != expected_suffix[: len(suffix)]:
+                raise ValueError("resume checkpoint order is impossible")
+            all_terminal = all(status is EffectProgress.REVERTED for status in statuses)
+            if any(
+                name in suffix
+                for name in ("effects_reverted", "committing", "manifest_removed")
+            ) and not all_terminal:
+                raise ValueError("operation checkpoint precedes terminal effects")
         else:
             terminal = EffectProgress.APPLIED if forward else EffectProgress.REVERTED
             all_terminal = all(status is terminal for status in statuses)
@@ -717,7 +742,7 @@ class TransactionJournal:
             if checkpoints:
                 raise ValueError("planned phase contains operation checkpoints")
         elif self.phase is TransactionPhase.APPLYING:
-            if repairing or not forward or len(checkpoints) > 1:
+            if repairing or resuming or not forward or len(checkpoints) > 1:
                 raise ValueError("applying phase is inconsistent")
             if not checkpoints and all(
                 status is EffectProgress.PLANNED for status in statuses
@@ -728,6 +753,13 @@ class TransactionJournal:
                 suffix = checkpoints[checkpoints.index("repairing") :]
                 if "rolled_back" in suffix:
                     raise ValueError("rolled_back belongs in committing phase")
+            elif resuming:
+                suffix = checkpoints[checkpoints.index("resuming") :]
+                if any(
+                    name in suffix
+                    for name in ("committing", "manifest_removed", "rolled_back")
+                ):
+                    raise ValueError("commit proof belongs in committing phase")
             else:
                 if forward or len(checkpoints) > 1:
                     raise ValueError("reverting phase is inconsistent")
@@ -758,13 +790,18 @@ class TransactionJournal:
                 is (EffectProgress.APPLIED if forward else EffectProgress.REVERTED)
                 for status in statuses
             )
-            if repairing or len(checkpoints) != len(expected) or not all_terminal:
+            if (
+                repairing
+                or resuming
+                or len(checkpoints) != len(expected)
+                or not all_terminal
+            ):
                 raise ValueError("committed phase lacks completion proof")
 
         if any(blob.status is BlobStatus.PENDING for blob in self.blobs) and not any(
             status is EffectProgress.PREPARED for status in statuses
         ):
-            if not repairing:
+            if not repairing and not resuming:
                 raise ValueError("pending blob exists without a prepared effect")
         if self.blobs and not any(
             status is not EffectProgress.PLANNED for status in statuses
@@ -1124,7 +1161,9 @@ class TransactionRepository:
             transition,
         )
 
-    def begin_repair(self, transaction_id: str) -> TransactionJournal:
+    def begin_repair(
+        self, transaction_id: str, *, resume: bool = False
+    ) -> TransactionJournal:
         journal = self.read(transaction_id)
         if "manifest_committed" in journal.operation_checkpoints:
             raise CorruptTransactionError(
@@ -1136,6 +1175,14 @@ class TransactionRepository:
                 "removed-manifest transaction cannot enter repair rollback",
                 details={"transaction_id": transaction_id},
             )
+        if resume:
+            if "repairing" in journal.operation_checkpoints:
+                return journal
+            if "resuming" in journal.operation_checkpoints:
+                return journal
+            return self.checkpoint(transaction_id, "resuming")
+        if "resuming" in journal.operation_checkpoints:
+            return journal
         if "repairing" in journal.operation_checkpoints:
             return journal
         return self.checkpoint(transaction_id, "repairing")
@@ -1197,6 +1244,9 @@ class TransactionRepository:
             phase = TransactionPhase.APPLYING
         elif name in {"effects_reverted", "repairing"}:
             phase = TransactionPhase.REVERTING
+        elif name == "resuming":
+            if phase is not TransactionPhase.COMMITTING:
+                phase = TransactionPhase.REVERTING
         elif name in {"committing", "rolled_back"}:
             phase = TransactionPhase.COMMITTING
         changed = replace(journal, operation_checkpoints=checkpoints, phase=phase)

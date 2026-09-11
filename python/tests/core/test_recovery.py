@@ -901,9 +901,14 @@ def test_resume_true_continues_interrupted_uninstall(
     began: list[str] = []
     original = TransactionRepository.begin_repair
 
-    def tracking_begin_repair(self: TransactionRepository, transaction_id: str):
+    def tracking_begin_repair(
+        self: TransactionRepository,
+        transaction_id: str,
+        *args: object,
+        **kwargs: object,
+    ):
         began.append(transaction_id)
-        return original(self, transaction_id)
+        return original(self, transaction_id, *args, **kwargs)
 
     monkeypatch.setattr(
         TransactionRepository, "begin_repair", tracking_begin_repair

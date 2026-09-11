@@ -80,28 +80,32 @@ def _run_worker(
     hold_after: str,
     *,
     version: str = "v1",
+    resume: bool = False,
 ) -> subprocess.Popen[str]:
     ready = base / ".crash-ready"
     if ready.exists():
         ready.unlink()
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    command = [
+        sys.executable,
+        "-u",
+        str(WORKER),
+        "--base",
+        str(base),
+        "--operation",
+        operation,
+        "--hold-after",
+        hold_after,
+        "--ready",
+        str(ready),
+        "--version",
+        version,
+    ]
+    if resume:
+        command.append("--resume")
     process = subprocess.Popen(
-        [
-            sys.executable,
-            "-u",
-            str(WORKER),
-            "--base",
-            str(base),
-            "--operation",
-            operation,
-            "--hold-after",
-            hold_after,
-            "--ready",
-            str(ready),
-            "--version",
-            version,
-        ],
+        command,
         cwd=str(Path(__file__).resolve().parents[3]),
         env=env,
         stdout=subprocess.PIPE,
@@ -257,6 +261,59 @@ def test_crash_at_durable_boundary_is_inspectable_and_repairable(
                 seed_transaction
             )
             assert (tmp_path / README_PATH).read_bytes() == b"version-1"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Linux crash matrix is verified")
+def test_crash_after_uninstall_resume_checkpoint_continues(tmp_path: Path) -> None:
+    write_sentinel(tmp_path)
+    _seed_install(tmp_path)
+    _run_worker(tmp_path, "uninstall", "prepared")
+    _run_worker(tmp_path, "repair", "resuming", resume=True)
+
+    journals = list((tmp_path / "state/transactions").glob("*/journal.json"))
+    assert len(journals) == 1
+    journal = json.loads(journals[0].read_text("utf-8"))
+    assert "resuming" in journal["operation_checkpoints"]
+    assert "repairing" not in journal["operation_checkpoints"]
+    assert all(effect["status"] != "reverted" for effect in journal["effects"])
+
+    installer = make_installer("v1")
+    result = installer.repair(base_path=tmp_path)
+    assert result.status is OperationStatus.COMPLETED
+    assert not (tmp_path / "state/manifest.json").exists()
+    assert not (tmp_path / README_PATH).exists()
+    assert (tmp_path / SENTINEL_NAME).read_bytes() == SENTINEL_BYTES
+    assert _active(tmp_path) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Linux crash matrix is verified")
+def test_crash_after_unmutated_uninstall_abort_checkpoint_keeps_install(
+    tmp_path: Path,
+) -> None:
+    write_sentinel(tmp_path)
+    _seed_install(tmp_path)
+    seed_transaction = json.loads((tmp_path / "state/manifest.json").read_text("utf-8"))[
+        "transaction_id"
+    ]
+    _run_worker(tmp_path, "uninstall", "prepared")
+    _run_worker(tmp_path, "repair", "repairing")
+
+    journals = list((tmp_path / "state/transactions").glob("*/journal.json"))
+    assert len(journals) == 1
+    journal = json.loads(journals[0].read_text("utf-8"))
+    assert "repairing" in journal["operation_checkpoints"]
+    assert "resuming" not in journal["operation_checkpoints"]
+
+    installer = make_installer("v1")
+    result = installer.repair(base_path=tmp_path)
+    assert result.status is OperationStatus.COMPLETED
+    assert json.loads((tmp_path / "state/manifest.json").read_text("utf-8"))[
+        "transaction_id"
+    ] == seed_transaction
+    assert (tmp_path / README_PATH).read_bytes() == b"version-1"
+    assert (tmp_path / SETTINGS_PATH).is_file()
+    assert (tmp_path / SENTINEL_NAME).read_bytes() == SENTINEL_BYTES
+    assert _active(tmp_path) is None
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Linux crash matrix is verified")
