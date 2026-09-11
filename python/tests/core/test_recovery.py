@@ -162,16 +162,16 @@ class _PathEffect:
         if isinstance(existing, Mapping) and existing.get("phase") == "done":
             self.reverted.append(context.effect_id)
             return
-        checkpoint.write(
-            "revert",
-            {"phase": "ready", "effect_id": context.effect_id},
-        )
         if (
             context.effect_id == self.fail_revert_of
             and not self._revert_interrupted
         ):
             self._revert_interrupted = True
             raise RuntimeError(f"revert interrupted:{context.effect_id}")
+        checkpoint.write(
+            "revert",
+            {"phase": "ready", "effect_id": context.effect_id},
+        )
         assert isinstance(before_state, Mapping)
         relative = str(before_state["path"])
         filesystem = context.filesystem

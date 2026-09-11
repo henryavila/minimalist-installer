@@ -220,17 +220,24 @@ class RecoveryCoordinator:
             and committed.transaction_id == active.transaction_id
         )
         removed_this = "manifest_removed" in active.operation_checkpoints
-        cleanup = committed_this or removed_this
+        uninstall = active.operation is Operation.UNINSTALL
+        uninstall_finished = (
+            uninstall
+            and committed is None
+            and all(
+                effect.status is EffectProgress.REVERTED for effect in active.effects
+            )
+        )
+        cleanup = committed_this or removed_this or uninstall_finished
         trusted = effect_error is None
         repairing = active.repairing()
         resuming = active.resuming()
-        uninstall = active.operation is Operation.UNINSTALL
-        uninstall_reverted = uninstall and bool(reverted)
+        uninstall_mutated = uninstall and self._uninstall_mutated(active)
         rollback_supported = (
             trusted
             and not cleanup
             and not missing_blobs
-            and not uninstall_reverted
+            and not uninstall_mutated
             and not resuming
             and all(
                 effect.prepared is None or effect.prepared.recoverable
@@ -256,7 +263,7 @@ class RecoveryCoordinator:
             reason = "repair resume in progress"
         elif repairing:
             reason = "repair rollback in progress"
-        elif uninstall_reverted:
+        elif uninstall_mutated:
             reason = "interrupted uninstall cannot restore the previous installation"
         else:
             reason = "incomplete transaction"
@@ -435,9 +442,10 @@ class RecoveryCoordinator:
         )
 
     @staticmethod
-    def _has_reverted(journal: TransactionJournal) -> bool:
+    def _uninstall_mutated(journal: TransactionJournal) -> bool:
         return any(
-            effect.status is EffectProgress.REVERTED for effect in journal.effects
+            effect.status is EffectProgress.REVERTED or effect.checkpoints
+            for effect in journal.effects
         )
 
     def _abort_unmutated_uninstall(
@@ -446,7 +454,7 @@ class RecoveryCoordinator:
         error = self._effect_error(journal)
         if error is not None:
             raise error
-        if self._has_reverted(journal):
+        if self._uninstall_mutated(journal):
             raise RecoveryBlockedError(
                 "interrupted uninstall cannot restore the previous installation",
                 operation=Operation.REPAIR,
@@ -736,6 +744,14 @@ class RecoveryCoordinator:
             and committed.transaction_id == journal.transaction_id
         ) or "manifest_removed" in journal.operation_checkpoints:
             return self._complete_committed(journal)
+        if (
+            journal.operation is Operation.UNINSTALL
+            and committed is None
+            and all(
+                effect.status is EffectProgress.REVERTED for effect in journal.effects
+            )
+        ):
+            return self._complete_committed(journal)
 
         if journal.resuming():
             if journal.operation is Operation.UNINSTALL:
@@ -744,7 +760,7 @@ class RecoveryCoordinator:
 
         if journal.repairing():
             if journal.operation is Operation.UNINSTALL:
-                if self._has_reverted(journal):
+                if self._uninstall_mutated(journal):
                     raise RecoveryBlockedError(
                         "interrupted uninstall cannot restore the previous installation",
                         operation=Operation.REPAIR,
@@ -768,7 +784,7 @@ class RecoveryCoordinator:
             return self._resume_forward(journal)
 
         if journal.operation is Operation.UNINSTALL:
-            if self._has_reverted(journal):
+            if self._uninstall_mutated(journal):
                 raise RecoveryBlockedError(
                     "interrupted uninstall cannot restore the previous installation",
                     operation=Operation.REPAIR,
