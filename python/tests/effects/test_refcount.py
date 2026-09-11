@@ -391,3 +391,32 @@ def test_structurally_corrupt_manifest_does_not_prove_owner(tmp_path: Path) -> N
         )
     assert not _marker(tmp_path, "malformed").exists()
     assert not (tmp_path / "shared/owners").exists()
+
+
+def test_orphan_ready_checkpoint_preserves_rewritten_marker_and_completes(
+    tmp_path: Path,
+) -> None:
+    effect = RefcountEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        releasing, _ = _apply(effect, safe, tmp_path, "releasing")
+        orphan, _ = _apply(effect, safe, tmp_path, "orphan")
+        key = orphan.before_state["owner_key"]
+        marker = _marker(tmp_path, "orphan")
+        writer = MemoryCheckpoints()
+        writer.write(
+            f"orphan:{key}",
+            {
+                "phase": "ready",
+                "path": f"shared/owners/{key}",
+                "hash": orphan.before_state["marker_hash"],
+            },
+        )
+        rewritten = json.dumps(json.loads(marker.read_bytes()), indent=2).encode("utf-8")
+        marker.write_bytes(rewritten)
+        effect.revert(
+            _context(tmp_path, safe, Operation.UNINSTALL),
+            releasing.before_state,
+            writer,
+        )
+    assert marker.read_bytes() == rewritten
+    assert not _marker(tmp_path, "releasing").exists()
