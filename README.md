@@ -115,3 +115,8 @@ npm test    # node --test "test/**/*.test.js"  (requires Node >= 21 for glob exp
 ## License
 
 MIT
+
+## Python variation
+
+The Python distribution lives in a separate public repository:
+[henryavila/minimalist-installer-python](https://github.com/henryavila/minimalist-installer-python).
