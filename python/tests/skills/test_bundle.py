@@ -136,6 +136,42 @@ def test_symlink_to_outside_is_refused_and_not_copied(tmp_path: Path) -> None:
     assert sentinel.read_bytes() == b"outside-original"
 
 
+def test_bundle_root_inventory_uses_held_base_after_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from minimalist_installer.skills import bundle as bundle_mod
+
+    trusted_parent = tmp_path / "trusted-parent"
+    external_parent = tmp_path / "external-parent"
+    root = _skill(trusted_parent / "bundle", body="trusted body\n")
+    evil = _skill(external_parent / "bundle", body="evil body\n", extra={"planted.txt": "nope\n"})
+    real_inventory = bundle_mod._inventory
+
+    def inventory_after_retarget(filesystem: object) -> object:
+        held_parent = tmp_path / "trusted-parent-held"
+        trusted_parent.rename(held_parent)
+        try:
+            (tmp_path / "trusted-parent").symlink_to(
+                external_parent, target_is_directory=True
+            )
+        except (NotImplementedError, OSError) as error:
+            pytest.skip(f"symlinks are unavailable in this environment: {error}")
+        return real_inventory(filesystem)
+
+    monkeypatch.setattr(bundle_mod, "_inventory", inventory_after_retarget)
+
+    loaded = load_bundle(root)
+    paths = [item.path for item in loaded.files]
+    by_path = {item.path: item.data for item in loaded.files}
+
+    assert paths == ["SKILL.md"]
+    assert b"trusted body" in by_path["SKILL.md"]
+    assert b"evil body" not in by_path["SKILL.md"]
+    assert "planted.txt" not in paths
+    assert (evil / "planted.txt").read_text(encoding="utf-8") == "nope\n"
+
+
 def test_parent_path_escape_is_refused(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()

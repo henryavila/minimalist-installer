@@ -585,6 +585,50 @@ def test_list_directory_rejects_parent_traversal_without_touching_sentinel(
     assert sentinel.read_bytes() == b"outside-original"
 
 
+@pytest.mark.parametrize("via", ("list_base", "empty_relative"))
+def test_list_base_survives_path_replacement_with_symlink_elsewhere(
+    tmp_path: Path,
+    via: str,
+) -> None:
+    trusted_parent = tmp_path / "trusted-parent"
+    trusted_base = trusted_parent / "base"
+    external_parent = tmp_path / "external-parent"
+    external_base = external_parent / "base"
+    trusted_base.mkdir(parents=True)
+    external_base.mkdir(parents=True)
+    (trusted_base / "inside.txt").write_bytes(b"trusted")
+    (external_base / "outside.txt").write_bytes(b"external")
+    filesystem = SafeFilesystem(trusted_base)
+
+    held_parent = tmp_path / "trusted-parent-held"
+    trusted_parent.rename(held_parent)
+    _symlink(external_parent, trusted_parent, target_is_directory=True)
+
+    if via == "list_base":
+        entries = filesystem.list_base()
+    else:
+        entries = filesystem.list_directory("")
+
+    assert entries == (("inside.txt", PathEntryKind.FILE),)
+    assert (external_base / "outside.txt").read_bytes() == b"external"
+    filesystem.close()
+
+
+def test_empty_relative_is_refused_for_writes_after_list_base_support(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "install"
+    base.mkdir()
+    filesystem = SafeFilesystem(base)
+
+    with pytest.raises(UnsafePathError):
+        filesystem.atomic_write_bytes("", b"attacker")
+    with pytest.raises(UnsafePathError):
+        filesystem.read_bytes("")
+    with pytest.raises(UnsafePathError):
+        filesystem.unlink("")
+
+
 def test_posix_backend_is_unavailable_without_listdir_fd_support(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
