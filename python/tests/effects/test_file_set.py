@@ -77,6 +77,9 @@ class RecordingFilesystem:
     def read_bytes(self, relative: str) -> bytes:
         return self._filesystem.read_bytes(relative)
 
+    def directory_exists(self, relative: str) -> bool:
+        return self._filesystem.directory_exists(relative)
+
     def atomic_write_bytes(
         self, relative: str, data: bytes, *, mode: int = 0o600
     ) -> None:
@@ -87,9 +90,9 @@ class RecordingFilesystem:
         self.events.append(f"unlink:{relative}")
         return self._filesystem.unlink(relative, missing_ok=missing_ok)
 
-    def prune_empty_parents(self, relative: str) -> tuple[Path, ...]:
-        self.events.append(f"prune:{relative}")
-        return self._filesystem.prune_empty_parents(relative)
+    def rmdir_empty(self, relative: str, *, missing_ok: bool = False) -> bool:
+        self.events.append(f"rmdir:{relative}")
+        return self._filesystem.rmdir_empty(relative, missing_ok=missing_ok)
 
 
 def _context(
@@ -192,6 +195,7 @@ def test_greenfield_prepare_is_read_only_and_apply_writes_exact_utf8_bytes(
                     "installed_hash": _digest("olá\r\n".encode("utf-8")),
                 },
             ),
+            "created_parents": ("nested",),
         }
         assert [item["decision"] for item in prepared.payload["decisions"]] == [
             "write",

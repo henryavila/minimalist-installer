@@ -257,6 +257,8 @@ class _Backend(Protocol):
 
     def read_bytes(self, parts: tuple[str, ...]) -> bytes: ...
 
+    def directory_exists(self, parts: tuple[str, ...]) -> bool: ...
+
     def atomic_write_bytes(
         self,
         parts: tuple[str, ...],
@@ -414,6 +416,19 @@ class _PosixBackend:
                 return _read_all(descriptor)
             finally:
                 os.close(descriptor)
+
+    def directory_exists(self, parts: tuple[str, ...]) -> bool:
+        display = self.base.joinpath(*parts)
+        try:
+            with self._open_parent(parts, create=False) as (parent_fd, leaf):
+                kind = self._entry_kind(parent_fd, leaf, display)
+                if kind is None:
+                    return False
+                if kind is not PathEntryKind.DIRECTORY:
+                    raise _unsafe("expected parent path is not a directory", display)
+                return True
+        except FileNotFoundError:
+            return False
 
     def _exclusive_temp(self, parent_fd: int, mode: int) -> tuple[int, str]:
         flags = (
@@ -611,6 +626,11 @@ class SafeFilesystem:
         """Read a regular file without following link-like path entries."""
 
         return self._backend.read_bytes(self._parts(relative))
+
+    def directory_exists(self, relative: os.PathLike[str] | str) -> bool:
+        """Check for a real directory without following link-like entries."""
+
+        return self._backend.directory_exists(self._parts(relative))
 
     def read_json(self, relative: os.PathLike[str] | str) -> Any:
         """Read UTF-8 JSON through the safe byte reader."""

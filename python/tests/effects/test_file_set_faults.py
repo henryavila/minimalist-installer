@@ -43,6 +43,12 @@ class FaultingFilesystem:
             f"read:{relative}", lambda: self._filesystem.read_bytes(relative)
         )
 
+    def directory_exists(self, relative: str) -> bool:
+        return self.controller.call(
+            f"directory-exists:{relative}",
+            lambda: self._filesystem.directory_exists(relative),
+        )
+
     def atomic_write_bytes(
         self, relative: str, data: bytes, *, mode: int = 0o600
     ) -> None:
@@ -57,10 +63,12 @@ class FaultingFilesystem:
             lambda: self._filesystem.unlink(relative, missing_ok=missing_ok),
         )
 
-    def prune_empty_parents(self, relative: str) -> tuple[Path, ...]:
+    def rmdir_empty(self, relative: str, *, missing_ok: bool = False) -> bool:
         return self.controller.call(
-            f"prune:{relative}",
-            lambda: self._filesystem.prune_empty_parents(relative),
+            f"rmdir:{relative}",
+            lambda: self._filesystem.rmdir_empty(
+                relative, missing_ok=missing_ok
+            ),
         )
 
 
@@ -122,11 +130,16 @@ class DurableMemoryWriter:
         )
 
 
-def _context(root: Path, filesystem: object) -> EffectContext:
+def _context(
+    root: Path,
+    filesystem: object,
+    *,
+    operation: Operation = Operation.UPDATE,
+) -> EffectContext:
     return EffectContext(
         base_path=root,
         manifest_dir=root / "state",
-        operation=Operation.UPDATE,
+        operation=operation,
         transaction_id="tx",
         effect_id="files",
         filesystem=filesystem,
@@ -372,3 +385,101 @@ def test_rollback_cleans_owned_directories_after_file_write_fails(
         effect.revert(_context(tmp_path, filesystem), prepared.before_state, writer)
 
     assert not (tmp_path / "created").exists()
+
+
+def _installed_for_uninstall(
+    root: Path,
+    safe: SafeFilesystem,
+    effect: ReconcileFileSetEffect,
+) -> tuple[object, dict[str, bytes]]:
+    (root / "preexisting-empty").mkdir()
+    filesystem = FaultingFilesystem(safe, FaultController(None))
+    prepared = effect.prepare(
+        {
+            "desired": [
+                {"path": "preexisting-empty/owned.txt", "content": "one"},
+                {"path": "created/deep/owned.txt", "content": "two"},
+            ]
+        },
+        None,
+        _context(root, filesystem),
+    )
+    blobs: dict[str, bytes] = {}
+    effect.apply(
+        prepared,
+        DurableMemoryWriter(
+            filesystem,
+            FaultController(None),
+            blobs=blobs,
+        ),
+    )
+    return prepared.before_state, blobs
+
+
+def _uninstall_boundaries(tmp_path: Path) -> list[str]:
+    root = tmp_path / "uninstall-baseline"
+    root.mkdir()
+    effect = ReconcileFileSetEffect()
+    with SafeFilesystem(root) as safe:
+        before_state, blobs = _installed_for_uninstall(root, safe, effect)
+        controller = FaultController(None)
+        filesystem = FaultingFilesystem(safe, controller)
+        effect.revert(
+            _context(root, filesystem, operation=Operation.UNINSTALL),
+            before_state,
+            DurableMemoryWriter(filesystem, controller, blobs=blobs),
+        )
+    return controller.boundaries
+
+
+def test_interrupted_uninstall_never_removes_a_preexisting_empty_parent(
+    tmp_path: Path,
+) -> None:
+    boundaries = _uninstall_boundaries(tmp_path)
+    assert boundaries
+
+    for fail_at, boundary in enumerate(boundaries, start=1):
+        root = tmp_path / f"uninstall-{fail_at}"
+        root.mkdir()
+        outside = root.parent / f"{root.name}-outside.txt"
+        outside.write_bytes(b"outside")
+        effect = ReconcileFileSetEffect()
+        checkpoints: dict[str, object] = {}
+        with SafeFilesystem(root) as safe:
+            before_state, blobs = _installed_for_uninstall(root, safe, effect)
+            controller = FaultController(fail_at)
+            filesystem = FaultingFilesystem(safe, controller)
+            writer = DurableMemoryWriter(
+                filesystem,
+                controller,
+                checkpoints=checkpoints,
+                blobs=blobs,
+            )
+            with pytest.raises(InjectedFailure, match=boundary):
+                effect.revert(
+                    _context(root, filesystem, operation=Operation.UNINSTALL),
+                    before_state,
+                    writer,
+                )
+
+            resumed_controller = FaultController(None)
+            resumed_filesystem = FaultingFilesystem(safe, resumed_controller)
+            effect.revert(
+                _context(
+                    root,
+                    resumed_filesystem,
+                    operation=Operation.UNINSTALL,
+                ),
+                before_state,
+                DurableMemoryWriter(
+                    resumed_filesystem,
+                    resumed_controller,
+                    checkpoints=checkpoints,
+                    blobs=blobs,
+                ),
+            )
+
+        assert (root / "preexisting-empty").is_dir()
+        assert list((root / "preexisting-empty").iterdir()) == []
+        assert not (root / "created").exists()
+        assert outside.read_bytes() == b"outside"

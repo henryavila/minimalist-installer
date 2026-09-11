@@ -40,13 +40,15 @@ class _EffectFilesystem(Protocol):
 
     def read_bytes(self, relative: str) -> bytes: ...
 
+    def directory_exists(self, relative: str) -> bool: ...
+
     def atomic_write_bytes(
         self, relative: str, data: bytes, *, mode: int = 0o600
     ) -> None: ...
 
     def unlink(self, relative: str, *, missing_ok: bool = False) -> bool: ...
 
-    def prune_empty_parents(self, relative: str) -> tuple[Path, ...]: ...
+    def rmdir_empty(self, relative: str, *, missing_ok: bool = False) -> bool: ...
 
 
 class FileDecision(StrEnum):
@@ -183,9 +185,10 @@ def _filesystem(value: object, label: str) -> _EffectFilesystem:
         "base",
         "closed",
         "read_bytes",
+        "directory_exists",
         "atomic_write_bytes",
         "unlink",
-        "prune_empty_parents",
+        "rmdir_empty",
     )
     if value is None or any(not hasattr(value, name) for name in required):
         raise InvalidEffectError(f"{label} requires a held safe filesystem")
@@ -204,6 +207,51 @@ def _read_optional(filesystem: _EffectFilesystem, path: str) -> bytes | None:
 
 def _joined_path(destination: str, path: str) -> str:
     return path if destination == "." else f"{destination}/{path}"
+
+
+def _parent_paths(path: str) -> tuple[str, ...]:
+    parts = path.split("/")[:-1]
+    return tuple("/".join(parts[:length]) for length in range(1, len(parts) + 1))
+
+
+def _is_parent(parent: str, path: str) -> bool:
+    return path.startswith(f"{parent}/")
+
+
+def _sorted_parents(paths: Sequence[str], *, deepest_first: bool = False) -> tuple[str, ...]:
+    unique = set(paths)
+    if deepest_first:
+        return tuple(sorted(unique, key=lambda path: (-path.count("/"), path.encode())))
+    return tuple(sorted(unique, key=str.encode))
+
+
+def _parse_owned_parents(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        raise TypeError(f"{label} must be an array")
+    normalized = tuple(
+        _normalize_relative(item, f"{label}[{index}]")
+        for index, item in enumerate(value)
+    )
+    portable: dict[tuple[str, ...], str] = {}
+    for path in normalized:
+        key = _collision_key(path)
+        if key in portable:
+            raise ValueError(
+                f"{label} contains duplicate or colliding parents: "
+                f"{portable[key]} and {path}"
+            )
+        portable[key] = path
+    ordered = _sorted_parents(normalized)
+    if ordered != normalized:
+        raise ValueError(f"{label} must be unique and sorted")
+    return ordered
+
+
+def _remove_owned_parents(
+    filesystem: _EffectFilesystem, parents: Sequence[str]
+) -> None:
+    for parent in _sorted_parents(parents, deepest_first=True):
+        filesystem.rmdir_empty(parent, missing_ok=True)
 
 
 def _parse_desired(
@@ -238,12 +286,20 @@ def _parse_desired(
     return tuple(sorted(parsed, key=lambda item: cast(str, item["path"]).encode()))
 
 
-def _parse_state(value: JsonValue | None) -> tuple[dict[str, str], ...]:
+def _parse_state(
+    value: JsonValue | None,
+) -> tuple[tuple[dict[str, str], ...], tuple[str, ...]]:
     if value is None:
-        return ()
+        return (), ()
     if not isinstance(value, Mapping):
         raise TypeError("previous file-set state must be an object")
-    _exact_keys(value, frozenset({"version", "files"}), "previous state")
+    keys = frozenset(value)
+    legacy_keys = frozenset({"version", "files"})
+    current_keys = frozenset({"version", "files", "created_parents"})
+    if keys not in {legacy_keys, current_keys}:
+        raise ValueError(
+            "previous state keys must describe files and created parents"
+        )
     if value["version"] != _STATE_VERSION or isinstance(value["version"], bool):
         raise ValueError("previous file-set state has an unsupported version")
     files = value["files"]
@@ -266,7 +322,15 @@ def _parse_state(value: JsonValue | None) -> tuple[dict[str, str], ...]:
             )
         parsed.append({"path": path, "installed_hash": digest})
     _validate_collisions([item["path"] for item in parsed], "previous state")
-    return tuple(sorted(parsed, key=lambda item: item["path"].encode()))
+    ordered_files = tuple(sorted(parsed, key=lambda item: item["path"].encode()))
+    parents = (
+        _parse_owned_parents(value["created_parents"], "previous created_parents")
+        if "created_parents" in value
+        else ()
+    )
+    if any(not any(_is_parent(parent, item["path"]) for item in ordered_files) for parent in parents):
+        raise ValueError("previous created parent does not own a tracked file path")
+    return ordered_files, parents
 
 
 def _decision_payload(
@@ -278,6 +342,9 @@ def _decision_payload(
     disk_hash: str | None,
     content: str | None,
     before_content: bytes | None,
+    created_parents: Sequence[str],
+    owned_parents: Sequence[str],
+    released_parents: Sequence[str],
 ) -> JsonObject:
     return {
         "path": path,
@@ -291,6 +358,9 @@ def _decision_payload(
             if before_content is not None and decision.value in _MUTATING
             else None
         ),
+        "created_parents": list(created_parents),
+        "owned_parents": list(owned_parents),
+        "released_parents": list(released_parents),
     }
 
 
@@ -318,6 +388,9 @@ def _parse_prepared(prepared: PreparedEffect) -> tuple[_EffectFilesystem, tuple[
             "disk_hash",
             "content",
             "before_content",
+            "created_parents",
+            "owned_parents",
+            "released_parents",
         }
     )
     for item in decisions:
@@ -345,6 +418,15 @@ def _parse_prepared(prepared: PreparedEffect) -> tuple[_EffectFilesystem, tuple[
         backup = item["before_content"]
         if backup is not None and not isinstance(backup, str):
             raise InvalidEffectError("prepared decision backup must be base64 text or null")
+        for name in ("created_parents", "owned_parents", "released_parents"):
+            try:
+                parents = _parse_owned_parents(item[name], f"prepared decision {name}")
+            except (TypeError, ValueError) as error:
+                raise InvalidEffectError(str(error)) from error
+            if any(not _is_parent(parent, path) for parent in parents):
+                raise InvalidEffectError(
+                    f"prepared decision {name} contains a non-parent path"
+                )
         parsed.append(item)
     _validate_collisions(
         [cast(str, item["path"]) for item in parsed], "prepared decisions"
@@ -355,9 +437,10 @@ def _parse_prepared(prepared: PreparedEffect) -> tuple[_EffectFilesystem, tuple[
 def _validate_tracking_state(
     before_state: JsonValue,
     decisions: Sequence[Mapping[str, JsonValue]],
-) -> tuple[dict[str, str], ...]:
-    files = _parse_state(before_state)
+) -> tuple[tuple[dict[str, str], ...], tuple[str, ...]]:
+    files, created_parents = _parse_state(before_state)
     expected: list[dict[str, str]] = []
+    expected_parents: list[str] = []
     for item in decisions:
         desired_hash = item["desired_hash"]
         if desired_hash is None:
@@ -373,11 +456,19 @@ def _validate_tracking_state(
         expected.append(
             {"path": cast(str, item["path"]), "installed_hash": tracking_hash}
         )
+        owned = item["owned_parents"]
+        if not isinstance(owned, list | tuple):
+            raise InvalidEffectError("prepared decision owned_parents must be an array")
+        expected_parents.extend(cast(Sequence[str], owned))
     if tuple(expected) != files:
         raise InvalidEffectError(
             "file-set tracking state does not match prepared decisions"
         )
-    return files
+    if _sorted_parents(expected_parents) != created_parents:
+        raise InvalidEffectError(
+            "file-set created parent state does not match prepared decisions"
+        )
+    return files, created_parents
 
 
 def _decode_content(decision: Mapping[str, JsonValue]) -> bytes:
@@ -420,6 +511,8 @@ def _checkpoint_state(
         "before_hash": decision["disk_hash"],
         "after_hash": decision["desired_hash"],
         "backup_digest": backup_digest,
+        "created_parents": decision["created_parents"],
+        "released_parents": decision["released_parents"],
     }
 
 
@@ -432,7 +525,16 @@ def _validate_checkpoint(
     if not isinstance(state, Mapping):
         raise InvalidEffectError("file checkpoint must be an object")
     expected = frozenset(
-        {"phase", "path", "decision", "before_hash", "after_hash", "backup_digest"}
+        {
+            "phase",
+            "path",
+            "decision",
+            "before_hash",
+            "after_hash",
+            "backup_digest",
+            "created_parents",
+            "released_parents",
+        }
     )
     _exact_keys(state, expected, "file checkpoint")
     if state["phase"] not in phases:
@@ -442,6 +544,8 @@ def _validate_checkpoint(
         "decision": decision["decision"],
         "before_hash": decision["disk_hash"],
         "after_hash": decision["desired_hash"],
+        "created_parents": decision["created_parents"],
+        "released_parents": decision["released_parents"],
     }
     if any(state[key] != value for key, value in comparisons.items()):
         raise InvalidEffectError("file checkpoint does not match prepared decision")
@@ -483,13 +587,39 @@ class ReconcileFileSetEffect:
             raise TypeError("args.adopt_identical must be a boolean")
         filesystem = _filesystem(context.filesystem, "file-set prepare")
         desired = _parse_desired(args["desired"], destination)
-        previous_files = _parse_state(previous)
+        previous_files, previous_created_parents = _parse_state(previous)
         desired_by_path = {cast(str, entry["path"]): entry for entry in desired}
         previous_by_path = {entry["path"]: entry for entry in previous_files}
         all_paths = sorted(
             desired_by_path.keys() | previous_by_path.keys(), key=str.encode
         )
         _validate_collisions(all_paths, "combined desired and previous state")
+
+        desired_parent_paths = {
+            path: _parent_paths(path) for path in desired_by_path
+        }
+        all_desired_parents = _sorted_parents(
+            tuple(
+                parent
+                for parents in desired_parent_paths.values()
+                for parent in parents
+            )
+        )
+        absent_parents = frozenset(
+            parent
+            for parent in all_desired_parents
+            if not filesystem.directory_exists(parent)
+        )
+        next_created_parents = _sorted_parents(
+            tuple(
+                parent
+                for parent in (*previous_created_parents, *absent_parents)
+                if any(_is_parent(parent, path) for path in desired_by_path)
+            )
+        )
+        released_parents = frozenset(previous_created_parents) - frozenset(
+            next_created_parents
+        )
 
         decisions: list[JsonValue] = []
         next_files: list[JsonValue] = []
@@ -526,6 +656,20 @@ class ReconcileFileSetEffect:
                 if desired_entry is not None
                 else None
             )
+            parents = desired_parent_paths.get(path, ())
+            created_for_path = _sorted_parents(
+                tuple(parent for parent in parents if parent in absent_parents)
+            )
+            owned_for_path = _sorted_parents(
+                tuple(parent for parent in parents if parent in next_created_parents)
+            )
+            released_for_path = _sorted_parents(
+                tuple(
+                    parent
+                    for parent in _parent_paths(path)
+                    if parent in released_parents
+                )
+            )
             decisions.append(
                 _decision_payload(
                     path=path,
@@ -535,6 +679,9 @@ class ReconcileFileSetEffect:
                     disk_hash=disk_hash,
                     content=content,
                     before_content=disk_bytes,
+                    created_parents=created_for_path,
+                    owned_parents=owned_for_path,
+                    released_parents=released_for_path,
                 )
             )
             if desired_entry is not None:
@@ -550,7 +697,11 @@ class ReconcileFileSetEffect:
                     {"path": path, "installed_hash": tracked_hash}
                 )
 
-        state: JsonObject = {"version": _STATE_VERSION, "files": next_files}
+        state: JsonObject = {
+            "version": _STATE_VERSION,
+            "files": next_files,
+            "created_parents": list(next_created_parents),
+        }
         payload: JsonObject = {"version": _STATE_VERSION, "decisions": decisions}
         resource_path = filesystem.base
         if destination != ".":
@@ -568,9 +719,14 @@ class ReconcileFileSetEffect:
         checkpoint: CheckpointWriter,
     ) -> JsonValue:
         filesystem, decisions = _parse_prepared(prepared)
-        files = _validate_tracking_state(prepared.before_state, decisions)
+        files, _created_parents = _validate_tracking_state(
+            prepared.before_state, decisions
+        )
         for index, decision in enumerate(decisions):
             action = str(decision["decision"])
+            released = decision["released_parents"]
+            if not isinstance(released, list | tuple):
+                raise InvalidEffectError("released_parents must be an array")
             if action not in _MUTATING:
                 continue
             name = f"apply:{index:06d}"
@@ -613,8 +769,12 @@ class ReconcileFileSetEffect:
                         f'file changed after prepare: "{path}"',
                         path=filesystem.base / path,
                     )
-                filesystem.prune_empty_parents(path)
-            else:
+                _remove_owned_parents(filesystem, cast(Sequence[str], released))
+            elif action in {
+                FileDecision.WRITE.value,
+                FileDecision.WRITE_MISSING.value,
+                FileDecision.REPLACE.value,
+            }:
                 data = _decode_content(decision)
                 if current_hash != after_hash:
                     if current_hash != before_hash:
@@ -668,6 +828,8 @@ class ReconcileFileSetEffect:
             before_hash = apply_state.get("before_hash")
             after_hash = apply_state.get("after_hash")
             backup_digest = apply_state.get("backup_digest")
+            created_parents = apply_state.get("created_parents")
+            released_parents = apply_state.get("released_parents")
             if not isinstance(path, str) or action not in _MUTATING:
                 raise InvalidEffectError("apply checkpoint cannot be rolled back")
             for digest in (before_hash, after_hash, backup_digest):
@@ -675,6 +837,17 @@ class ReconcileFileSetEffect:
                     not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None
                 ):
                     raise InvalidEffectError("apply checkpoint contains an invalid digest")
+            try:
+                created = _parse_owned_parents(
+                    created_parents, "rollback created_parents"
+                )
+                released = _parse_owned_parents(
+                    released_parents, "rollback released_parents"
+                )
+            except (TypeError, ValueError) as error:
+                raise InvalidEffectError(str(error)) from error
+            if any(not _is_parent(parent, path) for parent in (*created, *released)):
+                raise InvalidEffectError("rollback checkpoint contains a non-parent path")
             name = f"rollback:{apply_name.removeprefix('apply:')}"
             existing = checkpoint.read(name)
             if existing is not None:
@@ -694,6 +867,8 @@ class ReconcileFileSetEffect:
                         "before_hash": before_hash,
                         "after_hash": after_hash,
                         "backup_digest": backup_digest,
+                        "created_parents": list(created),
+                        "released_parents": list(released),
                     },
                 )
 
@@ -703,7 +878,6 @@ class ReconcileFileSetEffect:
             if before_hash is None:
                 if current_hash == after_hash:
                     filesystem.unlink(path)
-                    filesystem.prune_empty_parents(path)
                     outcome = "removed_created"
                 elif current_hash is not None:
                     outcome = "preserved_modified"
@@ -720,6 +894,7 @@ class ReconcileFileSetEffect:
                     outcome = "restored"
                 else:
                     outcome = "preserved_modified"
+            _remove_owned_parents(filesystem, created)
             checkpoint.write(
                 name,
                 {
@@ -729,6 +904,8 @@ class ReconcileFileSetEffect:
                     "before_hash": before_hash,
                     "after_hash": after_hash,
                     "backup_digest": backup_digest,
+                    "created_parents": list(created),
+                    "released_parents": list(released),
                     "outcome": outcome,
                 },
             )
@@ -739,7 +916,7 @@ class ReconcileFileSetEffect:
         before_state: JsonValue,
         checkpoint: CheckpointWriter,
     ) -> None:
-        files = _parse_state(before_state)
+        files, created_parents = _parse_state(before_state)
         for index, entry in enumerate(files):
             path = entry["path"]
             expected_hash = entry["installed_hash"]
@@ -768,7 +945,6 @@ class ReconcileFileSetEffect:
             outcome = "missing"
             if current_hash == expected_hash:
                 filesystem.unlink(path)
-                filesystem.prune_empty_parents(path)
                 outcome = "removed"
             elif current_hash is not None:
                 outcome = "preserved_modified"
@@ -779,6 +955,41 @@ class ReconcileFileSetEffect:
                     "path": path,
                     "expected_hash": expected_hash,
                     "outcome": outcome,
+                },
+            )
+
+        for index, parent in enumerate(
+            _sorted_parents(created_parents, deepest_first=True)
+        ):
+            name = f"uninstall-dir:{index:06d}"
+            existing = checkpoint.read(name)
+            if existing is not None:
+                if not isinstance(existing, Mapping):
+                    raise InvalidEffectError(
+                        "uninstall directory checkpoint must be an object"
+                    )
+                if existing.get("path") != parent:
+                    raise InvalidEffectError(
+                        "uninstall directory checkpoint is inconsistent"
+                    )
+                if existing.get("phase") == "done":
+                    continue
+                if existing.get("phase") != "ready":
+                    raise InvalidEffectError(
+                        "uninstall directory checkpoint phase is invalid"
+                    )
+            else:
+                checkpoint.write(
+                    name,
+                    {"phase": "ready", "path": parent},
+                )
+            removed = filesystem.rmdir_empty(parent, missing_ok=True)
+            checkpoint.write(
+                name,
+                {
+                    "phase": "done",
+                    "path": parent,
+                    "outcome": "removed" if removed else "preserved_nonempty",
                 },
             )
 
