@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tomllib
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 
@@ -125,7 +125,9 @@ class SkillDistribution:
     name: str
     version: str
     bundle: Path
-    variables: Mapping[str, str] = MappingProxyType({})
+    variables: Mapping[str, str] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _basename(self.name, "name"))

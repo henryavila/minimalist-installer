@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import venv
@@ -81,16 +80,26 @@ def test_wheel_installs_console_entry_and_bundled_hosts(
     assert "install" in help_result.stdout
     assert "detect" in help_result.stdout
 
+    # Isolate host probes so CI runners and developer machines behave alike.
+    clean_home = tmp_path / "home"
+    clean_home.mkdir()
+    detect_env = {
+        "HOME": str(clean_home),
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+    }
     detect_result = subprocess.run(
         [str(script), "detect", "--json", "--search-path", ""],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
-        env={**os.environ, "HOME": str(tmp_path / "home")},
+        env=detect_env,
     )
     payload = json.loads(detect_result.stdout)
     assert payload["schema_version"] == 1
-    assert "detections" in payload
+    assert payload["detections"] == []
+    assert detect_result.returncode == 1
+    assert "No hosts detected" in detect_result.stderr
 
     host_probe = subprocess.run(
         [

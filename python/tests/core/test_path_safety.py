@@ -550,7 +550,13 @@ def test_list_directory_survives_non_utf8_filename(tmp_path: Path) -> None:
     base.mkdir()
     owners_dir.mkdir()
     name = b"\xff".decode("utf-8", "surrogateescape")
-    (owners_dir / name).write_bytes(b"junk")
+    try:
+        (owners_dir / name).write_bytes(b"junk")
+    except OSError as error:
+        # APFS/HFS reject non-UTF-8 path bytes (errno 92 on macOS).
+        if getattr(error, "errno", None) in {92, 22} or sys.platform == "darwin":
+            pytest.skip(f"filesystem rejects non-UTF-8 filenames: {error}")
+        raise
 
     filesystem = SafeFilesystem(base)
 
