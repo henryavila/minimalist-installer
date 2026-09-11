@@ -80,6 +80,10 @@ class RecordingFilesystem:
     def directory_exists(self, relative: str) -> bool:
         return self._filesystem.directory_exists(relative)
 
+    def ensure_directory(self, relative: str) -> None:
+        self.events.append(f"mkdir:{relative}")
+        self._filesystem.ensure_directory(relative)
+
     def atomic_write_bytes(
         self, relative: str, data: bytes, *, mode: int = 0o600
     ) -> None:

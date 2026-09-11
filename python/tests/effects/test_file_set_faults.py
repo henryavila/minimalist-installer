@@ -49,6 +49,12 @@ class FaultingFilesystem:
             lambda: self._filesystem.directory_exists(relative),
         )
 
+    def ensure_directory(self, relative: str) -> None:
+        self.controller.call(
+            f"mkdir:{relative}",
+            lambda: self._filesystem.ensure_directory(relative),
+        )
+
     def atomic_write_bytes(
         self, relative: str, data: bytes, *, mode: int = 0o600
     ) -> None:
@@ -157,7 +163,12 @@ def _previous() -> dict[str, object]:
             {"path": "create-parent/replace.txt", "installed_hash": _digest(b"v1")},
             {"path": "orphan.txt", "installed_hash": _digest(b"orphan-v1")},
             {"path": "stable.txt", "installed_hash": _digest(b"stable")},
+            {
+                "path": "missing-owned/deep/missing.txt",
+                "installed_hash": _digest(b"missing-v1"),
+            },
         ],
+        "created_parents": ["missing-owned", "missing-owned/deep"],
     }
 
 
@@ -167,6 +178,7 @@ def _seed(root: Path) -> Path:
     (root / "orphan.txt").write_bytes(b"orphan-v1")
     (root / "stable.txt").write_bytes(b"stable")
     (root / "empty-sentinel").mkdir()
+    (root / "missing-owned/deep").mkdir(parents=True)
     sentinel = root.parent / f"{root.name}-sentinel.txt"
     sentinel.write_bytes(b"outside")
     return sentinel
@@ -198,6 +210,7 @@ def _assert_prior(root: Path, sentinel: Path) -> None:
     assert (root / "stable.txt").read_bytes() == b"stable"
     assert (root / "empty-sentinel").is_dir()
     assert list((root / "empty-sentinel").iterdir()) == []
+    assert (root / "missing-owned/deep").is_dir()
     assert sentinel.read_bytes() == b"outside"
 
 
@@ -483,3 +496,44 @@ def test_interrupted_uninstall_never_removes_a_preexisting_empty_parent(
         assert list((root / "preexisting-empty").iterdir()) == []
         assert not (root / "created").exists()
         assert outside.read_bytes() == b"outside"
+
+
+def test_missing_orphan_directory_cleanup_is_checkpointed_and_reversible(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "owned/deep").mkdir(parents=True)
+    effect = ReconcileFileSetEffect()
+    controller = FaultController(None)
+    checkpoints: dict[str, object] = {}
+    with SafeFilesystem(tmp_path) as safe:
+        filesystem = FaultingFilesystem(safe, controller)
+        prepared = effect.prepare(
+            {"desired": []},
+            {
+                "version": 1,
+                "files": [
+                    {
+                        "path": "owned/deep/missing.txt",
+                        "installed_hash": _digest(b"previous"),
+                    }
+                ],
+                "created_parents": ["owned", "owned/deep"],
+            },
+            _context(tmp_path, filesystem),
+        )
+        writer = DurableMemoryWriter(
+            filesystem,
+            controller,
+            checkpoints=checkpoints,
+        )
+
+        effect.apply(prepared, writer)
+
+        assert not (tmp_path / "owned").exists()
+        assert any(
+            name.startswith("apply:") and state["phase"] == "done"
+            for name, state in checkpoints.items()
+        )
+        effect.revert(_context(tmp_path, filesystem), prepared.before_state, writer)
+
+    assert (tmp_path / "owned/deep").is_dir()

@@ -259,6 +259,8 @@ class _Backend(Protocol):
 
     def directory_exists(self, parts: tuple[str, ...]) -> bool: ...
 
+    def ensure_directory(self, parts: tuple[str, ...]) -> None: ...
+
     def atomic_write_bytes(
         self,
         parts: tuple[str, ...],
@@ -429,6 +431,35 @@ class _PosixBackend:
                 return True
         except FileNotFoundError:
             return False
+
+    def ensure_directory(self, parts: tuple[str, ...]) -> None:
+        descriptors = [self._open_base()]
+        current_fd = descriptors[0]
+        walked = self.base
+        try:
+            for component in parts:
+                walked /= component
+                try:
+                    child_fd = self._open_directory_at(
+                        current_fd, component, walked
+                    )
+                except FileNotFoundError:
+                    try:
+                        os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                    if directory_fsync_supported(
+                        platform_name=self.platform_name
+                    ):
+                        _fsync_directory_descriptor(current_fd)
+                    child_fd = self._open_directory_at(
+                        current_fd, component, walked
+                    )
+                descriptors.append(child_fd)
+                current_fd = child_fd
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
     def _exclusive_temp(self, parent_fd: int, mode: int) -> tuple[int, str]:
         flags = (
@@ -631,6 +662,11 @@ class SafeFilesystem:
         """Check for a real directory without following link-like entries."""
 
         return self._backend.directory_exists(self._parts(relative))
+
+    def ensure_directory(self, relative: os.PathLike[str] | str) -> None:
+        """Create one directory path safely and idempotently below the base."""
+
+        self._backend.ensure_directory(self._parts(relative))
 
     def read_json(self, relative: os.PathLike[str] | str) -> Any:
         """Read UTF-8 JSON through the safe byte reader."""

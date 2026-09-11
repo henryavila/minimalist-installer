@@ -30,6 +30,7 @@ from ..core.models import (
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _STATE_VERSION = 1
 _MUTATING = frozenset({"write", "write_missing", "replace", "delete"})
+_CHECKPOINTED = _MUTATING | frozenset({"missing"})
 
 
 class _EffectFilesystem(Protocol):
@@ -41,6 +42,8 @@ class _EffectFilesystem(Protocol):
     def read_bytes(self, relative: str) -> bytes: ...
 
     def directory_exists(self, relative: str) -> bool: ...
+
+    def ensure_directory(self, relative: str) -> None: ...
 
     def atomic_write_bytes(
         self, relative: str, data: bytes, *, mode: int = 0o600
@@ -186,6 +189,7 @@ def _filesystem(value: object, label: str) -> _EffectFilesystem:
         "closed",
         "read_bytes",
         "directory_exists",
+        "ensure_directory",
         "atomic_write_bytes",
         "unlink",
         "rmdir_empty",
@@ -727,7 +731,10 @@ class ReconcileFileSetEffect:
             released = decision["released_parents"]
             if not isinstance(released, list | tuple):
                 raise InvalidEffectError("released_parents must be an array")
-            if action not in _MUTATING:
+            directory_only = (
+                action == FileDecision.MISSING.value and bool(released)
+            )
+            if action not in _MUTATING and not directory_only:
                 continue
             name = f"apply:{index:06d}"
             existing = checkpoint.read(name)
@@ -783,6 +790,10 @@ class ReconcileFileSetEffect:
                             path=filesystem.base / path,
                         )
                     filesystem.atomic_write_bytes(path, data)
+            elif action == FileDecision.MISSING.value:
+                _remove_owned_parents(
+                    filesystem, cast(Sequence[str], released)
+                )
             checkpoint.write(
                 name,
                 _checkpoint_state(
@@ -830,7 +841,7 @@ class ReconcileFileSetEffect:
             backup_digest = apply_state.get("backup_digest")
             created_parents = apply_state.get("created_parents")
             released_parents = apply_state.get("released_parents")
-            if not isinstance(path, str) or action not in _MUTATING:
+            if not isinstance(path, str) or action not in _CHECKPOINTED:
                 raise InvalidEffectError("apply checkpoint cannot be rolled back")
             for digest in (before_hash, after_hash, backup_digest):
                 if digest is not None and (
@@ -875,7 +886,11 @@ class ReconcileFileSetEffect:
             current = _read_optional(filesystem, path)
             current_hash = sha256_bytes(current) if current is not None else None
             outcome = "already_restored"
-            if before_hash is None:
+            if action == FileDecision.MISSING.value:
+                for parent in _sorted_parents(released):
+                    filesystem.ensure_directory(parent)
+                outcome = "restored_directories"
+            elif before_hash is None:
                 if current_hash == after_hash:
                     filesystem.unlink(path)
                     outcome = "removed_created"
