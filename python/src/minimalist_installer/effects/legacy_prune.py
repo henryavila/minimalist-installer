@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Protocol, cast
 
 from ..core.errors import InvalidEffectError, ModifiedContentError, UnsafePathError
@@ -147,10 +147,14 @@ def _parse_entry(value: object, label: str) -> Mapping[str, JsonValue]:
     return cast(Mapping[str, JsonValue], value)
 
 
-def _parse_state(value: JsonValue | None) -> tuple[Mapping[str, JsonValue], ...]:
+def _parse_state(
+    value: JsonValue | None,
+) -> tuple[tuple[Mapping[str, JsonValue], ...], tuple[str, ...]]:
     if value is None:
-        return ()
-    if not isinstance(value, Mapping) or set(value) != {"version", "pruned"}:
+        return (), ()
+    if not isinstance(value, Mapping) or set(value) != {
+        "version", "pruned", "applied_paths"
+    }:
         raise TypeError("legacy prune state must be a versioned object")
     if value["version"] != _VERSION or isinstance(value["version"], bool):
         raise ValueError("legacy prune state version is unsupported")
@@ -161,7 +165,18 @@ def _parse_state(value: JsonValue | None) -> tuple[Mapping[str, JsonValue], ...]
     paths = [cast(str, item["path"]) for item in parsed]
     if paths != sorted(paths, key=str.encode) or len(paths) != len(set(paths)):
         raise ValueError("legacy prune state paths must be unique and sorted")
-    return parsed
+    applied_value = value["applied_paths"]
+    if not isinstance(applied_value, list | tuple):
+        raise TypeError("legacy prune applied_paths must be an array")
+    applied = tuple(
+        _normalize_relative(path, f"legacy applied_paths[{index}]")
+        for index, path in enumerate(applied_value)
+    )
+    if applied != tuple(sorted(set(applied), key=str.encode)):
+        raise ValueError("legacy prune applied_paths must be unique and sorted")
+    if not set(applied).issubset(paths):
+        raise ValueError("legacy prune applied_paths must be owned by pruned state")
+    return parsed, applied
 
 
 def _prune_namespace_parents(filesystem: _LegacyFilesystem, path: str, root: str) -> None:
@@ -178,6 +193,7 @@ def _prune_namespace_parents(filesystem: _LegacyFilesystem, path: str, root: str
 def _apply_checkpoint(entry: Mapping[str, JsonValue], phase: str, blob: str) -> JsonObject:
     return {
         "phase": phase,
+        "action": "delete",
         "path": entry["path"],
         "sha256": entry["sha256"],
         "namespace_root": entry["namespace_root"],
@@ -205,7 +221,8 @@ class LegacyPruneEffect:
         names = _parse_names(args["known_names"])
         roots = _parse_roots(args["legacy_namespace_dirs"], namespace_name)
         filesystem = _legacy_filesystem(context.filesystem, "legacy prune prepare")
-        prior = {cast(str, item["path"]): item for item in _parse_state(previous)}
+        prior_entries, _prior_applied = _parse_state(previous)
+        prior = {cast(str, item["path"]): item for item in prior_entries}
         seen: set[str] = set()
         candidates: dict[str, Mapping[str, JsonValue]] = {}
         for root in roots:
@@ -240,6 +257,7 @@ class LegacyPruneEffect:
                 {
                     **item,
                     "checkpoint": {
+                        "action": "delete",
                         "path": item["path"],
                         "sha256": item["sha256"],
                         "namespace_root": item["namespace_root"],
@@ -249,8 +267,16 @@ class LegacyPruneEffect:
         resources = canonicalize_resources(
             canonical_resource_identity("path", filesystem.base / root) for root in roots
         )
+        applied_paths: list[JsonValue] = [
+            cast(JsonValue, path)
+            for path in sorted(candidates, key=str.encode)
+        ]
         return PreparedEffect(
-            before_state={"version": _VERSION, "pruned": ordered_state},
+            before_state={
+                "version": _VERSION,
+                "pruned": ordered_state,
+                "applied_paths": applied_paths,
+            },
             payload={"version": _VERSION, "entries": payload_entries},
             resources=resources,
             filesystem=filesystem,
@@ -292,9 +318,9 @@ class LegacyPruneEffect:
 
     def revert(self, context: EffectContext, before_state: JsonValue, checkpoint: CheckpointWriter) -> None:
         filesystem = _legacy_filesystem(context.filesystem, "legacy prune revert")
-        entries = _parse_state(before_state)
+        entries, applied_paths = _parse_state(before_state)
         if context.operation is not Operation.UNINSTALL:
-            self._rollback(filesystem, checkpoint)
+            self._rollback(filesystem, entries, applied_paths, checkpoint)
             return
         for index, entry in enumerate(entries):
             name = f"uninstall:{index:06d}"
@@ -353,16 +379,30 @@ class LegacyPruneEffect:
                 f"prepared entries[{index}]",
             )
             template = raw["checkpoint"]
-            if not isinstance(template, Mapping) or set(template) != {"path", "sha256", "namespace_root"} or any(template[key] != entry[key] for key in template):
+            if (
+                not isinstance(template, Mapping)
+                or set(template) != {"action", "path", "sha256", "namespace_root"}
+                or template["action"] != "delete"
+                or any(
+                    template[key] != entry[key]
+                    for key in ("path", "sha256", "namespace_root")
+                )
+            ):
                 raise InvalidEffectError("legacy prune checkpoint template is invalid")
             encoded = cast(str, entry["path"]).encode()
             if prior_path is not None and encoded <= prior_path:
                 raise InvalidEffectError("legacy prune prepared paths are not sorted")
             prior_path = encoded
             entries.append(cast(Mapping[str, JsonValue], raw))
+        try:
+            parsed_state, applied_paths = _parse_state(prepared.before_state)
+        except (ValueError, TypeError, KeyError) as error:
+            raise InvalidEffectError(
+                "legacy prune prepared state is invalid"
+            ) from error
         state_entries = {
             cast(str, item["path"]): item
-            for item in _parse_state(prepared.before_state)
+            for item in parsed_state
         }
         for entry in entries:
             state_entry = state_entries.get(cast(str, entry["path"]))
@@ -371,13 +411,17 @@ class LegacyPruneEffect:
                 for key in ("path", "content", "sha256", "namespace_root")
             ):
                 raise InvalidEffectError("legacy prune prepared state is inconsistent")
+        if tuple(cast(str, entry["path"]) for entry in entries) != applied_paths:
+            raise InvalidEffectError("legacy prune prepared apply plan is inconsistent")
         return filesystem, tuple(entries)
 
     @staticmethod
     def _validate_apply_checkpoint(value: object, entry: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
-        if not isinstance(value, Mapping) or set(value) != {"phase", "path", "sha256", "namespace_root", "blob"}:
+        if not isinstance(value, Mapping) or set(value) != {
+            "phase", "action", "path", "sha256", "namespace_root", "blob"
+        }:
             raise InvalidEffectError("legacy apply checkpoint is invalid")
-        if value["phase"] not in {"ready", "done"} or any(
+        if value["phase"] not in {"ready", "done"} or value["action"] != "delete" or any(
             value[key] != entry[key] for key in ("path", "sha256", "namespace_root")
         ):
             raise InvalidEffectError("legacy apply checkpoint is inconsistent")
@@ -386,7 +430,13 @@ class LegacyPruneEffect:
         return cast(Mapping[str, JsonValue], value)
 
     @staticmethod
-    def _rollback(filesystem: _LegacyFilesystem, checkpoint: CheckpointWriter) -> None:
+    def _rollback(
+        filesystem: _LegacyFilesystem,
+        entries: Sequence[Mapping[str, JsonValue]],
+        applied_paths: Sequence[str],
+        checkpoint: CheckpointWriter,
+    ) -> None:
+        owned = {cast(str, entry["path"]): entry for entry in entries}
         apply_states = sorted(
             (
                 (name, state)
@@ -395,12 +445,32 @@ class LegacyPruneEffect:
             ),
             reverse=True,
         )
+        validated: list[
+            tuple[str, Mapping[str, JsonValue], Mapping[str, JsonValue] | None]
+        ] = []
         for apply_name, raw in apply_states:
-            if not isinstance(raw, Mapping):
-                raise InvalidEffectError("legacy rollback source is invalid")
-            required = {"phase", "path", "sha256", "namespace_root", "blob"}
-            if set(raw) != required or raw["phase"] not in {"ready", "done"} or raw["blob"] != raw["sha256"]:
-                raise InvalidEffectError("legacy rollback source is invalid")
+            match = re.fullmatch(r"apply:(\d{6})", apply_name)
+            if match is None or not isinstance(raw, Mapping):
+                raise InvalidEffectError("legacy checkpoint is not in authorized state")
+            index = int(match.group(1))
+            if index >= len(applied_paths):
+                raise InvalidEffectError("legacy checkpoint is not in authorized state")
+            authorized_path = applied_paths[index]
+            entry = owned[authorized_path]
+            authorization: JsonObject = {
+                "action": "delete",
+                "path": entry["path"],
+                "sha256": entry["sha256"],
+                "namespace_root": entry["namespace_root"],
+                "blob": entry["sha256"],
+            }
+            required = set(authorization) | {"phase"}
+            if (
+                set(raw) != required
+                or raw["phase"] not in {"ready", "done"}
+                or any(raw[key] != authorization[key] for key in authorization)
+            ):
+                raise InvalidEffectError("legacy checkpoint is not in authorized state")
             suffix = apply_name.removeprefix("apply:")
             name = f"rollback:{suffix}"
             existing = checkpoint.read(name)
@@ -415,8 +485,17 @@ class LegacyPruneEffect:
                     or any(existing.get(key) != raw[key] for key in required - {"phase"})
                 ):
                     raise InvalidEffectError("legacy rollback checkpoint is invalid")
-                if phase == "done":
-                    continue
+            validated.append(
+                (
+                    name,
+                    cast(Mapping[str, JsonValue], raw),
+                    cast(Mapping[str, JsonValue] | None, existing),
+                )
+            )
+
+        for name, raw, existing in validated:
+            if existing is not None and existing["phase"] == "done":
+                continue
             if existing is None:
                 checkpoint.write(name, {**raw, "phase": "ready"})
             path = cast(str, raw["path"])

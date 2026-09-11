@@ -116,6 +116,7 @@ def _parse_state(value: JsonValue | None) -> Mapping[str, JsonValue] | None:
         "marker_hash",
         "owns_marker",
         "created_parents",
+        "apply",
     }
     if set(value) != expected or value["version"] != _VERSION or isinstance(value["version"], bool):
         raise ValueError("previous refcount state is invalid")
@@ -144,20 +145,54 @@ def _parse_state(value: JsonValue | None) -> Mapping[str, JsonValue] | None:
     marker_path = f"{owners_dir}/{key}"
     if any(not marker_path.startswith(f"{parent}/") for parent in parsed_parents):
         raise ValueError("previous created parent is outside marker path")
+    authorization = value["apply"]
+    if authorization is not None:
+        if not isinstance(authorization, Mapping) or set(authorization) != {
+            "action",
+            "marker_path",
+            "before_hash",
+            "after_hash",
+            "blob",
+            "created_parents",
+        }:
+            raise ValueError("previous refcount apply authorization is invalid")
+        if (
+            authorization["action"] != "register"
+            or authorization["marker_path"] != marker_path
+            or authorization["before_hash"] is not None
+            or authorization["after_hash"] != marker_hash
+            or authorization["blob"] is not None
+        ):
+            raise ValueError("previous refcount apply authorization is inconsistent")
+        apply_parents = authorization["created_parents"]
+        if not isinstance(apply_parents, list | tuple):
+            raise TypeError("previous refcount apply parents must be an array")
+        parsed_apply_parents = tuple(
+            _normalize_relative(parent, f"previous apply parent[{index}]")
+            for index, parent in enumerate(apply_parents)
+        )
+        if (
+            parsed_apply_parents != _sorted_parents(parsed_apply_parents)
+            or not set(parsed_apply_parents).issubset(parsed_parents)
+        ):
+            raise ValueError("previous refcount apply parents are invalid")
     return value
 
 
 def _checkpoint(template: Mapping[str, JsonValue], phase: str) -> JsonObject:
     return {
         "phase": phase,
+        "action": template["action"],
         "marker_path": template["marker_path"],
         "before_hash": template["before_hash"],
         "after_hash": template["after_hash"],
+        "blob": template["blob"],
+        "created_parents": template["created_parents"],
     }
 
 
 def _validate_checkpoint(value: object, template: Mapping[str, JsonValue], phases: set[str]) -> Mapping[str, JsonValue]:
-    if not isinstance(value, Mapping) or set(value) != {"phase", "marker_path", "before_hash", "after_hash"}:
+    if not isinstance(value, Mapping) or set(value) != set(template) | {"phase"}:
         raise InvalidEffectError("refcount checkpoint is invalid")
     if value["phase"] not in phases or any(value[key] != template[key] for key in template):
         raise InvalidEffectError("refcount checkpoint is inconsistent")
@@ -180,15 +215,23 @@ def _manifest_proves_owner(
     if manifest.installation_id != owner_id:
         return False
     for effect in manifest.effects:
-        state = effect.before_state
+        if effect.type != "refcount" or effect.effect_version != _VERSION:
+            continue
+        try:
+            state = _parse_state(effect.before_state)
+        except (ValueError, TypeError, KeyError):
+            continue
+        if state is None:
+            continue
         if (
-            effect.type == "refcount"
-            and effect.effect_version == _VERSION
-            and isinstance(state, Mapping)
-            and state.get("owner_key") == key
-            and state.get("owners_dir") == owners_dir
-            and state.get("owner_manifest_path") == owner_manifest_path
-            and state.get("owns_marker") is True
+            state["version"] == _VERSION
+            and state["owner_id"] == owner_id
+            and state["owner_key"] == key
+            and state["owners_dir"] == owners_dir
+            and state["owner_manifest_path"] == owner_manifest_path
+            and state["marker_hash"]
+            == sha256_bytes(_marker_bytes(owner_id, owner_manifest_path))
+            and state["owns_marker"] is True
         ):
             return True
     return False
@@ -240,8 +283,34 @@ class RefcountEffect:
         write_required = existing is None
         owns_marker = bool(prior["owns_marker"]) if prior is not None else write_required
         created = set(cast(Sequence[str], prior["created_parents"])) if prior is not None else set()
+        apply_created: set[str] = set()
         if write_required:
-            created.update(parent for parent in _parent_paths(marker_path) if not filesystem.directory_exists(parent))
+            apply_created.update(
+                parent
+                for parent in _parent_paths(marker_path)
+                if not filesystem.directory_exists(parent)
+            )
+            created.update(apply_created)
+        ordered_created_parents: list[JsonValue] = [
+            cast(JsonValue, parent)
+            for parent in _sorted_parents(tuple(created))
+        ]
+        ordered_apply_parents: list[JsonValue] = [
+            cast(JsonValue, parent)
+            for parent in _sorted_parents(tuple(apply_created))
+        ]
+        authorization: JsonValue = (
+            {
+                "action": "register",
+                "marker_path": marker_path,
+                "before_hash": before_hash,
+                "after_hash": marker_hash,
+                "blob": None,
+                "created_parents": ordered_apply_parents,
+            }
+            if write_required
+            else None
+        )
         state: JsonObject = {
             "version": _VERSION,
             "owners_dir": owners_dir,
@@ -250,9 +319,17 @@ class RefcountEffect:
             "owner_manifest_path": manifest_path,
             "marker_hash": marker_hash,
             "owns_marker": owns_marker,
-            "created_parents": list(_sorted_parents(tuple(created))),
+            "created_parents": ordered_created_parents,
+            "apply": authorization,
         }
-        template: JsonObject = {"marker_path": marker_path, "before_hash": before_hash, "after_hash": marker_hash}
+        template: JsonObject = {
+            "action": "register",
+            "marker_path": marker_path,
+            "before_hash": before_hash,
+            "after_hash": marker_hash,
+            "blob": None,
+            "created_parents": ordered_apply_parents,
+        }
         return PreparedEffect(
             before_state=state,
             payload={
@@ -294,7 +371,7 @@ class RefcountEffect:
         if state is None:
             return
         if context.operation is not Operation.UNINSTALL:
-            self._rollback(filesystem, checkpoint)
+            self._rollback(filesystem, state, checkpoint)
             return
         if not state["owns_marker"]:
             return
@@ -312,10 +389,17 @@ class RefcountEffect:
         if not isinstance(payload["marker_bytes"], str) or not isinstance(payload["write_required"], bool):
             raise InvalidEffectError("refcount prepared marker is invalid")
         template = payload["checkpoint"]
-        if not isinstance(template, Mapping) or set(template) != {"marker_path", "before_hash", "after_hash"}:
+        if not isinstance(template, Mapping) or set(template) != {
+            "action", "marker_path", "before_hash", "after_hash", "blob", "created_parents"
+        }:
             raise InvalidEffectError("refcount prepared checkpoint is invalid")
         marker = cast(str, payload["marker_bytes"]).encode("latin1")
-        if template["marker_path"] != marker_path or template["after_hash"] != sha256_bytes(marker):
+        if (
+            template["action"] != "register"
+            or template["marker_path"] != marker_path
+            or template["after_hash"] != sha256_bytes(marker)
+            or template["blob"] is not None
+        ):
             raise InvalidEffectError("refcount prepared marker hash is invalid")
         before_hash = template["before_hash"]
         if before_hash is not None and (not isinstance(before_hash, str) or _DIGEST.fullmatch(before_hash) is None):
@@ -326,28 +410,43 @@ class RefcountEffect:
             or f"{state['owners_dir']}/{state['owner_key']}" != marker_path
             or state["marker_hash"] != template["after_hash"]
             or bool(payload["write_required"]) != (template["before_hash"] is None)
+            or (
+                state["apply"] != template
+                if payload["write_required"]
+                else state["apply"] is not None
+            )
         ):
             raise InvalidEffectError("refcount prepared state is inconsistent")
         return filesystem, cast(Mapping[str, JsonValue], payload)
 
     @staticmethod
-    def _rollback(filesystem: _RefcountFilesystem, checkpoint: CheckpointWriter) -> None:
+    def _rollback(
+        filesystem: _RefcountFilesystem,
+        state: Mapping[str, JsonValue],
+        checkpoint: CheckpointWriter,
+    ) -> None:
         applied = checkpoint.read("apply")
         if applied is None:
             return
-        if not isinstance(applied, Mapping):
-            raise InvalidEffectError("refcount rollback source is invalid")
-        template = {key: cast(JsonValue, applied[key]) for key in ("marker_path", "before_hash", "after_hash")}
+        authorization = state["apply"]
+        if not isinstance(authorization, Mapping):
+            raise InvalidEffectError("refcount checkpoint is not in authorized state")
+        if not isinstance(applied, Mapping) or set(applied) != set(authorization) | {"phase"}:
+            raise InvalidEffectError("refcount checkpoint is not in authorized state")
+        if any(applied[key] != authorization[key] for key in authorization):
+            raise InvalidEffectError("refcount checkpoint is not in authorized state")
+        template = cast(Mapping[str, JsonValue], authorization)
         _validate_checkpoint(applied, template, {"ready", "done"})
         existing = checkpoint.read("rollback")
+        rollback_done = False
         if existing is not None:
             if not isinstance(existing, Mapping):
                 raise InvalidEffectError("refcount rollback checkpoint is invalid")
             phase = existing.get("phase")
             expected = (
-                {"phase", "marker_path", "before_hash", "after_hash", "outcome"}
+                set(template) | {"phase", "outcome"}
                 if phase == "done"
-                else {"phase", "marker_path", "before_hash", "after_hash"}
+                else set(template) | {"phase"}
             )
             if (
                 phase not in {"ready", "done"}
@@ -355,20 +454,47 @@ class RefcountEffect:
                 or any(existing.get(key) != template[key] for key in template)
             ):
                 raise InvalidEffectError("refcount rollback checkpoint is invalid")
-            if phase == "done":
-                return
+            rollback_done = phase == "done"
+        parents = cast(Sequence[str], authorization["created_parents"])
+        directory_states: list[tuple[str, str, Mapping[str, JsonValue] | None]] = []
+        for index, parent in enumerate(_sorted_parents(parents, deepest_first=True)):
+            name = f"rollback-dir:{index:06d}"
+            raw = checkpoint.read(name)
+            if raw is not None:
+                if not isinstance(raw, Mapping):
+                    raise InvalidEffectError("refcount rollback directory checkpoint is invalid")
+                phase = raw.get("phase")
+                expected = {"phase", "path", "outcome"} if phase == "done" else {"phase", "path"}
+                if phase not in {"ready", "done"} or set(raw) != expected or raw.get("path") != parent:
+                    raise InvalidEffectError("refcount rollback directory checkpoint is invalid")
+            directory_states.append((name, parent, cast(Mapping[str, JsonValue] | None, raw)))
         if existing is None:
             checkpoint.write("rollback", _checkpoint(template, "ready"))
         marker_path = cast(str, applied["marker_path"])
-        current = _read_optional(filesystem, marker_path)
-        current_hash = sha256_bytes(current) if current is not None else None
-        outcome = "already_restored"
-        if applied["before_hash"] is None and current_hash == applied["after_hash"]:
-            filesystem.unlink(marker_path)
-            outcome = "removed_created"
-        elif current_hash not in {applied["before_hash"], None}:
-            outcome = "preserved_modified"
-        checkpoint.write("rollback", {**_checkpoint(template, "done"), "outcome": outcome})
+        if not rollback_done:
+            current = _read_optional(filesystem, marker_path)
+            current_hash = sha256_bytes(current) if current is not None else None
+            outcome = "already_restored"
+            if applied["before_hash"] is None and current_hash == applied["after_hash"]:
+                filesystem.unlink(marker_path)
+                outcome = "removed_created"
+            elif current_hash not in {applied["before_hash"], None}:
+                outcome = "preserved_modified"
+            checkpoint.write("rollback", {**_checkpoint(template, "done"), "outcome": outcome})
+        for name, parent, raw in directory_states:
+            if raw is not None and raw["phase"] == "done":
+                continue
+            if raw is None:
+                checkpoint.write(name, {"phase": "ready", "path": parent})
+            removed = filesystem.rmdir_empty(parent, missing_ok=True)
+            checkpoint.write(
+                name,
+                {
+                    "phase": "done",
+                    "path": parent,
+                    "outcome": "removed" if removed else "preserved_nonempty",
+                },
+            )
 
     @staticmethod
     def _release(filesystem: _RefcountFilesystem, state: Mapping[str, JsonValue], checkpoint: CheckpointWriter) -> None:
@@ -409,7 +535,7 @@ class RefcountEffect:
         if not filesystem.directory_exists(owners_dir):
             _remove_owned_parents(filesystem, cast(Sequence[str], state["created_parents"]))
             return
-        for index, (name, kind) in enumerate(filesystem.list_directory(owners_dir)):
+        for name, kind in filesystem.list_directory(owners_dir):
             path = f"{owners_dir}/{name}"
             if kind is not PathEntryKind.FILE or _DIGEST.fullmatch(name) is None:
                 continue
@@ -428,7 +554,7 @@ class RefcountEffect:
                 owners_dir=owners_dir,
             ):
                 continue
-            checkpoint_name = f"orphan:{index:06d}"
+            checkpoint_name = f"orphan:{name}"
             existing = checkpoint.read(checkpoint_name)
             expected_hash = sha256_bytes(marker)
             if existing is not None:

@@ -307,6 +307,7 @@ def _parse_state(value: JsonValue | None) -> Mapping[str, JsonValue] | None:
     expected = {
         "version", "path", "file_created", "original", "installed_hash",
         "exact_restore_hash", "owned", "created_containers", "created_parents",
+        "apply",
     }
     if set(value) != expected or value["version"] != _VERSION or isinstance(value["version"], bool):
         raise ValueError("previous JSON merge state is invalid")
@@ -341,15 +342,53 @@ def _parse_state(value: JsonValue | None) -> Mapping[str, JsonValue] | None:
             raise ValueError("previous created parent is outside JSON path")
     if tuple(parents) != _sorted_parents(cast(Sequence[str], parents)):
         raise ValueError("previous created parents must be unique and sorted")
+    authorization = value["apply"]
+    if authorization is not None:
+        if not isinstance(authorization, Mapping) or set(authorization) != {
+            "action",
+            "path",
+            "before_hash",
+            "after_hash",
+            "blob",
+            "created_parents",
+        }:
+            raise ValueError("previous JSON merge apply authorization is invalid")
+        if (
+            authorization["action"] != "write"
+            or authorization["path"] != value["path"]
+            or authorization["after_hash"] != value["installed_hash"]
+            or authorization["blob"] != authorization["before_hash"]
+        ):
+            raise ValueError("previous JSON merge apply authorization is inconsistent")
+        apply_parents = authorization["created_parents"]
+        if not isinstance(apply_parents, list | tuple):
+            raise TypeError("previous JSON merge apply parents must be an array")
+        parsed_apply_parents = tuple(
+            _normalize_relative(parent, f"previous apply parent[{index}]")
+            for index, parent in enumerate(apply_parents)
+        )
+        if (
+            parsed_apply_parents != _sorted_parents(parsed_apply_parents)
+            or not set(parsed_apply_parents).issubset(cast(Sequence[str], parents))
+        ):
+            raise ValueError("previous JSON merge apply parents are invalid")
+        for key in ("before_hash", "after_hash", "blob"):
+            digest = authorization[key]
+            if digest is not None and (
+                not isinstance(digest, str)
+                or len(digest) != _DIGEST_LENGTH
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError("previous JSON merge apply digest is invalid")
     return value
 
 
-def _checkpoint(payload: Mapping[str, JsonValue], phase: str, blob: str | None) -> JsonObject:
+def _checkpoint(payload: Mapping[str, JsonValue], phase: str) -> JsonObject:
     source = payload["checkpoint"]
     if not isinstance(source, Mapping):
         raise InvalidEffectError("JSON merge checkpoint template is invalid")
     state = {key: _json_value(value) for key, value in source.items()}
-    state.update({"phase": phase, "blob": blob})
+    state["phase"] = phase
     return state
 
 
@@ -393,8 +432,34 @@ class JsonMergeEffect:
         unedited = prior is None or before_hash == cast(str, prior["installed_hash"])
         exact_restore_hash = after_hash if unedited else prior_exact if before_hash == prior_exact else None
         created_parents = set(cast(Sequence[str], prior["created_parents"])) if prior is not None else set()
+        apply_created_parents: set[str] = set()
         if write_required:
-            created_parents.update(parent for parent in _parent_paths(path) if not filesystem.directory_exists(parent))
+            apply_created_parents.update(
+                parent
+                for parent in _parent_paths(path)
+                if not filesystem.directory_exists(parent)
+            )
+            created_parents.update(apply_created_parents)
+        ordered_created_parents: list[JsonValue] = [
+            cast(JsonValue, parent)
+            for parent in _sorted_parents(tuple(created_parents))
+        ]
+        ordered_apply_parents: list[JsonValue] = [
+            cast(JsonValue, parent)
+            for parent in _sorted_parents(tuple(apply_created_parents))
+        ]
+        authorization: JsonValue = (
+            {
+                "action": "write",
+                "path": path,
+                "before_hash": before_hash,
+                "after_hash": after_hash,
+                "blob": before_hash,
+                "created_parents": ordered_apply_parents,
+            }
+            if write_required
+            else None
+        )
         state: JsonObject = {
             "version": _VERSION,
             "path": path,
@@ -404,9 +469,17 @@ class JsonMergeEffect:
             "exact_restore_hash": exact_restore_hash,
             "owned": owned,
             "created_containers": containers,
-            "created_parents": list(_sorted_parents(tuple(created_parents))),
+            "created_parents": ordered_created_parents,
+            "apply": authorization,
         }
-        checkpoint: JsonObject = {"path": path, "before_hash": before_hash, "after_hash": after_hash}
+        checkpoint: JsonObject = {
+            "action": "write",
+            "path": path,
+            "before_hash": before_hash,
+            "after_hash": after_hash,
+            "blob": before_hash,
+            "created_parents": ordered_apply_parents,
+        }
         payload: JsonObject = {
             "version": _VERSION,
             "path": path,
@@ -432,7 +505,9 @@ class JsonMergeEffect:
             before_text = payload["before_bytes"]
             if before_text is not None:
                 blob = checkpoint.write_blob(cast(str, before_text).encode("latin1"))
-            checkpoint.write("apply", _checkpoint(payload, "ready", blob))
+                if blob != cast(Mapping[str, JsonValue], payload["checkpoint"])["blob"]:
+                    raise InvalidEffectError("JSON merge blob writer returned a non-content digest")
+            checkpoint.write("apply", _checkpoint(payload, "ready"))
         else:
             blob = self._validate_checkpoint(current_checkpoint, payload, {"ready", "done"})
             if cast(Mapping[str, JsonValue], current_checkpoint)["phase"] == "done":
@@ -446,7 +521,7 @@ class JsonMergeEffect:
             if current_hash != before_hash:
                 raise ModifiedContentError(f'JSON changed after prepare: "{path}"', path=filesystem.base / path)
             filesystem.atomic_write_bytes(path, cast(str, payload["after_bytes"]).encode("latin1"))
-        checkpoint.write("apply", _checkpoint(payload, "done", blob))
+        checkpoint.write("apply", _checkpoint(payload, "done"))
         return prepared.before_state
 
     def revert(self, context: EffectContext, before_state: JsonValue, checkpoint: CheckpointWriter) -> None:
@@ -455,7 +530,7 @@ class JsonMergeEffect:
         if state is None:
             return
         if context.operation is not Operation.UNINSTALL:
-            self._rollback(filesystem, checkpoint)
+            self._rollback(filesystem, state, checkpoint)
             return
         name = "uninstall"
         existing = checkpoint.read(name)
@@ -488,28 +563,50 @@ class JsonMergeEffect:
         if payload["before_bytes"] is not None and not isinstance(payload["before_bytes"], str):
             raise InvalidEffectError("JSON merge prepared before bytes are invalid")
         template = payload["checkpoint"]
-        if not isinstance(template, Mapping) or set(template) != {"path", "before_hash", "after_hash"}:
+        if not isinstance(template, Mapping) or set(template) != {
+            "action", "path", "before_hash", "after_hash", "blob", "created_parents"
+        }:
             raise InvalidEffectError("JSON merge checkpoint template is invalid")
         after = cast(str, payload["after_bytes"]).encode("latin1")
         before_value = payload["before_bytes"]
         before = cast(str, before_value).encode("latin1") if before_value is not None else None
-        if template["path"] != payload["path"] or template["after_hash"] != sha256_bytes(after) or template["before_hash"] != (sha256_bytes(before) if before is not None else None):
+        if (
+            template["action"] != "write"
+            or template["path"] != payload["path"]
+            or template["after_hash"] != sha256_bytes(after)
+            or template["before_hash"] != (sha256_bytes(before) if before is not None else None)
+            or template["blob"] != template["before_hash"]
+        ):
             raise InvalidEffectError("JSON merge prepared hashes are invalid")
-        state = _parse_state(prepared.before_state)
+        try:
+            state = _parse_state(prepared.before_state)
+        except (ValueError, TypeError, KeyError) as error:
+            raise InvalidEffectError(
+                "JSON merge prepared state is invalid"
+            ) from error
         if (
             state is None
             or state["path"] != path
             or state["installed_hash"] != template["after_hash"]
+            or (
+                state["apply"] != template
+                if payload["write_required"]
+                else state["apply"] is not None
+            )
         ):
             raise InvalidEffectError("JSON merge prepared state is inconsistent")
         return filesystem, cast(Mapping[str, JsonValue], payload)
 
     @staticmethod
     def _validate_checkpoint(value: object, payload: Mapping[str, JsonValue], phases: set[str]) -> str | None:
-        if not isinstance(value, Mapping) or set(value) != {"phase", "path", "before_hash", "after_hash", "blob"}:
+        if not isinstance(value, Mapping) or set(value) != {
+            "phase", "action", "path", "before_hash", "after_hash", "blob", "created_parents"
+        }:
             raise InvalidEffectError("JSON merge apply checkpoint is invalid")
         template = cast(Mapping[str, JsonValue], payload["checkpoint"])
-        if value["phase"] not in phases or any(value[key] != template[key] for key in template):
+        if value["phase"] not in phases or any(
+            not _equal(value[key], template[key]) for key in template
+        ):
             raise InvalidEffectError("JSON merge apply checkpoint is inconsistent")
         blob = value["blob"]
         if blob is not None and (not isinstance(blob, str) or len(blob) != _DIGEST_LENGTH):
@@ -517,15 +614,26 @@ class JsonMergeEffect:
         return cast(str | None, blob)
 
     @staticmethod
-    def _rollback(filesystem: _EffectFilesystem, checkpoint: CheckpointWriter) -> None:
+    def _rollback(
+        filesystem: _EffectFilesystem,
+        state: Mapping[str, JsonValue],
+        checkpoint: CheckpointWriter,
+    ) -> None:
         applied = checkpoint.read("apply")
         if applied is None:
             return
-        if not isinstance(applied, Mapping) or set(applied) != {"phase", "path", "before_hash", "after_hash", "blob"}:
-            raise InvalidEffectError("JSON merge rollback source is invalid")
+        authorization = state["apply"]
+        if not isinstance(authorization, Mapping):
+            raise InvalidEffectError("JSON merge checkpoint is not in authorized state")
+        if not isinstance(applied, Mapping) or set(applied) != set(authorization) | {"phase"}:
+            raise InvalidEffectError("JSON merge checkpoint is not in authorized state")
+        if any(not _equal(applied[key], authorization[key]) for key in authorization):
+            raise InvalidEffectError("JSON merge checkpoint is not in authorized state")
         path = _normalize_relative(applied["path"], "JSON merge rollback path")
         if applied["phase"] not in {"ready", "done"}:
             raise InvalidEffectError("JSON merge rollback source phase is invalid")
+        if applied["action"] != "write":
+            raise InvalidEffectError("JSON merge rollback action is invalid")
         for key in ("before_hash", "after_hash", "blob"):
             value = applied[key]
             if value is not None and (
@@ -537,49 +645,81 @@ class JsonMergeEffect:
         if not isinstance(applied["after_hash"], str):
             raise InvalidEffectError("JSON merge rollback after hash is missing")
         existing = checkpoint.read("rollback")
+        rollback_done = False
         if existing is not None:
             if not isinstance(existing, Mapping):
                 raise InvalidEffectError("JSON merge rollback checkpoint is invalid")
             phase = existing.get("phase")
             expected = (
-                {"phase", "path", "before_hash", "after_hash", "blob", "outcome"}
+                set(authorization) | {"phase", "outcome"}
                 if phase == "done"
-                else {"phase", "path", "before_hash", "after_hash", "blob"}
+                else set(authorization) | {"phase"}
             )
             if (
                 phase not in {"ready", "done"}
                 or set(existing) != expected
-                or any(existing.get(key) != applied[key] for key in applied)
+                or any(
+                    not _equal(existing.get(key), authorization[key])
+                    for key in authorization
+                )
             ):
                 raise InvalidEffectError("JSON merge rollback checkpoint is invalid")
-            if phase == "done":
-                return
+            rollback_done = phase == "done"
+        parents = cast(Sequence[str], authorization["created_parents"])
+        directory_states: list[tuple[str, str, Mapping[str, JsonValue] | None]] = []
+        for index, parent in enumerate(_sorted_parents(parents, deepest_first=True)):
+            name = f"rollback-dir:{index:06d}"
+            raw = checkpoint.read(name)
+            if raw is not None:
+                if not isinstance(raw, Mapping):
+                    raise InvalidEffectError("JSON merge rollback directory checkpoint is invalid")
+                phase = raw.get("phase")
+                expected = {"phase", "path", "outcome"} if phase == "done" else {"phase", "path"}
+                if phase not in {"ready", "done"} or set(raw) != expected or raw.get("path") != parent:
+                    raise InvalidEffectError("JSON merge rollback directory checkpoint is invalid")
+            directory_states.append((name, parent, cast(Mapping[str, JsonValue] | None, raw)))
+
         if existing is None:
             ready = {key: _json_value(value) for key, value in applied.items()}
             ready["phase"] = "ready"
             checkpoint.write("rollback", ready)
-        current = _read_optional(filesystem, path)
-        current_hash = sha256_bytes(current) if current is not None else None
-        before_hash = cast(str | None, applied["before_hash"])
-        after_hash = cast(str, applied["after_hash"])
-        outcome = "already_restored"
-        if current_hash == after_hash and before_hash is None:
-            filesystem.unlink(path)
-            outcome = "removed_created"
-        elif current_hash == after_hash and before_hash is not None:
-            blob = applied["blob"]
-            if not isinstance(blob, str):
-                raise InvalidEffectError("JSON merge rollback blob is missing")
-            original = checkpoint.read_blob(blob)
-            if sha256_bytes(original) != before_hash:
-                raise InvalidEffectError("JSON merge rollback blob is corrupt")
-            filesystem.atomic_write_bytes(path, original)
-            outcome = "restored"
-        elif current_hash not in {before_hash, None}:
-            outcome = "preserved_modified"
-        done = {key: _json_value(value) for key, value in applied.items()}
-        done.update({"phase": "done", "outcome": outcome})
-        checkpoint.write("rollback", done)
+        if not rollback_done:
+            current = _read_optional(filesystem, path)
+            current_hash = sha256_bytes(current) if current is not None else None
+            before_hash = cast(str | None, applied["before_hash"])
+            after_hash = cast(str, applied["after_hash"])
+            outcome = "already_restored"
+            if current_hash == after_hash and before_hash is None:
+                filesystem.unlink(path)
+                outcome = "removed_created"
+            elif current_hash == after_hash and before_hash is not None:
+                blob = applied["blob"]
+                if not isinstance(blob, str):
+                    raise InvalidEffectError("JSON merge rollback blob is missing")
+                original = checkpoint.read_blob(blob)
+                if sha256_bytes(original) != before_hash:
+                    raise InvalidEffectError("JSON merge rollback blob is corrupt")
+                filesystem.atomic_write_bytes(path, original)
+                outcome = "restored"
+            elif current_hash not in {before_hash, None}:
+                outcome = "preserved_modified"
+            done = {key: _json_value(value) for key, value in applied.items()}
+            done.update({"phase": "done", "outcome": outcome})
+            checkpoint.write("rollback", done)
+        for name, parent, raw in directory_states:
+            if raw is not None and raw["phase"] == "done":
+                continue
+            if raw is None:
+                checkpoint.write(name, {"phase": "ready", "path": parent})
+            removed = filesystem.rmdir_empty(parent, missing_ok=True)
+            checkpoint.write(
+                name,
+                {
+                    "phase": "done",
+                    "path": parent,
+                    "outcome": "removed" if removed else "preserved_nonempty",
+                },
+            )
 
     @staticmethod
     def _uninstall(filesystem: _EffectFilesystem, state: Mapping[str, JsonValue]) -> str:
