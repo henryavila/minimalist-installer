@@ -507,3 +507,94 @@ def test_posix_symlink_classification_is_explicit(tmp_path: Path) -> None:
     _symlink(target, link, target_is_directory=False)
 
     assert classify_entry(os.lstat(link), platform_name="linux") is PathEntryKind.SYMLINK
+
+
+def test_list_directory_classifies_symlink_child_without_following(tmp_path: Path) -> None:
+    base = tmp_path / "install"
+    outside = tmp_path / "outside"
+    base.mkdir()
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    sentinel.write_bytes(b"outside-original")
+    (base / "owners").mkdir()
+    _symlink(sentinel, base / "owners" / "linked.bin", target_is_directory=False)
+
+    filesystem = SafeFilesystem(base)
+
+    assert filesystem.list_directory("owners") == (
+        ("linked.bin", PathEntryKind.SYMLINK),
+    )
+    assert sentinel.read_bytes() == b"outside-original"
+
+
+def test_list_directory_rejects_symlinked_directory(tmp_path: Path) -> None:
+    base = tmp_path / "install"
+    outside = tmp_path / "outside"
+    base.mkdir()
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    sentinel.write_bytes(b"outside-original")
+    _symlink(outside, base / "linked", target_is_directory=True)
+
+    filesystem = SafeFilesystem(base)
+
+    with pytest.raises(UnsafePathError):
+        filesystem.list_directory("linked")
+
+    assert sentinel.read_bytes() == b"outside-original"
+
+
+def test_list_directory_survives_non_utf8_filename(tmp_path: Path) -> None:
+    base = tmp_path / "install"
+    owners_dir = base / "owners"
+    base.mkdir()
+    owners_dir.mkdir()
+    name = b"\xff".decode("utf-8", "surrogateescape")
+    (owners_dir / name).write_bytes(b"junk")
+
+    filesystem = SafeFilesystem(base)
+
+    entries = filesystem.list_directory("owners")
+
+    assert (name, PathEntryKind.FILE) in entries
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "../outside",
+        "nested/../../outside",
+    ),
+)
+def test_list_directory_rejects_parent_traversal_without_touching_sentinel(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    base = tmp_path / "install"
+    outside = tmp_path / "outside"
+    base.mkdir()
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    sentinel.write_bytes(b"outside-original")
+
+    filesystem = SafeFilesystem(base)
+
+    with pytest.raises(UnsafePathError):
+        filesystem.list_directory(relative)
+
+    assert sentinel.read_bytes() == b"outside-original"
+
+
+def test_posix_backend_is_unavailable_without_listdir_fd_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        path_safety.os,
+        "supports_fd",
+        frozenset(path_safety.os.supports_fd) - {os.listdir},
+    )
+
+    assert (
+        path_safety.safe_filesystem_backend_status(platform_name="linux")
+        is path_safety.SafeFilesystemBackendStatus.UNAVAILABLE
+    )
