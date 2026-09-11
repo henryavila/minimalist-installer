@@ -49,6 +49,24 @@ class MemoryCheckpoints:
         return self.blobs[digest]
 
 
+class InterruptingCheckpoints(MemoryCheckpoints):
+    def __init__(self, checkpoint_name: str, phase: str) -> None:
+        super().__init__()
+        self.checkpoint_name = checkpoint_name
+        self.phase = phase
+        self.interrupted = False
+
+    def write(self, checkpoint: str, state: object) -> None:
+        if (
+            not self.interrupted
+            and checkpoint == self.checkpoint_name
+            and state["phase"] == self.phase
+        ):
+            self.interrupted = True
+            raise RuntimeError(f"interrupted:{checkpoint}:{self.phase}")
+        super().write(checkpoint, state)
+
+
 class RecordingFilesystem:
     def __init__(self, filesystem: SafeFilesystem, events: list[str]) -> None:
         self._filesystem = filesystem
@@ -453,3 +471,79 @@ def test_update_rollback_preserves_parents_owned_by_prior_install(tmp_path: Path
         )
     assert (tmp_path / "created").is_dir()
     assert not (tmp_path / "created/settings.json").exists()
+
+
+def test_uninstall_resume_reclaims_parents_when_leaf_was_removed_after_ready(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "preexisting").mkdir()
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared, _ = _apply(
+            effect,
+            safe,
+            tmp_path,
+            {"ours": True},
+            path="preexisting/owned/deep/settings.json",
+        )
+        writer = MemoryCheckpoints()
+        writer.write(
+            "uninstall",
+            {
+                "phase": "ready",
+                "path": "preexisting/owned/deep/settings.json",
+            },
+        )
+        safe.unlink("preexisting/owned/deep/settings.json")
+        effect.revert(
+            _context(tmp_path, safe, Operation.UNINSTALL),
+            prepared.before_state,
+            writer,
+        )
+    assert (tmp_path / "preexisting").is_dir()
+    assert not (tmp_path / "preexisting/owned").exists()
+    assert writer.checkpoints["uninstall"]["phase"] == "done"
+    assert writer.checkpoints["uninstall-dir:000000"]["phase"] == "done"
+    assert writer.checkpoints["uninstall-dir:000001"]["phase"] == "done"
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_name", "phase"),
+    [
+        ("uninstall-dir:000000", "ready"),
+        ("uninstall-dir:000000", "done"),
+        ("uninstall-dir:000001", "ready"),
+        ("uninstall-dir:000001", "done"),
+    ],
+)
+def test_uninstall_parent_cleanup_resumes_after_each_durable_boundary(
+    tmp_path: Path,
+    checkpoint_name: str,
+    phase: str,
+) -> None:
+    (tmp_path / "preexisting").mkdir()
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared, _ = _apply(
+            effect,
+            safe,
+            tmp_path,
+            {"ours": True},
+            path="preexisting/owned/deep/settings.json",
+        )
+        writer = InterruptingCheckpoints(checkpoint_name, phase)
+        with pytest.raises(RuntimeError, match="interrupted:uninstall-dir"):
+            effect.revert(
+                _context(tmp_path, safe, Operation.UNINSTALL),
+                prepared.before_state,
+                writer,
+            )
+        effect.revert(
+            _context(tmp_path, safe, Operation.UNINSTALL),
+            prepared.before_state,
+            writer,
+        )
+    assert (tmp_path / "preexisting").is_dir()
+    assert not (tmp_path / "preexisting/owned").exists()
+    assert writer.checkpoints["uninstall-dir:000000"]["phase"] == "done"
+    assert writer.checkpoints["uninstall-dir:000001"]["phase"] == "done"
