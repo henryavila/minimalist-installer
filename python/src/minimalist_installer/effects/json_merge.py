@@ -26,7 +26,6 @@ from .file_set import (
     _normalize_relative,
     _parent_paths,
     _read_optional,
-    _remove_owned_parents,
     _sorted_parents,
     sha256_bytes,
 )
@@ -534,6 +533,7 @@ class JsonMergeEffect:
             return
         name = "uninstall"
         existing = checkpoint.read(name)
+        leaf_done = False
         if existing is not None:
             if not isinstance(existing, Mapping) or existing.get("path") != state["path"]:
                 raise InvalidEffectError("JSON merge uninstall checkpoint is invalid")
@@ -541,12 +541,68 @@ class JsonMergeEffect:
             expected = {"phase", "path", "outcome"} if phase == "done" else {"phase", "path"}
             if phase not in {"ready", "done"} or set(existing) != expected:
                 raise InvalidEffectError("JSON merge uninstall checkpoint is invalid")
-            if phase == "done":
-                return
+            leaf_done = phase == "done"
+        directory_states: list[
+            tuple[str, str, Mapping[str, JsonValue] | None]
+        ] = []
+        parents = _sorted_parents(
+            cast(Sequence[str], state["created_parents"]),
+            deepest_first=True,
+        )
+        for index, parent in enumerate(parents):
+            directory_name = f"uninstall-dir:{index:06d}"
+            raw = checkpoint.read(directory_name)
+            if raw is not None:
+                if not isinstance(raw, Mapping):
+                    raise InvalidEffectError(
+                        "JSON merge uninstall directory checkpoint is invalid"
+                    )
+                phase = raw.get("phase")
+                expected = (
+                    {"phase", "path", "outcome"}
+                    if phase == "done"
+                    else {"phase", "path"}
+                )
+                if (
+                    phase not in {"ready", "done"}
+                    or set(raw) != expected
+                    or raw.get("path") != parent
+                ):
+                    raise InvalidEffectError(
+                        "JSON merge uninstall directory checkpoint is invalid"
+                    )
+            directory_states.append(
+                (
+                    directory_name,
+                    parent,
+                    cast(Mapping[str, JsonValue] | None, raw),
+                )
+            )
         if existing is None:
             checkpoint.write(name, {"phase": "ready", "path": state["path"]})
-        outcome = self._uninstall(filesystem, state)
-        checkpoint.write(name, {"phase": "done", "path": state["path"], "outcome": outcome})
+        if not leaf_done:
+            outcome = self._uninstall_leaf(filesystem, state)
+            checkpoint.write(
+                name,
+                {"phase": "done", "path": state["path"], "outcome": outcome},
+            )
+        for directory_name, parent, raw in directory_states:
+            if raw is not None and raw["phase"] == "done":
+                continue
+            if raw is None:
+                checkpoint.write(
+                    directory_name,
+                    {"phase": "ready", "path": parent},
+                )
+            removed = filesystem.rmdir_empty(parent, missing_ok=True)
+            checkpoint.write(
+                directory_name,
+                {
+                    "phase": "done",
+                    "path": parent,
+                    "outcome": "removed" if removed else "preserved_nonempty",
+                },
+            )
 
     @staticmethod
     def _prepared(prepared: PreparedEffect) -> tuple[_EffectFilesystem, Mapping[str, JsonValue]]:
@@ -722,7 +778,10 @@ class JsonMergeEffect:
             )
 
     @staticmethod
-    def _uninstall(filesystem: _EffectFilesystem, state: Mapping[str, JsonValue]) -> str:
+    def _uninstall_leaf(
+        filesystem: _EffectFilesystem,
+        state: Mapping[str, JsonValue],
+    ) -> str:
         path = cast(str, state["path"])
         current = _read_optional(filesystem, path)
         if current is None:
@@ -733,7 +792,6 @@ class JsonMergeEffect:
         if current_hash == exact:
             if bool(state["file_created"]):
                 filesystem.unlink(path)
-                _remove_owned_parents(filesystem, cast(Sequence[str], state["created_parents"]))
                 return "removed_created"
             if isinstance(original, str):
                 filesystem.atomic_write_bytes(path, original.encode("latin1"))
@@ -748,7 +806,6 @@ class JsonMergeEffect:
             return "preserved"
         if bool(state["file_created"]) and not target:
             filesystem.unlink(path)
-            _remove_owned_parents(filesystem, cast(Sequence[str], state["created_parents"]))
             return "removed_created"
         filesystem.atomic_write_bytes(path, _encoded(target))
         return "subtracted"
