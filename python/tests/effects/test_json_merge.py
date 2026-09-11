@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -372,3 +373,50 @@ def test_driver_update_then_uninstall_retains_merge_ownership(tmp_path: Path) ->
     installer.install(base_path=tmp_path)
     installer.uninstall(base_path=tmp_path)
     assert target.read_bytes() == original
+
+
+def test_rollback_rejects_checkpoint_for_unrelated_in_base_file(tmp_path: Path) -> None:
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"unrelated")
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared = _prepared(effect, safe, tmp_path, {"ours": True})
+        writer = MemoryCheckpoints()
+        writer.checkpoints["apply"] = {
+            "phase": "done",
+            "path": "victim.txt",
+            "before_hash": None,
+            "after_hash": hashlib.sha256(b"unrelated").hexdigest(),
+            "blob": None,
+        }
+        with pytest.raises(InvalidEffectError, match="authorized state"):
+            effect.revert(
+                _context(tmp_path, safe, Operation.UPDATE),
+                prepared.before_state,
+                writer,
+            )
+    assert victim.read_bytes() == b"unrelated"
+
+
+def test_rollback_prunes_only_apply_created_parents_with_checkpoints(tmp_path: Path) -> None:
+    (tmp_path / "existing").mkdir()
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared = _prepared(
+            effect,
+            safe,
+            tmp_path,
+            {"ours": True},
+            path="existing/created/settings.json",
+        )
+        assert prepared.before_state["created_parents"] == ("existing/created",)
+        writer = MemoryCheckpoints()
+        effect.apply(prepared, writer)
+        effect.revert(
+            _context(tmp_path, safe, Operation.UPDATE),
+            prepared.before_state,
+            writer,
+        )
+    assert (tmp_path / "existing").is_dir()
+    assert not (tmp_path / "existing/created").exists()
+    assert writer.checkpoints["rollback-dir:000000"]["phase"] == "done"

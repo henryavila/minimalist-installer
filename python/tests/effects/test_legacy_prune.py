@@ -289,3 +289,33 @@ def test_corrupt_done_restore_checkpoint_cannot_skip_restore(tmp_path: Path) -> 
                 writer,
             )
     assert not target.exists()
+
+
+def test_rollback_rejects_checkpoint_for_unrelated_in_base_path(tmp_path: Path) -> None:
+    signed = _write(
+        tmp_path,
+        ".claude/commands/atomic-skills/fix.md",
+        b"---\nname: fix\n---\n",
+    )
+    effect = LegacyPruneEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared = _prepare(effect, safe, tmp_path)
+        forged = b"forged unrelated bytes"
+        digest = hashlib.sha256(forged).hexdigest()
+        writer = MemoryCheckpoints()
+        writer.blobs[digest] = forged
+        writer.checkpoints["apply:000000"] = {
+            "phase": "done",
+            "path": "victim.txt",
+            "sha256": digest,
+            "namespace_root": ".",
+            "blob": digest,
+        }
+        with pytest.raises(InvalidEffectError, match="authorized state"):
+            effect.revert(
+                _context(tmp_path, safe, Operation.UPDATE),
+                prepared.before_state,
+                writer,
+            )
+    assert signed.is_file()
+    assert not (tmp_path / "victim.txt").exists()
