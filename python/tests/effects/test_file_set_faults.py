@@ -64,6 +64,23 @@ class FaultingFilesystem:
         )
 
 
+class DirectoryCreationFailureFilesystem(FaultingFilesystem):
+    def __init__(self, filesystem: SafeFilesystem) -> None:
+        super().__init__(filesystem, FaultController(None))
+        self.failed = False
+
+    def atomic_write_bytes(
+        self, relative: str, data: bytes, *, mode: int = 0o600
+    ) -> None:
+        if not self.failed:
+            self.failed = True
+            marker = f"{relative.rsplit('/', 1)[0]}/.directory-created"
+            self._filesystem.atomic_write_bytes(marker, b"")
+            self._filesystem.unlink(marker)
+            raise InjectedFailure("after parent creation")
+        self._filesystem.atomic_write_bytes(relative, data, mode=mode)
+
+
 class DurableMemoryWriter:
     def __init__(
         self,
@@ -136,6 +153,7 @@ def _seed(root: Path) -> Path:
     (root / "create-parent/replace.txt").write_bytes(b"v1")
     (root / "orphan.txt").write_bytes(b"orphan-v1")
     (root / "stable.txt").write_bytes(b"stable")
+    (root / "empty-sentinel").mkdir()
     sentinel = root.parent / f"{root.name}-sentinel.txt"
     sentinel.write_bytes(b"outside")
     return sentinel
@@ -152,6 +170,7 @@ def _prepare_update(
                 {"path": "create-parent/replace.txt", "content": "v2"},
                 {"path": "new-parent/new.txt", "content": "new"},
                 {"path": "stable.txt", "content": "stable"},
+                {"path": "empty-sentinel/new-owned.txt", "content": "new"},
             ]
         },
         _previous(),
@@ -164,6 +183,8 @@ def _assert_prior(root: Path, sentinel: Path) -> None:
     assert (root / "orphan.txt").read_bytes() == b"orphan-v1"
     assert not (root / "new-parent/new.txt").exists()
     assert (root / "stable.txt").read_bytes() == b"stable"
+    assert (root / "empty-sentinel").is_dir()
+    assert list((root / "empty-sentinel").iterdir()) == []
     assert sentinel.read_bytes() == b"outside"
 
 
@@ -318,3 +339,36 @@ def test_interrupted_revert_resumes_from_durable_checkpoint_snapshot(
             )
 
         _assert_prior(root, sentinel)
+
+
+def test_rollback_cleans_owned_directories_after_file_write_fails(
+    tmp_path: Path,
+) -> None:
+    effect = ReconcileFileSetEffect()
+    checkpoints: dict[str, object] = {}
+    blobs: dict[str, bytes] = {}
+    with SafeFilesystem(tmp_path) as safe:
+        filesystem = DirectoryCreationFailureFilesystem(safe)
+        prepared = effect.prepare(
+            {
+                "desired": [
+                    {"path": "created/deep/owned.txt", "content": "owned"}
+                ]
+            },
+            None,
+            _context(tmp_path, filesystem),
+        )
+        writer = DurableMemoryWriter(
+            filesystem,
+            FaultController(None),
+            checkpoints=checkpoints,
+            blobs=blobs,
+        )
+
+        with pytest.raises(InjectedFailure, match="parent creation"):
+            effect.apply(prepared, writer)
+        assert (tmp_path / "created/deep").is_dir()
+
+        effect.revert(_context(tmp_path, filesystem), prepared.before_state, writer)
+
+    assert not (tmp_path / "created").exists()

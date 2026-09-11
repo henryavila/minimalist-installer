@@ -438,6 +438,40 @@ def test_apply_and_uninstall_revert_are_idempotent_and_preserve_modifications(
         )
 
 
+def test_uninstall_removes_only_installer_created_empty_parents(
+    tmp_path: Path,
+) -> None:
+    preexisting = tmp_path / "preexisting"
+    preexisting.mkdir()
+    effect = ReconcileFileSetEffect()
+
+    with SafeFilesystem(tmp_path) as safe:
+        prepared = _prepare(
+            effect,
+            safe,
+            tmp_path,
+            [
+                {
+                    "path": "preexisting/created/owned.txt",
+                    "content": "owned",
+                }
+            ],
+        )
+        assert prepared.before_state["created_parents"] == (
+            "preexisting/created",
+        )
+        effect.apply(prepared, RecordingCheckpointWriter(safe))
+        effect.revert(
+            _context(tmp_path, safe, operation=Operation.UNINSTALL),
+            prepared.before_state,
+            RecordingCheckpointWriter(safe),
+        )
+
+    assert preexisting.is_dir()
+    assert list(preexisting.iterdir()) == []
+    assert not (preexisting / "created").exists()
+
+
 def test_apply_validates_manifest_state_before_the_first_mutation(
     tmp_path: Path,
 ) -> None:
