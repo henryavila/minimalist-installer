@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "name": "additive-deep-merge",
+      "target": {"existing": true, "nested": {"keep": "yes"}},
+      "delta": {"nested": {"added": 1}, "new": null},
+      "merged": {"existing": true, "nested": {"keep": "yes", "added": 1}, "new": null}
+    },
+    {
+      "name": "array-structural-dedupe",
+      "target": {"items": [1, {"same": true}]},
+      "delta": {"items": [{"same": true}, 2, 2]},
+      "merged": {"items": [1, {"same": true}, 2]}
+    },
+    {
+      "name": "equal-scalars-are-noop",
+      "target": {"enabled": true, "nested": {"name": "same"}},
+      "delta": {"enabled": true, "nested": {"name": "same"}},
+      "merged": {"enabled": true, "nested": {"name": "same"}}
+    }
+  ]
+}

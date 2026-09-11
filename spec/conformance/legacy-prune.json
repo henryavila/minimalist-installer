@@ -1,0 +1,10 @@
+{
+  "frontmatter": [
+    {"name": "plain", "content": "---\nname: fix\n---\n# Fix\n", "detected": "fix"},
+    {"name": "double-quoted", "content": "---\nname: \"historical-name\"\n---\n", "detected": "historical-name"},
+    {"name": "single-quoted", "content": "---\nname: 'fix'\n---\n", "detected": "fix"},
+    {"name": "unknown", "content": "---\nname: custom\n---\n", "detected": "custom"},
+    {"name": "not-frontmatter", "content": "# Mine\nname: fix\n", "detected": null},
+    {"name": "invalid-name", "content": "---\nname: Fix_Me\n---\n", "detected": null}
+  ]
+}

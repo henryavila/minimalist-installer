@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from pathlib import Path
+
+import pytest
+
+from minimalist_installer import EffectContext, InvalidEffectError, Operation, PreparedEffect
+from minimalist_installer.core.path_safety import SafeFilesystem
+from minimalist_installer.effects import JsonMergeEffect
+
+
+class MemoryCheckpoints:
+    def __init__(self) -> None:
+        self.checkpoints: dict[str, object] = {}
+        self.blobs: dict[str, bytes] = {}
+        self.events: list[str] = []
+
+    def write(self, checkpoint: str, state: object) -> None:
+        self.events.append(f"checkpoint:{checkpoint}:{state['phase']}")
+        self.checkpoints[checkpoint] = state
+
+    def snapshot(self) -> Mapping[str, object]:
+        return dict(self.checkpoints)
+
+    def read(self, checkpoint: str) -> object:
+        return self.checkpoints.get(checkpoint)
+
+    def write_blob(self, data: bytes) -> str:
+        import hashlib
+
+        digest = hashlib.sha256(data).hexdigest()
+        self.events.append(f"blob:{digest}")
+        self.blobs[digest] = data
+        return digest
+
+    def read_blob(self, digest: str) -> bytes:
+        return self.blobs[digest]
+
+
+class RecordingFilesystem:
+    def __init__(self, filesystem: SafeFilesystem, events: list[str]) -> None:
+        self._filesystem = filesystem
+        self.base = filesystem.base
+        self.events = events
+
+    @property
+    def closed(self) -> bool:
+        return self._filesystem.closed
+
+    def read_bytes(self, relative: str) -> bytes:
+        return self._filesystem.read_bytes(relative)
+
+    def directory_exists(self, relative: str) -> bool:
+        return self._filesystem.directory_exists(relative)
+
+    def ensure_directory(self, relative: str) -> None:
+        self.events.append(f"mkdir:{relative}")
+        self._filesystem.ensure_directory(relative)
+
+    def atomic_write_bytes(self, relative: str, data: bytes, *, mode: int = 0o600) -> None:
+        self.events.append(f"write:{relative}")
+        self._filesystem.atomic_write_bytes(relative, data, mode=mode)
+
+    def unlink(self, relative: str, *, missing_ok: bool = False) -> bool:
+        self.events.append(f"unlink:{relative}")
+        return self._filesystem.unlink(relative, missing_ok=missing_ok)
+
+    def rmdir_empty(self, relative: str, *, missing_ok: bool = False) -> bool:
+        self.events.append(f"rmdir:{relative}")
+        return self._filesystem.rmdir_empty(relative, missing_ok=missing_ok)
+
+
+def _context(root: Path, filesystem: object, operation: Operation = Operation.INSTALL) -> EffectContext:
+    return EffectContext(
+        base_path=root,
+        manifest_dir=root / "state",
+        operation=operation,
+        transaction_id="tx",
+        effect_id="settings",
+        filesystem=filesystem,
+    )
+
+
+def _prepared(
+    effect: JsonMergeEffect,
+    safe: object,
+    root: Path,
+    delta: object,
+    *,
+    path: str = "settings.json",
+    previous: object = None,
+) -> PreparedEffect:
+    return effect.prepare({"path": path, "delta": delta}, previous, _context(root, safe))
+
+
+def _apply(effect: JsonMergeEffect, safe: object, root: Path, delta: object, **kwargs: object):
+    prepared = _prepared(effect, safe, root, delta, **kwargs)
+    writer = MemoryCheckpoints()
+    effect.apply(prepared, writer)
+    return prepared, writer
+
+
+def _fixture_cases() -> list[dict[str, object]]:
+    path = Path(__file__).parents[3] / "spec/conformance/json-merge.json"
+    return json.loads(path.read_text("utf-8"))["cases"]
+
+
+@pytest.mark.parametrize("case", _fixture_cases(), ids=lambda case: str(case["name"]))
+def test_conformance_additive_merge_and_array_dedupe(tmp_path: Path, case: dict[str, object]) -> None:
+    target = tmp_path / "settings.json"
+    target.write_text(json.dumps(case["target"]), encoding="utf-8")
+    with SafeFilesystem(tmp_path) as safe:
+        _apply(JsonMergeEffect(), safe, tmp_path, case["delta"])
+    assert json.loads(target.read_text("utf-8")) == case["merged"]
+
+
+def test_prepare_is_read_only_and_apply_checkpoints_before_write(tmp_path: Path) -> None:
+    original = b'{ "existing" : true }\n'
+    (tmp_path / "settings.json").write_bytes(original)
+    events: list[str] = []
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        filesystem = RecordingFilesystem(safe, events)
+        prepared = _prepared(effect, filesystem, tmp_path, {"added": [1]})
+        assert (tmp_path / "settings.json").read_bytes() == original
+        assert prepared.resources == (f"path:{(tmp_path / 'settings.json').as_posix()}",)
+        writer = MemoryCheckpoints()
+        writer.events = events
+        effect.apply(prepared, writer)
+    assert events.index("checkpoint:apply:ready") < events.index("write:settings.json")
+    assert events[-1] == "checkpoint:apply:done"
+
+
+def test_revert_preserves_preexisting_and_later_third_party_entries(tmp_path: Path) -> None:
+    target = tmp_path / "settings.json"
+    target.write_text(json.dumps({"hooks": [{"command": "before"}]}), "utf-8")
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared, _ = _apply(effect, safe, tmp_path, {"hooks": [{"command": "ours"}], "managed": True})
+        value = json.loads(target.read_text("utf-8"))
+        value["hooks"].append({"command": "after"})
+        value["managed"] = "user-edited"
+        value["unrelated"] = {"keep": True}
+        target.write_text(json.dumps(value), "utf-8")
+        effect.revert(_context(tmp_path, safe, Operation.UNINSTALL), prepared.before_state, MemoryCheckpoints())
+    assert json.loads(target.read_text("utf-8")) == {
+        "hooks": [{"command": "before"}, {"command": "after"}],
+        "managed": "user-edited",
+        "unrelated": {"keep": True},
+    }
+
+
+def test_exact_original_bytes_return_when_no_third_party_edit_occurred(tmp_path: Path) -> None:
+    original = b'{\n\t"hooks": [],\n\t"keep": true\n}\n'
+    target = tmp_path / "settings.json"
+    target.write_bytes(original)
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared, _ = _apply(effect, safe, tmp_path, {"hooks": [{"command": "ours"}]})
+        effect.revert(_context(tmp_path, safe, Operation.UNINSTALL), prepared.before_state, MemoryCheckpoints())
+    assert target.read_bytes() == original
+
+
+def test_created_file_and_only_owned_parents_are_removed(tmp_path: Path) -> None:
+    (tmp_path / "nested").mkdir()
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared, _ = _apply(
+            effect,
+            safe,
+            tmp_path,
+            {"hooks": {"start": ["ours"]}},
+            path="nested/created/settings.json",
+        )
+        effect.revert(_context(tmp_path, safe, Operation.UNINSTALL), prepared.before_state, MemoryCheckpoints())
+    assert not (tmp_path / "nested/created").exists()
+    assert (tmp_path / "nested").is_dir()
+
+
+def test_empty_delta_and_repeat_delta_preserve_bytes_and_do_not_duplicate(tmp_path: Path) -> None:
+    original = b'{ "hooks": [] }\n'
+    target = tmp_path / "settings.json"
+    target.write_bytes(original)
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        empty, empty_writer = _apply(effect, safe, tmp_path, {})
+        assert target.read_bytes() == original
+        assert empty_writer.checkpoints == {}
+        first, _ = _apply(effect, safe, tmp_path, {"hooks": [{"command": "ours"}]})
+        second = _prepared(
+            effect,
+            safe,
+            tmp_path,
+            {"hooks": [{"command": "ours"}]},
+            previous=first.before_state,
+        )
+        second_writer = MemoryCheckpoints()
+        effect.apply(second, second_writer)
+        assert second_writer.checkpoints == {}
+    assert json.loads(target.read_text("utf-8"))["hooks"] == [{"command": "ours"}]
+    assert empty.before_state["owned"] == ()
+
+
+def test_scalar_conflict_and_container_type_conflict_never_clobber(tmp_path: Path) -> None:
+    target = tmp_path / "settings.json"
+    original = b'{"enabled":true,"nested":3}\n'
+    target.write_bytes(original)
+    with SafeFilesystem(tmp_path) as safe:
+        effect = JsonMergeEffect()
+        with pytest.raises(ValueError, match="overwrite existing scalar"):
+            _prepared(effect, safe, tmp_path, {"enabled": False})
+        with pytest.raises(ValueError, match="object into existing non-object"):
+            _prepared(effect, safe, tmp_path, {"nested": {"x": 1}})
+    assert target.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [b"{not json", b'{"x":1,"x":2}', b'{"x":NaN}', b'\xff'],
+)
+def test_strict_json_input_is_rejected_without_clobber(tmp_path: Path, invalid: bytes) -> None:
+    target = tmp_path / "settings.json"
+    target.write_bytes(invalid)
+    with SafeFilesystem(tmp_path) as safe:
+        with pytest.raises((UnicodeDecodeError, ValueError)):
+            _prepared(JsonMergeEffect(), safe, tmp_path, {"ok": True})
+    assert target.read_bytes() == invalid
+
+
+def test_path_escape_and_symlink_leave_outside_sentinel_unchanged(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    outside = tmp_path / "outside.json"
+    base.mkdir()
+    outside.write_bytes(b'{"sentinel":true}\n')
+    (base / "link.json").symlink_to(outside)
+    effect = JsonMergeEffect()
+    with SafeFilesystem(base) as safe:
+        with pytest.raises(Exception):
+            _prepared(effect, safe, base, {"x": 1}, path="../outside.json")
+        with pytest.raises(Exception):
+            _prepared(effect, safe, base, {"x": 1}, path="link.json")
+        with pytest.raises(Exception):
+            effect.revert(
+                _context(base, safe, Operation.UNINSTALL),
+                {"version": 1, "path": "../outside.json", "file_created": True, "original": None, "installed_hash": "0" * 64, "owned": [], "created_containers": [], "created_parents": []},
+                MemoryCheckpoints(),
+            )
+    assert outside.read_bytes() == b'{"sentinel":true}\n'
+
+
+def test_interrupted_apply_and_rollback_resume_idempotently(tmp_path: Path) -> None:
+    target = tmp_path / "settings.json"
+    original = b'{"before":true}\n'
+    target.write_bytes(original)
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        prepared = _prepared(effect, safe, tmp_path, {"ours": True})
+        writer = MemoryCheckpoints()
+        writer.write("apply", {**prepared.payload["checkpoint"], "phase": "ready"})
+        safe.atomic_write_bytes("settings.json", prepared.payload["after_bytes"].encode("latin1"))
+        effect.apply(prepared, writer)
+        effect.revert(_context(tmp_path, safe, Operation.UPDATE), prepared.before_state, writer)
+        effect.revert(_context(tmp_path, safe, Operation.UPDATE), prepared.before_state, writer)
+    assert target.read_bytes() == original
+    assert writer.checkpoints["rollback"]["phase"] == "done"
+
+
+def test_corrupt_prepared_and_before_state_fail_closed(tmp_path: Path) -> None:
+    target = tmp_path / "settings.json"
+    target.write_bytes(b"{}\n")
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        bad = PreparedEffect(before_state={}, payload={"version": 99}, filesystem=safe)
+        with pytest.raises(InvalidEffectError):
+            effect.apply(bad, MemoryCheckpoints())
+        with pytest.raises((InvalidEffectError, ValueError, TypeError)):
+            effect.revert(_context(tmp_path, safe, Operation.UNINSTALL), {"version": 99}, MemoryCheckpoints())
+    assert target.read_bytes() == b"{}\n"
