@@ -423,10 +423,13 @@ def plan_distribution(
         by_destination.items(),
         key=lambda item: item[0].encode("utf-8"),
     ):
+        # Effect ids forbid `/`; keep destination segments joined with `:`.
+        effect_destination = destination.replace("/", ":")
         plans.extend(
             FileSetProvider(
                 effect_id=(
-                    f"skills:{distribution.name}:{resolved_scope.value}:{destination}"
+                    f"skills:{distribution.name}:{resolved_scope.value}"
+                    f":{effect_destination}"
                 ),
                 destination=destination,
             ).plan(
