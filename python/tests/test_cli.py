@@ -473,3 +473,340 @@ def test_install_everywhere_is_refused_without_hosts(
     captured = capsys.readouterr()
     assert code != 0
     assert "host" in captured.err.lower()
+
+
+def _scripted_prompts(*, selects=None, checkboxes=None, confirms=None):
+    from dataclasses import dataclass, field
+    from typing import Any, Sequence
+
+    @dataclass
+    class _ScriptedPrompt:
+        selects: list[Any] = field(default_factory=list)
+        checkboxes: list[Any] = field(default_factory=list)
+        confirms: list[Any] = field(default_factory=list)
+
+        def select(self, message: str, choices: Sequence[object], *, default: str | None = None):
+            if not self.selects:
+                raise AssertionError(f"unexpected select: {message!r}")
+            return self.selects.pop(0)
+
+        def checkbox(self, message: str, choices: Sequence[object]):
+            if not self.checkboxes:
+                raise AssertionError(f"unexpected checkbox: {message!r}")
+            return self.checkboxes.pop(0)
+
+        def confirm(self, message: str, *, default: bool = False):
+            if not self.confirms:
+                raise AssertionError(f"unexpected confirm: {message!r}")
+            return self.confirms.pop(0)
+
+    return _ScriptedPrompt(
+        selects=list(selects or []),
+        checkboxes=list(checkboxes or []),
+        confirms=list(confirms or []),
+    )
+
+
+def _recording_console(*, stream):
+    from minimalist_installer.tui.app import RecordingConsole
+
+    return RecordingConsole(stream=stream)
+
+
+def test_json_interactive_install_keeps_stdout_json_only(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from minimalist_installer.cli import main
+    from minimalist_installer.skills import HostRegistry, load_host_descriptor
+    import minimalist_installer.cli as cli_mod
+
+    home = tmp_path / "home"
+    home.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    exe = bin_dir / "codex"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o755)
+    descriptor = _distribution_toml(tmp_path)
+    registry = HostRegistry([load_host_descriptor(_host_toml(tmp_path / "codex.toml"))])
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(cli_mod, "require_tui_dependencies", lambda: None)
+    monkeypatch.setattr(cli_mod, "require_interactive_tty", lambda **_: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "create_questionary_prompts",
+        lambda: _scripted_prompts(selects=["en"], checkboxes=[["codex"]], confirms=[True]),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "create_rich_console",
+        lambda **kwargs: _recording_console(stream=kwargs.get("file")),
+    )
+
+    code = main(
+        [
+            "install",
+            str(descriptor),
+            "--json",
+            "--scope",
+            "user",
+            "--home",
+            str(home),
+            "--search-path",
+            str(bin_dir),
+            "--lang",
+            "en",
+        ],
+        registry=registry,
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0, captured.err
+    assert payload["schema_version"] == 1
+    assert payload["operation"] == "install"
+    assert captured.out.strip().startswith("{")
+    assert "Installing" not in captured.out
+    assert "minimalist-installer" not in captured.out
+    assert "Done." not in captured.out
+    assert captured.err.strip() != ""
+
+
+def test_json_interactive_detect_keeps_human_off_stdout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from minimalist_installer.cli import main
+    from minimalist_installer.skills import HostRegistry, load_host_descriptor
+
+    home = tmp_path / "home"
+    home.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    exe = bin_dir / "codex"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o755)
+    registry = HostRegistry([load_host_descriptor(_host_toml(tmp_path / "codex.toml"))])
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    code = main(
+        [
+            "detect",
+            "--json",
+            "--scope",
+            "user",
+            "--home",
+            str(home),
+            "--search-path",
+            str(bin_dir),
+        ],
+        registry=registry,
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0
+    assert payload["schema_version"] == 1
+    assert any(item["id"] == "codex" for item in payload["detections"])
+    # stdout is parseable JSON document only
+    assert captured.out.strip().startswith("{")
+    assert "confidence" not in captured.out.split("{", 1)[0]
+
+
+def test_json_interactive_uninstall_success_and_cancel(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from minimalist_installer.cli import main
+    from minimalist_installer.skills import HostRegistry, load_host_descriptor
+    import minimalist_installer.cli as cli_mod
+
+    home = tmp_path / "home"
+    home.mkdir()
+    descriptor = _distribution_toml(tmp_path)
+    registry = HostRegistry([load_host_descriptor(_host_toml(tmp_path / "codex.toml"))])
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    assert (
+        main(
+            [
+                "install",
+                str(descriptor),
+                "--yes",
+                "--scope",
+                "user",
+                "--hosts",
+                "codex",
+                "--home",
+                str(home),
+            ],
+            registry=registry,
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(cli_mod, "require_tui_dependencies", lambda: None)
+    monkeypatch.setattr(cli_mod, "require_interactive_tty", lambda **_: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "create_questionary_prompts",
+        lambda: _scripted_prompts(checkboxes=[["codex"]], confirms=[False]),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "create_rich_console",
+        lambda **kwargs: _recording_console(stream=kwargs.get("file")),
+    )
+
+    cancel_code = main(
+        [
+            "uninstall",
+            str(descriptor),
+            "--json",
+            "--scope",
+            "user",
+            "--home",
+            str(home),
+            "--lang",
+            "en",
+        ],
+        registry=registry,
+    )
+    cancel_captured = capsys.readouterr()
+    cancel_payload = json.loads(cancel_captured.out)
+
+    assert cancel_code == 0
+    assert cancel_payload["schema_version"] == 1
+    assert cancel_payload["cancelled"] is True
+    assert "Operation cancelled" not in cancel_captured.out
+    assert cancel_captured.err.strip() != ""
+    assert (home / ".agents" / "skills" / "demo" / "SKILL.md").is_file()
+
+    monkeypatch.setattr(
+        cli_mod,
+        "create_questionary_prompts",
+        lambda: _scripted_prompts(checkboxes=[["codex"]], confirms=[True]),
+    )
+    success_code = main(
+        [
+            "uninstall",
+            str(descriptor),
+            "--json",
+            "--scope",
+            "user",
+            "--home",
+            str(home),
+            "--lang",
+            "en",
+        ],
+        registry=registry,
+    )
+    success_captured = capsys.readouterr()
+    success_payload = json.loads(success_captured.out)
+
+    assert success_code == 0, success_captured.err
+    assert success_payload["schema_version"] == 1
+    assert success_payload["cancelled"] is not True
+    assert success_payload["operation"] == "uninstall"
+    assert "Uninstalling" not in success_captured.out
+    assert "Done." not in success_captured.out
+    assert not (home / ".agents" / "skills" / "demo" / "SKILL.md").exists()
+
+
+def test_interactive_install_zero_hosts_is_error_exit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from minimalist_installer.cli import main
+    from minimalist_installer.skills import HostRegistry
+    import minimalist_installer.cli as cli_mod
+
+    home = tmp_path / "home"
+    home.mkdir()
+    descriptor = _distribution_toml(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(cli_mod, "require_tui_dependencies", lambda: None)
+    monkeypatch.setattr(cli_mod, "require_interactive_tty", lambda **_: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "create_questionary_prompts",
+        lambda: _scripted_prompts(selects=["en"], checkboxes=[[]], confirms=[]),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "create_rich_console",
+        lambda **kwargs: _recording_console(stream=kwargs.get("file")),
+    )
+
+    code = main(
+        [
+            "install",
+            str(descriptor),
+            "--scope",
+            "user",
+            "--home",
+            str(home),
+            "--search-path",
+            "",
+            "--lang",
+            "en",
+        ],
+        registry=HostRegistry([]),
+    )
+    captured = capsys.readouterr()
+    assert code != 0
+    assert "host" in captured.err.lower()
+
+
+def test_json_errors_emit_structured_payload_on_stdout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from minimalist_installer.cli import main
+    from minimalist_installer.skills import HostRegistry
+
+    home = tmp_path / "home"
+    home.mkdir()
+    descriptor = _distribution_toml(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    code = main(
+        [
+            "install",
+            str(descriptor),
+            "--yes",
+            "--json",
+            "--scope",
+            "user",
+            "--home",
+            str(home),
+            "--search-path",
+            "",
+        ],
+        registry=HostRegistry([]),
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code != 0
+    assert payload["schema_version"] == 1
+    assert payload["code"] == "no_host_detected"
+    assert captured.err.strip() != ""

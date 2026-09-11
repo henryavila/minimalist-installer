@@ -498,3 +498,161 @@ def test_keyboard_cancel_from_prompt_aborts(
 
     assert outcome.cancelled is True
     installer.install.assert_not_called()
+
+
+def test_zero_detected_hosts_raises_no_host_error(
+    distribution: SkillDistribution, tmp_path: Path
+) -> None:
+    from minimalist_installer import NoHostDetectedError
+    from minimalist_installer.tui.app import run_install_flow
+
+    home = tmp_path / "home"
+    home.mkdir()
+    prompts = FakePrompt(selects=["user"])
+    installer = MagicMock()
+
+    with pytest.raises(NoHostDetectedError) as raised:
+        run_install_flow(
+            distribution,
+            prompts=prompts,
+            console=FakeConsole(),
+            home=home,
+            lang="en",
+            detect_hosts=lambda **_: _detection(root=home),
+            installer_factory=lambda **_: installer,
+            version="0.1.0",
+        )
+
+    assert raised.value.code.value == "no_host_detected"
+    installer.install.assert_not_called()
+
+
+def test_ascii_theme_flow_emits_no_ellipsis_or_box_drawing(
+    distribution: SkillDistribution, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minimalist_installer.tui import messages, theme
+    from minimalist_installer.tui.app import run_install_flow
+
+    monkeypatch.setenv("NO_UNICODE", "1")
+    assert theme.detect_unicode_ok(environ={"NO_UNICODE": "1"}) is False
+
+    for lang in ("en", "pt"):
+        catalog = messages.catalog(lang)
+        joined = "\n".join(catalog.values())
+        assert "…" not in joined
+
+    ascii_theme = theme.resolve_theme(unicode_ok=False, color_ok=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    result = OperationResult(
+        operation=Operation.INSTALL,
+        status=OperationStatus.COMPLETED,
+        transaction_id="tx-1",
+        installation_id="install-1",
+        planned=("skills:demo:user:agents:skills",),
+        applied=("skills:demo:user:agents:skills",),
+        selected_hosts=("codex",),
+    )
+    installer = MagicMock()
+    installer.install.return_value = result
+    prompts = FakePrompt(confirms=[True])
+    console = FakeConsole()
+
+    run_install_flow(
+        distribution,
+        prompts=prompts,
+        console=console,
+        scope=Scope.USER,
+        hosts=["codex"],
+        lang="en",
+        home=home,
+        detect_hosts=lambda **_: _detection(_host("codex"), root=home),
+        installer_factory=lambda **_: installer,
+        theme=ascii_theme,
+        version="0.1.0",
+    )
+
+    joined = "\n".join(console.lines + console.statuses)
+    assert "…" not in joined
+    for char in ("─", "│", "┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼", "→", "✓", "•"):
+        assert char not in joined
+    assert "->" in joined or "[ok]" in joined
+
+
+def test_uninstall_offers_checkbox_host_selection(
+    distribution: SkillDistribution, tmp_path: Path
+) -> None:
+    from minimalist_installer.tui.app import run_uninstall_flow
+
+    home = tmp_path / "home"
+    home.mkdir()
+    result = OperationResult(
+        operation=Operation.UNINSTALL,
+        status=OperationStatus.COMPLETED,
+        transaction_id="tx-2",
+        installation_id="install-1",
+        selected_hosts=("cursor",),
+    )
+    installer = MagicMock()
+    installer.uninstall.return_value = result
+    prompts = FakePrompt(checkboxes=[["cursor"]], confirms=[True])
+    console = FakeConsole()
+    detection = _detection(
+        _host("codex", confidence=40),
+        _host(
+            "cursor",
+            ".cursor/skills",
+            confidence=10,
+            evidence=(Evidence(kind=EvidenceKind.CONFIG_DIRECTORY, value=".cursor"),),
+        ),
+        root=home,
+    )
+
+    outcome = run_uninstall_flow(
+        distribution,
+        prompts=prompts,
+        console=console,
+        scope=Scope.USER,
+        hosts=None,
+        lang="en",
+        home=home,
+        detect_hosts=lambda **_: detection,
+        installer_factory=lambda **_: installer,
+    )
+
+    assert outcome.cancelled is False
+    assert outcome.selected_hosts == ("cursor",)
+    checkbox = next(entry for entry in prompts.log if entry[0] == "checkbox")
+    choices = checkbox[1][1]
+    checked = {
+        getattr(choice, "value"): getattr(choice, "checked", False) for choice in choices
+    }
+    assert checked["codex"] is True
+    assert checked["cursor"] is True
+    installer.uninstall.assert_called_once()
+
+
+def test_uninstall_zero_hosts_raises_no_host_error(
+    distribution: SkillDistribution, tmp_path: Path
+) -> None:
+    from minimalist_installer import NoHostDetectedError
+    from minimalist_installer.tui.app import run_uninstall_flow
+
+    home = tmp_path / "home"
+    home.mkdir()
+    installer = MagicMock()
+
+    with pytest.raises(NoHostDetectedError):
+        run_uninstall_flow(
+            distribution,
+            prompts=FakePrompt(),
+            console=FakeConsole(),
+            scope=Scope.USER,
+            hosts=None,
+            lang="en",
+            home=home,
+            detect_hosts=lambda **_: _detection(root=home),
+            installer_factory=lambda **_: installer,
+        )
+
+    installer.uninstall.assert_not_called()
