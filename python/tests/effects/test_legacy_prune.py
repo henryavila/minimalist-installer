@@ -306,6 +306,7 @@ def test_rollback_rejects_checkpoint_for_unrelated_in_base_path(tmp_path: Path) 
         writer.blobs[digest] = forged
         writer.checkpoints["apply:000000"] = {
             "phase": "done",
+            "action": "delete",
             "path": "victim.txt",
             "sha256": digest,
             "namespace_root": ".",

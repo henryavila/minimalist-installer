@@ -289,9 +289,12 @@ def test_rollback_rejects_checkpoint_for_unrelated_in_base_file(tmp_path: Path) 
         writer = MemoryCheckpoints()
         writer.checkpoints["apply"] = {
             "phase": "done",
+            "action": "register",
             "marker_path": "victim.txt",
             "before_hash": None,
             "after_hash": hashlib.sha256(b"unrelated").hexdigest(),
+            "blob": None,
+            "created_parents": [],
         }
         with pytest.raises(InvalidEffectError, match="authorized state"):
             effect.revert(
@@ -327,6 +330,23 @@ def test_initially_absent_refcount_state_records_all_created_parents(tmp_path: P
         "shared",
         "shared/owners",
     )
+
+
+def test_update_rollback_preserves_parents_owned_by_prior_install(tmp_path: Path) -> None:
+    effect = RefcountEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        first, _ = _apply(effect, safe, tmp_path, "owner")
+        safe.unlink(f"shared/owners/{first.before_state['owner_key']}")
+        update = _prepare(effect, safe, tmp_path, "owner", first.before_state)
+        writer = MemoryCheckpoints()
+        effect.apply(update, writer)
+        effect.revert(
+            _context(tmp_path, safe, Operation.UPDATE),
+            update.before_state,
+            writer,
+        )
+    assert (tmp_path / "shared/owners").is_dir()
+    assert not _marker(tmp_path, "owner").exists()
 
 
 @pytest.mark.parametrize("persist_done", [False, True])

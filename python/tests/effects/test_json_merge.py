@@ -275,6 +275,7 @@ def test_interrupted_apply_and_rollback_resume_idempotently(tmp_path: Path) -> N
         )
         safe.atomic_write_bytes("settings.json", prepared.payload["after_bytes"].encode("latin1"))
         effect.apply(prepared, writer)
+        effect.apply(prepared, writer)
         effect.revert(_context(tmp_path, safe, Operation.UPDATE), prepared.before_state, writer)
         effect.revert(_context(tmp_path, safe, Operation.UPDATE), prepared.before_state, writer)
     assert target.read_bytes() == original
@@ -384,10 +385,12 @@ def test_rollback_rejects_checkpoint_for_unrelated_in_base_file(tmp_path: Path) 
         writer = MemoryCheckpoints()
         writer.checkpoints["apply"] = {
             "phase": "done",
+            "action": "write",
             "path": "victim.txt",
             "before_hash": None,
             "after_hash": hashlib.sha256(b"unrelated").hexdigest(),
             "blob": None,
+            "created_parents": [],
         }
         with pytest.raises(InvalidEffectError, match="authorized state"):
             effect.revert(
@@ -420,3 +423,33 @@ def test_rollback_prunes_only_apply_created_parents_with_checkpoints(tmp_path: P
     assert (tmp_path / "existing").is_dir()
     assert not (tmp_path / "existing/created").exists()
     assert writer.checkpoints["rollback-dir:000000"]["phase"] == "done"
+
+
+def test_update_rollback_preserves_parents_owned_by_prior_install(tmp_path: Path) -> None:
+    effect = JsonMergeEffect()
+    with SafeFilesystem(tmp_path) as safe:
+        first, _ = _apply(
+            effect,
+            safe,
+            tmp_path,
+            {"ours": True},
+            path="created/settings.json",
+        )
+        safe.unlink("created/settings.json")
+        update = _prepared(
+            effect,
+            safe,
+            tmp_path,
+            {"ours": True},
+            path="created/settings.json",
+            previous=first.before_state,
+        )
+        writer = MemoryCheckpoints()
+        effect.apply(update, writer)
+        effect.revert(
+            _context(tmp_path, safe, Operation.UPDATE),
+            update.before_state,
+            writer,
+        )
+    assert (tmp_path / "created").is_dir()
+    assert not (tmp_path / "created/settings.json").exists()
