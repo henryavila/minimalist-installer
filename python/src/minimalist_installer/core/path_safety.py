@@ -83,6 +83,7 @@ def _posix_backend_available() -> bool:
         and hasattr(os, "O_DIRECTORY")
         and all(function in os.supports_dir_fd for function in required_dir_fd)
         and os.stat in os.supports_follow_symlinks
+        and os.listdir in os.supports_fd
     )
 
 
@@ -461,7 +462,12 @@ class _PosixBackend:
                 entries.append(
                     (name, classify_entry(entry, platform_name=self.platform_name))
                 )
-            return tuple(sorted(entries, key=lambda item: item[0].encode("utf-8")))
+            return tuple(
+                sorted(
+                    entries,
+                    key=lambda item: item[0].encode("utf-8", "surrogateescape"),
+                )
+            )
         finally:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
