@@ -590,7 +590,7 @@ class Driver:
             )
 
     def status(self, *, base_path: Path) -> StatusResult:
-        """Return a read-only summary; recovery policy is completed in Task 7."""
+        """Return a read-only summary of committed state and any active WAL."""
 
         with SafeFilesystem(base_path) as filesystem:
             manifests = ManifestRepository(
@@ -684,7 +684,11 @@ class Driver:
                     and isinstance(active, TransactionJournal)
                     and not active.repairing()
                     and active.operation
-                    in {Operation.INSTALL, Operation.UPDATE}
+                    in {
+                        Operation.INSTALL,
+                        Operation.UPDATE,
+                        Operation.UNINSTALL,
+                    }
                 ):
                     plans = self._plan(
                         base_path=filesystem.base,

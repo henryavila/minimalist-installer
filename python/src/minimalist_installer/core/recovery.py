@@ -223,10 +223,13 @@ class RecoveryCoordinator:
         cleanup = committed_this or removed_this
         trusted = effect_error is None
         repairing = active.repairing()
+        uninstall = active.operation is Operation.UNINSTALL
+        uninstall_reverted = uninstall and bool(reverted)
         rollback_supported = (
             trusted
             and not cleanup
             and not missing_blobs
+            and not uninstall_reverted
             and all(
                 effect.prepared is None or effect.prepared.recoverable
                 for effect in active.effects
@@ -236,9 +239,9 @@ class RecoveryCoordinator:
             trusted
             and not cleanup
             and not repairing
-            and not reverted
             and active.operation
             in {Operation.INSTALL, Operation.UPDATE, Operation.UNINSTALL}
+            and (not reverted or uninstall)
         )
         reason = None
         if effect_error is not None:
@@ -249,6 +252,8 @@ class RecoveryCoordinator:
             reason = "committed transaction awaiting cleanup"
         elif repairing:
             reason = "repair rollback in progress"
+        elif uninstall_reverted:
+            reason = "interrupted uninstall cannot restore the previous installation"
         else:
             reason = "incomplete transaction"
         return RecoveryReport(
@@ -425,10 +430,52 @@ class RecoveryCoordinator:
             reverted=tuple(reverted),
         )
 
+    @staticmethod
+    def _has_reverted(journal: TransactionJournal) -> bool:
+        return any(
+            effect.status is EffectProgress.REVERTED for effect in journal.effects
+        )
+
+    def _abort_unmutated_uninstall(
+        self, journal: TransactionJournal
+    ) -> OperationResult:
+        error = self._effect_error(journal)
+        if error is not None:
+            raise error
+        if self._has_reverted(journal):
+            raise RecoveryBlockedError(
+                "interrupted uninstall cannot restore the previous installation",
+                operation=Operation.REPAIR,
+                details={
+                    "transaction_id": journal.transaction_id,
+                    "rollback_supported": False,
+                },
+            )
+        journal = self.transactions.begin_repair(journal.transaction_id)
+        if "rolled_back" not in journal.operation_checkpoints:
+            journal = self.transactions.checkpoint(
+                journal.transaction_id, "rolled_back"
+            )
+        self.transactions.complete(journal.transaction_id)
+        self._gc_remnants(None)
+        committed = self.manifests.read()
+        return OperationResult(
+            operation=Operation.REPAIR,
+            status=OperationStatus.COMPLETED,
+            transaction_id=journal.transaction_id,
+            installation_id=(
+                committed.installation_id
+                if committed is not None
+                else journal.installation_id
+            ),
+            planned=journal.planned_effect_ids,
+        )
+
     def _continue_uninstall(self, journal: TransactionJournal) -> OperationResult:
         error = self._effect_error(journal)
         if error is not None:
             raise error
+        journal = self.transactions.begin_repair(journal.transaction_id)
         committed = self.manifests.read()
         prior = (
             {record.id: record for record in committed.effects}
@@ -477,15 +524,11 @@ class RecoveryCoordinator:
             journal = self.transactions.checkpoint(
                 journal.transaction_id, "effects_reverted"
             )
-        if "committing" not in journal.operation_checkpoints:
-            journal = self.transactions.checkpoint(
-                journal.transaction_id, "committing"
-            )
         if self.manifests.read() is not None:
             self.manifests.remove()
-        if "manifest_removed" not in journal.operation_checkpoints:
+        if "rolled_back" not in journal.operation_checkpoints:
             journal = self.transactions.checkpoint(
-                journal.transaction_id, "manifest_removed"
+                journal.transaction_id, "rolled_back"
             )
         self.transactions.complete(journal.transaction_id)
         self._gc_remnants(None)
@@ -685,10 +728,11 @@ class RecoveryCoordinator:
             return self._complete_committed(journal)
 
         if journal.repairing():
+            if journal.operation is Operation.UNINSTALL:
+                if self._has_reverted(journal):
+                    return self._continue_uninstall(journal)
+                return self._abort_unmutated_uninstall(journal)
             return self._rollback(journal)
-
-        if journal.operation is Operation.UNINSTALL:
-            return self._continue_uninstall(journal)
 
         if resume:
             if plans is None or not self._compatible(journal, plans):
@@ -697,7 +741,21 @@ class RecoveryCoordinator:
                     operation=Operation.REPAIR,
                     details={"transaction_id": journal.transaction_id},
                 )
+            if journal.operation is Operation.UNINSTALL:
+                return self._continue_uninstall(journal)
             return self._resume_forward(journal)
+
+        if journal.operation is Operation.UNINSTALL:
+            if self._has_reverted(journal):
+                raise RecoveryBlockedError(
+                    "interrupted uninstall cannot restore the previous installation",
+                    operation=Operation.REPAIR,
+                    details={
+                        "transaction_id": journal.transaction_id,
+                        "rollback_supported": False,
+                    },
+                )
+            return self._abort_unmutated_uninstall(journal)
         return self._rollback(journal)
 
 

@@ -626,7 +626,7 @@ class TransactionJournal:
 
         forward = self.operation in {Operation.INSTALL, Operation.UPDATE}
         repairing = self.repairing()
-        if repairing:
+        if repairing and forward:
             allowed = {
                 EffectProgress.PLANNED,
                 EffectProgress.PREPARED,
@@ -650,7 +650,7 @@ class TransactionJournal:
             raise ValueError("effect status has the wrong transaction direction")
         if statuses.count(EffectProgress.PREPARED) > 1:
             raise ValueError("at most one effect may be in prepared progress")
-        if repairing:
+        if repairing and forward:
             ranks = {
                 EffectProgress.APPLIED: 0,
                 EffectProgress.PREPARED: 1,
@@ -679,6 +679,10 @@ class TransactionJournal:
             status in {EffectProgress.REVERTED, EffectProgress.PLANNED}
             for status in statuses
         )
+        unmutated_reverse = not forward and all(
+            status in {EffectProgress.PLANNED, EffectProgress.PREPARED}
+            for status in statuses
+        )
         if repairing:
             index = checkpoints.index("repairing")
             prefix = checkpoints[:index]
@@ -687,11 +691,15 @@ class TransactionJournal:
                 raise ValueError("repair rollback after commit proof")
             if prefix != expected[: len(prefix)]:
                 raise ValueError("operation checkpoint order is impossible")
-            if suffix != ROLLBACK_CHECKPOINTS[: len(suffix)]:
+            expected_suffix = ROLLBACK_CHECKPOINTS
+            if "effects_reverted" in prefix or unmutated_reverse:
+                expected_suffix = ("repairing", "rolled_back")
+            if suffix != expected_suffix[: len(suffix)]:
                 raise ValueError("repair checkpoint order is impossible")
+            terminal_ok = rollback_done or unmutated_reverse
             if any(
                 name in suffix for name in ("effects_reverted", "rolled_back")
-            ) and not rollback_done:
+            ) and not terminal_ok:
                 raise ValueError("operation checkpoint precedes terminal effects")
         else:
             terminal = EffectProgress.APPLIED if forward else EffectProgress.REVERTED
@@ -729,7 +737,8 @@ class TransactionJournal:
                     raise ValueError("reverting phase has no effect progress")
         elif self.phase is TransactionPhase.COMMITTING:
             if repairing:
-                if "rolled_back" not in checkpoints or not rollback_done:
+                terminal_ok = rollback_done or unmutated_reverse
+                if "rolled_back" not in checkpoints or not terminal_ok:
                     raise ValueError("committing phase lacks terminal proof")
             else:
                 all_terminal = all(
