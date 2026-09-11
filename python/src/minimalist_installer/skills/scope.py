@@ -103,17 +103,20 @@ def resolve_project_root(start: Path, *, home: Path | None = None) -> Path:
     """Walk up from ``start`` to a git work tree without following link escapes."""
 
     home_path = Path(home) if home is not None else Path.home()
-    current = Path(os.path.abspath(os.fspath(start)))
+    origin = Path(os.path.abspath(os.fspath(start)))
+    current = origin
 
     for _ in range(_MAX_WALK):
         if _is_filesystem_root(current):
-            raise _unsafe("project scope refuses the filesystem root", current)
+            if current == origin:
+                raise _unsafe("project scope refuses the filesystem root", current)
+            raise _unsafe("project scope could not resolve a git root", origin)
 
         kind = _lstat_kind(current)
         if kind is None:
             parent = current.parent
             if parent == current:
-                raise _unsafe("project scope refuses the filesystem root", current)
+                raise _unsafe("project scope could not resolve a git root", origin)
             current = parent
             continue
         if kind in {PathEntryKind.SYMLINK, PathEntryKind.REPARSE}:
@@ -140,7 +143,7 @@ def resolve_project_root(start: Path, *, home: Path | None = None) -> Path:
 
         parent = current.parent
         if parent == current:
-            raise _unsafe("project scope refuses the filesystem root", current)
+            raise _unsafe("project scope could not resolve a git root", origin)
         current = parent
 
     raise _unsafe("project scope could not resolve a git root", Path(start))

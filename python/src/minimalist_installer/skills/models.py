@@ -59,8 +59,29 @@ def _string_tuple(value: object, label: str) -> tuple[str, ...]:
 
 
 def _relative_destination(value: str, label: str) -> str:
-    if _is_absolute_path(value) or any(part in {"", ".", ".."} for part in Path(value).parts):
+    if value in {".", ".."} or _is_absolute_path(value):
         raise ValueError(f"{label} must be a relative destination without parent traversal")
+    parts = value.replace("\\", "/").split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"{label} must be a relative destination without parent traversal")
+    return value
+
+
+def _basename_only(value: str, label: str) -> str:
+    if (
+        value in {".", ".."}
+        or _is_absolute_path(value)
+        or "/" in value
+        or "\\" in value
+        or Path(value).name != value
+    ):
+        raise ValueError(f"{label} must be a basename, not a path")
+    return value
+
+
+def _environment_pattern(value: str, label: str) -> str:
+    if value in {".", ".."} or (value.endswith("*") and not value[:-1]):
+        raise ValueError(f"{label} must not use an empty prefix")
     return value
 
 
@@ -104,9 +125,24 @@ class DetectionSignals:
     config_dirs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "executables", _string_tuple(self.executables, "executables"))
-        object.__setattr__(self, "environment", _string_tuple(self.environment, "environment"))
-        object.__setattr__(self, "config_dirs", _string_tuple(self.config_dirs, "config_dirs"))
+        executables = _string_tuple(self.executables, "executables")
+        environment = _string_tuple(self.environment, "environment")
+        config_dirs = _string_tuple(self.config_dirs, "config_dirs")
+        object.__setattr__(
+            self,
+            "executables",
+            tuple(_basename_only(item, "executables") for item in executables),
+        )
+        object.__setattr__(
+            self,
+            "environment",
+            tuple(_environment_pattern(item, "environment") for item in environment),
+        )
+        object.__setattr__(
+            self,
+            "config_dirs",
+            tuple(_relative_destination(item, "config_dirs") for item in config_dirs),
+        )
 
     def to_dict(self) -> JsonObject:
         return {
