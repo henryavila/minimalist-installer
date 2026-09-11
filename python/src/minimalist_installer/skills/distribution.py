@@ -303,11 +303,6 @@ def _select_hosts(
     return selected
 
 
-def _host_roots(host: HostAdapter, *, scope: Scope, root: Path) -> tuple[Path, ...]:
-    relatives = host.destinations.user if scope is Scope.USER else host.destinations.project
-    return tuple(root / relative for relative in relatives)
-
-
 def _destination_relative(bundle_path: str, skill_file: str) -> str:
     leaf = _skill_leaf(skill_file)
     mapped = leaf if bundle_path == "SKILL.md" else bundle_path
@@ -318,6 +313,12 @@ def _destination_relative(bundle_path: str, skill_file: str) -> str:
             path=Path(mapped),
         )
     return "/".join(parts)
+
+
+def _host_destination_relatives(
+    host: HostAdapter, *, scope: Scope
+) -> tuple[str, ...]:
+    return host.destinations.user if scope is Scope.USER else host.destinations.project
 
 
 def plan_distribution(
@@ -331,12 +332,14 @@ def plan_distribution(
     environ: Mapping[str, str] | None = None,
     search_path: str | None = None,
 ) -> SkillDistributionPlan:
-    """Render a bundle and emit one ``reconcile_file_set`` plan.
+    """Render a bundle and emit one ``reconcile_file_set`` plan per destination root.
 
     Shared physical destinations are written once. Host attribution is retained
-    even when Codex, Gemini, and Grok share ``.agents/skills``. Non-UTF-8 assets
-    fail closed here because the generic file-set effect stores UTF-8 text;
-    inventory and rendering still copy those bytes unchanged.
+    even when Codex, Gemini, and Grok share ``.agents/skills``. Each plan locks
+    only that destination root (for example ``$HOME/.agents/skills``), not the
+    whole home or project root. Non-UTF-8 assets fail closed here because the
+    generic file-set effect stores UTF-8 text; inventory and rendering still
+    copy those bytes unchanged.
     """
 
     if not isinstance(distribution, SkillDistribution):
@@ -354,31 +357,35 @@ def plan_distribution(
     )
     rendered = render_bundle(load_bundle(distribution.bundle), distribution.variables)
 
-    pending: dict[str, tuple[Path, str, str, list[str]]] = {}
+    # (destination_root, path_under_dest) -> physical, scope-relative, bundle, text, hosts
+    pending: dict[tuple[str, str], tuple[Path, str, str, str, list[str]]] = {}
     for host in selected:
         leaf = _skill_leaf(host.layout.skill_file)
-        for dest_root in _host_roots(host, scope=resolved_scope, root=resolved.root):
+        for destination in _host_destination_relatives(host, scope=resolved_scope):
+            dest_root = resolved.root / destination
             for item in rendered:
                 dest_rel = _destination_relative(item.path, leaf)
+                under_dest = f"{distribution.name}/{dest_rel}"
                 physical = dest_root / distribution.name / dest_rel
                 try:
-                    relative = physical.relative_to(resolved.root).as_posix()
+                    scope_relative = physical.relative_to(resolved.root).as_posix()
                 except ValueError as error:
                     raise UnsafePathError(
                         "skill destination escapes the resolved scope",
                         path=physical,
                     ) from error
                 text = _utf8_text(item.path, item.data)
-                existing = pending.get(relative)
+                key = (destination, under_dest)
+                existing = pending.get(key)
                 if existing is None:
-                    pending[relative] = (physical, item.path, text, [host.id])
+                    pending[key] = (physical, scope_relative, item.path, text, [host.id])
                     continue
-                _existing_path, bundle_path, content, host_ids = existing
+                _existing_path, _scope_relative, bundle_path, content, host_ids = existing
                 if bundle_path != item.path or content != text:
                     raise _invalid(
                         "colliding skill destinations",
                         path=physical,
-                        destination=relative,
+                        destination=scope_relative,
                     )
                 if host.id not in host_ids:
                     host_ids.append(host.id)
@@ -386,27 +393,49 @@ def plan_distribution(
     ordered = tuple(
         PlannedSkillFile(
             path=physical,
-            relative=relative,
+            relative=scope_relative,
             bundle_path=bundle_path,
             host_ids=tuple(sorted(dict.fromkeys(host_ids))),
         )
-        for relative, (physical, bundle_path, _content, host_ids) in sorted(
+        for (_destination, _under_dest), (
+            physical,
+            scope_relative,
+            bundle_path,
+            _content,
+            host_ids,
+        ) in sorted(
             pending.items(),
-            key=lambda item: item[0].encode("utf-8"),
+            key=lambda item: (item[0][0].encode("utf-8"), item[0][1].encode("utf-8")),
         )
     )
-    files = [
-        {"path": item.relative, "content": pending[item.relative][2]}
-        for item in ordered
-    ]
-    plans = FileSetProvider(
-        effect_id=f"skills:{distribution.name}:{resolved_scope.value}"
-    ).plan(
-        {"files": files},
-        PlanContext(base_path=resolved.root, operation=Operation.INSTALL),
-    )
+
+    by_destination: dict[str, list[dict[str, str]]] = {}
+    for (destination, under_dest), (_physical, _scope_relative, _bundle, content, _hosts) in sorted(
+        pending.items(),
+        key=lambda item: (item[0][0].encode("utf-8"), item[0][1].encode("utf-8")),
+    ):
+        by_destination.setdefault(destination, []).append(
+            {"path": under_dest, "content": content}
+        )
+
+    plans: list[EffectPlan] = []
+    for destination, files in sorted(
+        by_destination.items(),
+        key=lambda item: item[0].encode("utf-8"),
+    ):
+        plans.extend(
+            FileSetProvider(
+                effect_id=(
+                    f"skills:{distribution.name}:{resolved_scope.value}:{destination}"
+                ),
+                destination=destination,
+            ).plan(
+                {"files": files},
+                PlanContext(base_path=resolved.root, operation=Operation.INSTALL),
+            )
+        )
     return SkillDistributionPlan(
-        plans=plans,
+        plans=tuple(plans),
         files=ordered,
         scope=resolved,
         selected_hosts=tuple(sorted({host.id for host in selected})),
