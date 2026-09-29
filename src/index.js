@@ -41,3 +41,44 @@ export { createLegacyPruneEffect } from './kernel/effects/legacy-prune.js';
 
 // Content hashing used across the engine.
 export { hashContent } from './hash.js';
+
+// No-follow path authority + typed path safety errors.
+export {
+  PathSafetyError,
+  ERR_UNSAFE_PATH_RACE,
+  ERR_PATH_ESCAPE,
+  ERR_GREENFIELD_CONFLICT,
+  ERR_UNSUPPORTED_PLATFORM,
+  writeFileNoFollow,
+  readFileNoFollow,
+  unlinkNoFollow,
+  existsNoFollow,
+  atomicWriteJsonNoFollow,
+  openParentNoFollow,
+  openDirNoFollow,
+  openLeafNoFollow,
+  entryPath,
+  assertLexicalWithinBase,
+  getPathSafetyBackend,
+  resetPathSafetyBackendForTests,
+} from './path-safety.js';
+
+// Canonical resource locks + recovery / inspect.
+export {
+  acquireLocks,
+  acquireInstallLocks,
+  resourceIdentity,
+  lockFileName,
+  DEFAULT_LOCK_ROOT,
+  defaultLockRoot,
+} from './lock.js';
+export {
+  inspectTransaction,
+  describeRecovery,
+  readJournaledEffects,
+  assertNoIncompleteTransaction,
+  TX_STATE_COMPLETE,
+  TX_STATE_INCOMPLETE,
+  TX_STATE_ABSENT,
+} from './recovery.js';
+export { stableEffectId, JOURNAL_VERSION } from './kernel/journal.js';

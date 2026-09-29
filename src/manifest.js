@@ -1,6 +1,5 @@
 import {
   readFileSync,
-  writeFileSync,
   mkdirSync,
   existsSync,
   unlinkSync,
@@ -8,6 +7,7 @@ import {
   rmdirSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { atomicWriteJsonNoFollow, assertLexicalWithinBase } from './path-safety.js';
 
 // Default manifest directory. Package-neutral — a consumer (e.g. atomic-skills)
 // overrides it via the `manifestDir` argument to point at its own location
@@ -23,13 +23,21 @@ export function readManifest(projectDir, manifestDir = MANIFEST_DIR) {
   return JSON.parse(raw);
 }
 
+/**
+ * Persist the manifest with same-directory temp → fsync → rename (no-follow).
+ * Relative path is always `${manifestDir}/${MANIFEST_FILE}` under projectDir.
+ */
 export function writeManifest(projectDir, data, manifestDir = MANIFEST_DIR) {
   const dir = join(projectDir, manifestDir);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const filePath = join(dir, MANIFEST_FILE);
-  data.updated_at = new Date().toISOString();
-  if (!data.installed_at) data.installed_at = data.updated_at;
-  writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', 'utf8');
+
+  const next = { ...data };
+  next.updated_at = new Date().toISOString();
+  if (!next.installed_at) next.installed_at = next.updated_at;
+
+  const relativePath = join(manifestDir, MANIFEST_FILE).replace(/\\/g, '/');
+  assertLexicalWithinBase(projectDir, relativePath);
+  atomicWriteJsonNoFollow(projectDir, relativePath, next);
 }
 
 // Removes the manifest file and reclaims its directory when empty, so a full

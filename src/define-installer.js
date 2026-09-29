@@ -32,7 +32,13 @@ export const defineInstaller = ({ effects = [], providers = [], config = {} } = 
     registry.register(effect);
   }
 
-  const driver = createDriver({ registry, providers, manifestDir: config.manifestDir });
+  const driver = createDriver({
+    registry,
+    providers,
+    manifestDir: config.manifestDir,
+    lockRoot: config.lockRoot,
+    resourceIdentities: config.resourceIdentities,
+  });
 
   return {
     install: ({ projectDir }) => driver.install(config, { projectDir }),

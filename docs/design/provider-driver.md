@@ -39,10 +39,18 @@ driver.uninstall({ projectDir })         // replayReverse the journal + remove t
 
 - **install**: for each `{ type, args }` the providers emit, look up the effect in
   the registry, `apply(args)` → `beforeState`, `recordEffect(manifest, …)`, then
-  `writeManifest`. An unregistered `type` throws (fail-fast, not silent skip).
+  **flush the incomplete journal to disk** (F-001 durable per-effect journaling).
+  On success, write `transaction.state=complete` with
+  `transaction.journalMode='per-effect'`. An unregistered `type` throws
+  (fail-fast, not silent skip). A crash after effect N leaves an incomplete
+  journal with exactly those N applied effects (not stale prior-only ownership).
+  Rollback-only recovery is **rejected** as the sole design; optional
+  in-process reverse on caught errors is supplementary only.
 - **uninstall**: `replayReverse(manifest, ctx, registry)` reverts every effect in
   reverse record order; then `removeManifest` reclaims the manifest dir so the
   round-trip is byte-for-byte. A never-installed root is a no-op.
+  Incomplete transactions fail closed (`assertNoIncompleteTransaction`);
+  inspect via `describeRecovery` / `readJournaledEffects` (`durablePerEffect`).
 - **Shared revert ctx**: the journal passes ONE `ctx = { basePath, manifestDir }`
   to every effect's `revert(ctx, beforeState)`. Effects read install-root context
   from `ctx` and everything else from their own recorded `beforeState`.

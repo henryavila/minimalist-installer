@@ -88,15 +88,21 @@ describe('legacyPrune effect', () => {
     writeFile(unreadablePath, '---\nname: fix\n---\n# Would otherwise match\n');
     writeFile(noFrontmatterPath, 'not frontmatter\n---\nname: fix\n---\n');
     writeFile(unknownNamePath, '---\nname: unknown\n---\n# Unknown\n');
-    chmodSync(unreadablePath, 0o000);
+    if (process.platform !== 'win32') chmodSync(unreadablePath, 0o000);
 
     const beforeState = applyLegacyPrune(basePath);
 
-    assert.deepEqual(beforeState, { pruned: [] });
-    assert.equal(existsSync(unreadablePath), true);
+    if (process.platform === 'win32') {
+      // Owner can still read mode 0 files on Windows; unreadable is Unix-only.
+      assert.equal(beforeState.pruned.some((p) => p.path.includes('no-frontmatter')), false);
+      assert.equal(beforeState.pruned.some((p) => p.path.includes('unknown.md')), false);
+    } else {
+      assert.deepEqual(beforeState, { pruned: [] });
+      assert.equal(existsSync(unreadablePath), true);
+    }
     assert.equal(readFileSync(noFrontmatterPath, 'utf8'), 'not frontmatter\n---\nname: fix\n---\n');
     assert.equal(readFileSync(unknownNamePath, 'utf8'), '---\nname: unknown\n---\n# Unknown\n');
-    chmodSync(unreadablePath, 0o600);
+    if (process.platform !== 'win32') chmodSync(unreadablePath, 0o600);
   });
 
   it('throws on legacy dirs that escape basePath without touching outside files', () => {

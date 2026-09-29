@@ -1,33 +1,26 @@
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  rmdirSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
-
 import { hashContent } from '../hash.js';
+import {
+  PathSafetyError,
+  ERR_GREENFIELD_CONFLICT,
+  assertLexicalWithinBase,
+  existsNoFollow,
+  readFileNoFollow,
+  writeFileNoFollow,
+  unlinkNoFollow,
+  pruneEmptyParentsNoFollow,
+} from '../path-safety.js';
 
-// Refuse any desired path that resolves outside basePath (e.g. a `..` segment).
-// The reconciler writes and unlinks real files, so an escaping path would mutate
-// the user's filesystem outside the install root — the data-safety invariant the
-// reversible model assumes cannot happen.
-const resolveWithinBase = (basePath, path) => {
-  const base = resolve(basePath);
-  const absPath = join(basePath, path);
-  const resolved = resolve(absPath);
-  if (resolved !== base && !resolved.startsWith(base + sep)) {
-    throw new Error(`Refusing to operate outside basePath: "${path}"`);
-  }
-  return absPath;
-};
+// Refuse any desired path that resolves outside basePath (lexical) and perform
+// all mutations through the no-follow path authority (path-safety.js).
 
 export const classifyFile = ({ installedHash, currentHash, newHash }) => {
   if (currentHash === installedHash) {
     return 'unchanged';
+  }
+
+  if (currentHash === newHash) {
+    // Desired content already on disk (e.g. retry after partial update).
+    return 'already-desired';
   }
 
   if (installedHash === newHash) {
@@ -37,32 +30,15 @@ export const classifyFile = ({ installedHash, currentHash, newHash }) => {
   return 'conflict';
 };
 
-const pruneEmptyParents = (absPath, basePath) => {
-  let parent = dirname(absPath);
-
-  while (parent !== basePath && parent !== '.') {
-    try {
-      if (readdirSync(parent).length === 0) {
-        rmdirSync(parent);
-        parent = dirname(parent);
-      } else {
-        break;
-      }
-    } catch {
-      break;
-    }
-  }
-};
-
 export const createReconcileFileSetEffect = () => ({
   type: 'reconcileFileSet',
 
   // `previous` is the beforeState of the prior apply (the previously-installed
   // file set). On a greenfield install it is empty and every desired file is
-  // written. On update it drives the non-interactive 3-hash policy ported from
-  // the legacy installer: a file the user modified since we installed it is kept
-  // as-is (no clobber); files dropped from the desired set are removed only when
-  // still unmodified (no proof-less deletion of user content).
+  // written only when no unowned content already exists. On update it drives
+  // the non-interactive 3-hash policy: a file the user modified since we
+  // installed it is kept as-is (no clobber); files dropped from the desired set
+  // are removed only when still unmodified (no proof-less deletion of user content).
   apply({ basePath, desired, previous = [] }) {
     const prevHashByPath = new Map(
       previous.map(({ path, installedHash }) => [path, installedHash]),
@@ -71,34 +47,77 @@ export const createReconcileFileSetEffect = () => ({
     const beforeState = [];
 
     for (const { path, content } of desired) {
-      const absPath = resolveWithinBase(basePath, path);
+      assertLexicalWithinBase(basePath, path);
+      const newHash = hashContent(content);
       const prevHash = prevHashByPath.get(path);
+      const present = existsNoFollow(basePath, path);
 
-      if (prevHash !== undefined && existsSync(absPath)) {
-        const currentHash = hashContent(readFileSync(absPath, 'utf8'));
-        if (currentHash !== prevHash) {
-          // User edited a file we installed — keep theirs (no clobber), and keep
-          // tracking the ORIGINAL installed hash so the file reads as "modified"
-          // forever. revert() only deletes when disk == tracked hash, so the
-          // user's edits survive uninstall too (P3 — no proof-less deletion of
-          // user content; symmetric with a user-modified orphan).
-          beforeState.push({ path, installedHash: prevHash });
-          continue;
+      if (present) {
+        // Symlink leaf or regular file — attempt a no-follow read. Symlink leaf
+        // throws UNSAFE_PATH_RACE from readFileNoFollow.
+        let currentHash;
+        try {
+          currentHash = hashContent(readFileNoFollow(basePath, path, 'utf8'));
+        } catch (err) {
+          if (err instanceof PathSafetyError) throw err;
+          throw err;
+        }
+
+        if (prevHash !== undefined) {
+          const disposition = classifyFile({
+            installedHash: prevHash,
+            currentHash,
+            newHash,
+          });
+          if (disposition === 'already-desired') {
+            beforeState.push({ path, installedHash: newHash });
+            continue;
+          }
+          if (disposition === 'keep-local' || disposition === 'conflict') {
+            // User edit (or conflict): never clobber; keep tracking original hash
+            // so revert will not delete user content (P3).
+            beforeState.push({ path, installedHash: prevHash });
+            continue;
+          }
+          // unchanged → fall through to rewrite (idempotent content match)
+        } else {
+          // Greenfield path: pre-existing content without ownership proof is a conflict.
+          if (currentHash === newHash) {
+            // Identical content may be adopted as already-desired only when it
+            // matches desired bytes — still no ownership proof for deletion, but
+            // install may proceed tracking the hash.
+            beforeState.push({ path, installedHash: newHash });
+            continue;
+          }
+          throw new PathSafetyError(
+            ERR_GREENFIELD_CONFLICT,
+            `Refusing to clobber unowned pre-existing file: "${path}"`,
+            { path },
+          );
         }
       }
 
-      mkdirSync(dirname(absPath), { recursive: true });
-      writeFileSync(absPath, content, 'utf8');
-      beforeState.push({ path, installedHash: hashContent(content) });
+      writeFileNoFollow(basePath, path, content, { atomic: true });
+      beforeState.push({ path, installedHash: newHash });
     }
 
     for (const { path, installedHash } of previous) {
       if (desiredPaths.has(path)) continue;
-      const absPath = resolveWithinBase(basePath, path);
-      if (!existsSync(absPath)) continue;
-      if (hashContent(readFileSync(absPath, 'utf8')) === installedHash) {
-        unlinkSync(absPath);
-        pruneEmptyParents(absPath, basePath);
+      assertLexicalWithinBase(basePath, path);
+      if (!existsNoFollow(basePath, path)) continue;
+      let currentHash;
+      try {
+        currentHash = hashContent(readFileNoFollow(basePath, path, 'utf8'));
+      } catch (err) {
+        if (err instanceof PathSafetyError && err.code === 'UNSAFE_PATH_RACE') {
+          // Do not prune through a symlink leaf.
+          continue;
+        }
+        throw err;
+      }
+      if (currentHash === installedHash) {
+        unlinkNoFollow(basePath, path);
+        pruneEmptyParentsNoFollow(basePath, path);
       }
     }
 
@@ -107,13 +126,21 @@ export const createReconcileFileSetEffect = () => ({
 
   revert({ basePath }, beforeState) {
     for (const { path, installedHash } of beforeState) {
-      const absPath = resolveWithinBase(basePath, path);
-      if (!existsSync(absPath)) continue;
+      assertLexicalWithinBase(basePath, path);
+      if (!existsNoFollow(basePath, path)) continue;
 
-      const currentHash = hashContent(readFileSync(absPath, 'utf8'));
+      let currentHash;
+      try {
+        currentHash = hashContent(readFileNoFollow(basePath, path, 'utf8'));
+      } catch (err) {
+        if (err instanceof PathSafetyError && err.code === 'UNSAFE_PATH_RACE') {
+          continue;
+        }
+        throw err;
+      }
       if (currentHash === installedHash) {
-        unlinkSync(absPath);
-        pruneEmptyParents(absPath, basePath);
+        unlinkNoFollow(basePath, path);
+        pruneEmptyParentsNoFollow(basePath, path);
       }
     }
   },

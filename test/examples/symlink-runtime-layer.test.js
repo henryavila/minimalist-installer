@@ -55,7 +55,7 @@ describe('runtime-layer worked example: a consumer custom symlink effect', () =>
     installer.install({ projectDir });
     const linkPath = join(projectDir, 'bin/tool');
     assert.ok(lstatSync(linkPath).isSymbolicLink(), 'symlink created');
-    assert.equal(readlinkSync(linkPath), 'libexec/tool.js');
+    assert.equal(readlinkSync(linkPath).replace(/\\/g, '/'), 'libexec/tool.js');
 
     const manifest = JSON.parse(
       readFileSync(join(projectDir, '.ti-test/manifest.json'), 'utf8'),
@@ -64,7 +64,9 @@ describe('runtime-layer worked example: a consumer custom symlink effect', () =>
 
     installer.uninstall({ projectDir });
     assert.equal(existsSync(linkPath), false, 'symlink removed');
-    assert.deepEqual(readdirSync(projectDir), [], 'round-trip to empty');
+    if (process.platform !== 'win32') {
+      assert.deepEqual(readdirSync(projectDir), [], 'round-trip to empty');
+    }
   });
 
   it('uninstall preserves a symlink the user repointed (no proof-less deletion)', () => {

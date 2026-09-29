@@ -1,42 +1,12 @@
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  rmdirSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-
-const resolveWithinBase = (basePath, path) => {
-  const base = resolve(basePath);
-  const absPath = join(basePath, path);
-  const resolved = resolve(absPath);
-  if (resolved !== base && !resolved.startsWith(base + sep)) {
-    throw new Error(`Refusing to operate outside basePath: "${path}"`);
-  }
-  return absPath;
-};
-
-const pruneEmptyParents = (absPath, basePath) => {
-  const base = resolve(basePath);
-  let parent = dirname(resolve(absPath));
-
-  while (parent !== base && parent !== '.') {
-    try {
-      if (readdirSync(parent).length === 0) {
-        rmdirSync(parent);
-        parent = dirname(parent);
-      } else {
-        break;
-      }
-    } catch {
-      break;
-    }
-  }
-};
+import {
+  assertLexicalWithinBase,
+  existsNoFollow,
+  readFileNoFollow,
+  writeFileNoFollow,
+  unlinkNoFollow,
+  pruneEmptyParentsNoFollow,
+} from '../../path-safety.js';
 
 const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 
@@ -86,9 +56,9 @@ const dedupeByJson = (items) => {
   return out;
 };
 
-const parseJsonFile = (absPath, path) => {
+const parseJsonFile = (basePath, path) => {
   try {
-    return JSON.parse(readFileSync(absPath, 'utf8'));
+    return JSON.parse(readFileNoFollow(basePath, path, 'utf8'));
   } catch (error) {
     if (error instanceof SyntaxError) {
       throw new Error(`Unable to parse JSON at "${path}": ${error.message}`);
@@ -220,9 +190,9 @@ export const createJsonMergeEffect = () => ({
   type: 'jsonMerge',
 
   apply({ basePath, path, delta, previous }) {
-    const absPath = resolveWithinBase(basePath, path);
-    const fileCreated = !existsSync(absPath);
-    const target = fileCreated ? {} : parseJsonFile(absPath, path);
+    assertLexicalWithinBase(basePath, path);
+    const fileCreated = !existsNoFollow(basePath, path);
+    const target = fileCreated ? {} : parseJsonFile(basePath, path);
 
     if (!isPlainObject(target)) {
       throw new Error(`JSON merge target must be an object at "${path}"`);
@@ -235,8 +205,7 @@ export const createJsonMergeEffect = () => ({
     const createdContainers = [];
     mergeObject({ target, delta, path: [], inserts, createdContainers });
 
-    mkdirSync(dirname(absPath), { recursive: true });
-    writeFileSync(absPath, JSON.stringify(target, null, 2) + '\n', 'utf8');
+    writeFileNoFollow(basePath, path, JSON.stringify(target, null, 2) + '\n', { atomic: true });
 
     // Carry forward ownership from a prior install. The Driver threads the prior
     // before-state of this effect (same type + occurrence) as `previous`. On the
@@ -270,10 +239,10 @@ export const createJsonMergeEffect = () => ({
     // Prefer the journaled path (Driver path); fall back to ctx.path for direct
     // callers that still pass it.
     const path = beforeState?.path ?? ctx.path;
-    const absPath = resolveWithinBase(basePath, path);
-    if (!existsSync(absPath)) return;
+    assertLexicalWithinBase(basePath, path);
+    if (!existsNoFollow(basePath, path)) return;
 
-    const target = parseJsonFile(absPath, path);
+    const target = parseJsonFile(basePath, path);
 
     for (const insert of [...beforeState.inserts].reverse()) {
       if (insert.kind === 'key') {
@@ -295,11 +264,11 @@ export const createJsonMergeEffect = () => ({
     pruneCreatedContainers(target, beforeState.createdContainers);
 
     if (beforeState.fileCreated && isEmptyRoot(target)) {
-      unlinkSync(absPath);
-      pruneEmptyParents(absPath, basePath);
+      unlinkNoFollow(basePath, path);
+      pruneEmptyParentsNoFollow(basePath, path);
       return;
     }
 
-    writeFileSync(absPath, JSON.stringify(target, null, 2) + '\n', 'utf8');
+    writeFileNoFollow(basePath, path, JSON.stringify(target, null, 2) + '\n', { atomic: true });
   },
 });
