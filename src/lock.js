@@ -50,15 +50,11 @@ export function lockFileName(identity) {
 
 /** Best-effort: drop an empty lock dir (and empty `.minimalist-installer` parent). */
 function pruneEmptyLockRoot(lockRoot) {
-  try {
-    if (readdirSync(lockRoot).length !== 0) return;
-    rmdirSync(lockRoot);
-  } catch {
-    return;
-  }
   const parent = dirname(lockRoot);
   if (!parent.toLowerCase().endsWith('.minimalist-installer')) return;
   try {
+    if (readdirSync(lockRoot).length !== 0) return;
+    rmdirSync(lockRoot);
     if (readdirSync(parent).length === 0) rmdirSync(parent);
   } catch { /* ignore */ }
 }
@@ -126,6 +122,10 @@ export function acquireLocks(identities, opts = {}) {
           held.push(identity);
           break;
         } catch (err) {
+          if (err.code === 'ENOENT') {
+            mkdirSync(lockRoot, { recursive: true });
+            continue;
+          }
           if (err.code !== 'EEXIST') throw err;
           // Stale lock recovery: dead PID → steal. Never unlink on parse failure
           // alone — a concurrent holder may still be writing the lock payload.
