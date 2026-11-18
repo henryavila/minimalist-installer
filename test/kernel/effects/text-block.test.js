@@ -150,4 +150,131 @@ describe('textBlock effect', () => {
     assert.throws(() => effect.apply({ ...args, path: '../x' }), /outside basePath/);
     assert.throws(() => effect.revert(args, { path: '../x' }), /outside basePath/);
   });
+
+  for (const mismatch of [{ path: 'other.md' }, { id: 'other' }]) {
+    it(`ignores previous with mismatched ${Object.keys(mismatch)[0]}`, () => {
+      const previous = { ...effect.apply(args), ...mismatch, prefix: '\n\n' };
+      writeFileSync(file, '\n\n' + segment);
+      const state = effect.apply({ ...args, previous });
+      assert.equal(state.fileCreated, false);
+      assert.equal(state.prefix, '');
+      effect.revert(args, state);
+      assert.equal(read(file), '\n\n');
+    });
+  }
+
+  for (const markers of [{ begin: '', end }, { begin, end: '' },
+    { begin: ' \t ', end }, { begin, end: ' \t ' }]) {
+    it(`rejects empty markers ${JSON.stringify(markers)}`, () => {
+      writeFileSync(file, 'unchanged');
+      assert.throws(() => effect.apply({ ...args, markers }), /markers/);
+      assert.equal(read(file), 'unchanged');
+    });
+  }
+
+  it('replaces an end marker at EOF and reverts to surrounding bytes', () => {
+    writeFileSync(file, 'before\n' + segment.trimEnd());
+    const state = effect.apply(args);
+    assert.equal(read(file), 'before\n' + segment);
+    effect.revert(args, state);
+    assert.equal(read(file), 'before\n');
+  });
+
+  it('rejects an unmatched begin marker at EOF without writing', () => {
+    const original = 'before\n' + begin;
+    writeFileSync(file, original);
+    assert.throws(() => effect.apply(args), /a\.md/);
+    assert.equal(read(file), original);
+  });
+
+  it('carries file creation ownership through a second apply', () => {
+    const previous = effect.apply(args);
+    const state = effect.apply({ ...args, content: 'updated', previous });
+    assert.equal(state.fileCreated, true);
+    effect.revert(args, state);
+    assert.equal(existsSync(file), false);
+  });
+
+  it('rejects identical markers', () => {
+    assert.throws(() => effect.apply({ ...args, markers: { begin, end: begin } }), /markers/);
+    assert.equal(existsSync(file), false);
+  });
+
+  it('rejects content differing from either marker only by a trailing CR', () => {
+    for (const marker of [begin, end]) {
+      assert.throws(() => effect.apply({ ...args, content: marker + '\r' }), /marker line/);
+    }
+    assert.equal(existsSync(file), false);
+  });
+
+  const markers = { begin: '# begin x', end: '# end x' };
+  const migrated = '# begin x\nnew\n# end x\n';
+  for (const old of ['unedited', 'edited', 'gone']) {
+    it(`migrates markers when the old block is ${old}`, () => {
+      writeFileSync(file, 'before');
+      const previous = effect.apply(args);
+      if (old === 'edited') writeFileSync(file, read(file).replace('ours', 'mine'));
+      if (old === 'gone') writeFileSync(file, 'before');
+      const retained = old === 'edited' ? 'before\n\n' + segment.replace('ours', 'mine') : 'before';
+      const state = effect.apply({ ...args, markers, content: 'new', previous });
+      assert.equal(read(file), retained + (old === 'edited' ? '\n' : '\n\n') + migrated);
+      effect.revert(args, state);
+      assert.equal(read(file), retained);
+    });
+  }
+
+  for (const order of ['old-first', 'new-first']) {
+    for (const prefixMatches of [true, false]) {
+      it(`migrates coexisting blocks ${order}, prefixMatches=${prefixMatches}`, () => {
+        writeFileSync(file, 'before');
+        const previous = effect.apply(args);
+        const spacing = prefixMatches ? '\n\n' : '\n';
+        const old = spacing + segment;
+        const newer = '# begin x\nstale\n# end x\n';
+        writeFileSync(file, 'before' + (order === 'old-first' ? old + 'middle\n' + newer : '\n' + newer + 'middle' + old) + 'after');
+        const state = effect.apply({ ...args, markers, content: 'new', previous });
+        const keptSpacing = prefixMatches ? '' : spacing;
+        const expected = 'before' + (order === 'old-first' ? keptSpacing + 'middle\n' + migrated : '\n' + migrated + 'middle' + keptSpacing) + 'after';
+        assert.equal(read(file), expected);
+        assert.equal(state.prefix, '');
+        effect.revert(args, state);
+        assert.equal(read(file), expected.replace(migrated, ''));
+      });
+    }
+  }
+
+
+  for (const changed of [{ begin: '# begin x', end }, { begin, end: '# end x' }]) {
+    it(`migrates a single changed marker ${JSON.stringify(changed)}`, () => {
+      writeFileSync(file, 'before');
+      const previous = effect.apply(args);
+      writeFileSync(file, read(file) + 'after');
+      const state = effect.apply({ ...args, markers: changed, previous });
+      assert.equal(read(file), `before\n\n${changed.begin}\nours\n${changed.end}\nafter`);
+      effect.revert(args, state);
+      assert.equal(read(file), 'beforeafter');
+    });
+  }
+
+  it('keeps an edited old block when new markers already exist', () => {
+    const previous = effect.apply(args);
+    const edited = segment.replace('ours', 'mine');
+    writeFileSync(file, edited + '\n# begin x\nstale\n# end x\n');
+    const state = effect.apply({ ...args, markers, content: 'new', previous });
+    assert.equal(state.prefix, '');
+    assert.equal(read(file), edited + '\n' + migrated);
+    effect.revert(args, state);
+    assert.equal(read(file), edited + '\n');
+  });
+
+  it('carries created-file ownership when old markers are gone during migration', () => {
+    const previous = effect.apply(args);
+    writeFileSync(file, '');
+    const state = effect.apply({ ...args, markers, content: 'new', previous });
+    assert.equal(state.fileCreated, true);
+    assert.equal(read(file), migrated);
+    effect.revert(args, state);
+    assert.equal(existsSync(file), false);
+  });
+
 });

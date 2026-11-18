@@ -100,7 +100,9 @@ import {
   file it created once emptied.
 - **`createTextBlockEffect()`** — managed delimited text block; revert removes only
   the unedited block and its inserted spacing, preserving surrounding bytes; deletes
-  a file it created once emptied.
+  a file it created once emptied. Known limitation: if two blocks share an
+  installer-created file and a later install reverses their order, uninstall can
+  leave a zero-byte file because `fileCreated` belongs to one effect.
 - **`createRefcountEffect()`** — per-owner marker directory validated against each
   owner's manifest; reclaims a shared artifact only when the last owner leaves.
   Crash-safe (no decrement step).

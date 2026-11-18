@@ -43,7 +43,7 @@ export const createTextBlockEffect = () => ({
     const { begin, end } = markers ?? {
       begin: `<!-- BEGIN ${id} -->`, end: `<!-- END ${id} -->`,
     };
-    if ([begin, end].some((line) => typeof line !== 'string' || /[\r\n]/.test(line))
+    if ([begin, end].some((line) => typeof line !== 'string' || !line.trim() || /[\r\n]/.test(line))
       || begin === end) {
       throw new Error('textBlock markers must be distinct single-line strings');
     }
@@ -53,16 +53,43 @@ export const createTextBlockEffect = () => ({
     })) {
       throw new Error('textBlock content must not contain a marker line');
     }
+    // The Driver may fall back to another effect's positional before-state.
+    if (previous?.path !== path || previous?.id !== id) previous = undefined;
+
     const segment = `${begin}\n${content.replace(/[\r\n]+$/, '')}\n${end}\n`;
     const created = !existsNoFollow(basePath, path);
-    const bytes = created ? Buffer.alloc(0) : readFileNoFollow(basePath, path, null);
-    const block = findBlock(bytes, begin, end);
+    let bytes = created ? Buffer.alloc(0) : readFileNoFollow(basePath, path, null);
+    let block;
+    let migrated = false;
+    if (previous && (previous.begin !== begin || previous.end !== end)) {
+      const old = findBlock(bytes, previous.begin, previous.end);
+      if (old?.malformed) throw new Error(`Malformed textBlock markers at "${path}"`);
+      if (old && hashContent(bytes.subarray(old.start, old.end)) === previous.segmentHash) {
+        // Search without the old segment, including when only one marker changed.
+        const withoutOld = Buffer.concat([bytes.subarray(0, old.start), bytes.subarray(old.end)]);
+        const newer = findBlock(withoutOld, begin, end);
+        if (newer?.malformed) throw new Error(`Malformed textBlock markers at "${path}"`);
+        if (newer) {
+          const spacing = Buffer.from(previous.prefix);
+          const start = old.start >= spacing.length
+            && bytes.subarray(old.start - spacing.length, old.start).equals(spacing)
+            ? old.start - spacing.length : old.start;
+          bytes = Buffer.concat([bytes.subarray(0, start), bytes.subarray(old.end)]);
+          block = findBlock(bytes, begin, end);
+        } else {
+          block = old;
+          migrated = true;
+        }
+      }
+    }
+    block ??= findBlock(bytes, begin, end);
     if (block?.malformed) throw new Error(`Malformed textBlock markers at "${path}"`);
 
     let prefix;
     let result;
     if (block) {
-      prefix = previous?.prefix ?? '';
+      prefix = migrated || (previous?.begin === begin && previous?.end === end)
+        ? (previous.prefix ?? '') : '';
       result = Buffer.concat([
         bytes.subarray(0, block.start), Buffer.from(segment), bytes.subarray(block.end),
       ]);
