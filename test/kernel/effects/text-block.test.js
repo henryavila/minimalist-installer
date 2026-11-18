@@ -48,6 +48,50 @@ describe('textBlock effect', () => {
     });
   }
 
+  for (const [name, original] of [
+    ['trailing newline', `${begin}\noriginal\n${end}\n`],
+    ['no trailing newline', `${begin}\noriginal\n${end}`],
+    ['CRLF', `${begin}\r\noriginal\r\n${end}\r\n`],
+    ['surrounding text', `before\n\n${begin}\noriginal\n${end}\nafter`],
+  ]) {
+    it(`restores an adopted block with ${name} byte-for-byte`, () => {
+      const bytes = Buffer.from(original);
+      writeFileSync(file, bytes);
+      const state = effect.apply(args);
+      effect.revert(args, state);
+      assert.deepEqual(readFileSync(file), bytes);
+      assert.equal(state.prefix, '');
+      assert.equal(state.fileCreated, false);
+      const start = bytes.indexOf(begin);
+      assert.equal(state.replaced, bytes.subarray(start, start + original.slice(start).indexOf(end) + end.length
+        + (original.endsWith('after') || original.endsWith('\n') ? (name === 'CRLF' ? 2 : 1) : 0)).toString('base64'));
+    });
+  }
+
+  for (const migrate of [false, true]) {
+    it(`restores adopted bytes after updating, migrate=${migrate}`, () => {
+      const original = Buffer.from(`before\n${begin}\r\noriginal\r\n${end}`);
+      writeFileSync(file, original);
+      const previous = effect.apply(args);
+      const state = effect.apply({ ...args, content: 'updated', previous,
+        ...(migrate ? { markers: { begin: '# begin', end: '# end' } } : {}) });
+      assert.match(read(file), /updated/);
+      effect.revert(args, state);
+      assert.deepEqual(readFileSync(file), original);
+      assert.equal(state.replaced, previous.replaced);
+    });
+  }
+
+  it('preserves manual edits to an adopted block', () => {
+    writeFileSync(file, `${begin}\noriginal\n${end}\n`);
+    const state = effect.apply(args);
+    const edited = Buffer.from(segment.replace('ours', 'manual edit'));
+    writeFileSync(file, edited);
+    effect.revert(args, state);
+    assert.deepEqual(readFileSync(file), edited);
+    assert.equal(typeof state.replaced, 'string');
+  });
+
   it('preserves content before and third-party content appended after the block', () => {
     writeFileSync(file, 'before');
     const state = effect.apply(args);
@@ -159,7 +203,7 @@ describe('textBlock effect', () => {
       assert.equal(state.fileCreated, false);
       assert.equal(state.prefix, '');
       effect.revert(args, state);
-      assert.equal(read(file), '\n\n');
+      assert.equal(read(file), '\n\n' + segment);
     });
   }
 
@@ -172,12 +216,12 @@ describe('textBlock effect', () => {
     });
   }
 
-  it('replaces an end marker at EOF and reverts to surrounding bytes', () => {
+  it('replaces an end marker at EOF and restores the original block', () => {
     writeFileSync(file, 'before\n' + segment.trimEnd());
     const state = effect.apply(args);
     assert.equal(read(file), 'before\n' + segment);
     effect.revert(args, state);
-    assert.equal(read(file), 'before\n');
+    assert.equal(read(file), 'before\n' + segment.trimEnd());
   });
 
   it('rejects an unmatched begin marker at EOF without writing', () => {

@@ -87,6 +87,8 @@ export const createTextBlockEffect = () => ({
 
     let prefix;
     let result;
+    const replaced = previous ? previous.replaced
+      : block ? bytes.subarray(block.start, block.end).toString('base64') : undefined;
     if (block) {
       prefix = migrated || (previous?.begin === begin && previous?.end === end)
         ? (previous.prefix ?? '') : '';
@@ -105,6 +107,7 @@ export const createTextBlockEffect = () => ({
       fileCreated: created || Boolean(previous?.fileCreated),
       prefix,
       segmentHash: hashContent(segment),
+      ...(replaced !== undefined ? { replaced } : {}),
     };
   },
 
@@ -118,11 +121,20 @@ export const createTextBlockEffect = () => ({
     if (!block || block.malformed) return;
     if (hashContent(bytes.subarray(block.start, block.end)) !== beforeState.segmentHash) return;
 
-    const prefix = Buffer.from(beforeState.prefix);
-    const start = block.start >= prefix.length
-      && bytes.subarray(block.start - prefix.length, block.start).equals(prefix)
-      ? block.start - prefix.length : block.start;
-    const result = Buffer.concat([bytes.subarray(0, start), bytes.subarray(block.end)]);
+    let result;
+    if (beforeState.replaced !== undefined) {
+      result = Buffer.concat([
+        bytes.subarray(0, block.start),
+        Buffer.from(beforeState.replaced, 'base64'),
+        bytes.subarray(block.end),
+      ]);
+    } else {
+      const prefix = Buffer.from(beforeState.prefix);
+      const start = block.start >= prefix.length
+        && bytes.subarray(block.start - prefix.length, block.start).equals(prefix)
+        ? block.start - prefix.length : block.start;
+      result = Buffer.concat([bytes.subarray(0, start), bytes.subarray(block.end)]);
+    }
     if (beforeState.fileCreated && result.length === 0) {
       unlinkNoFollow(basePath, path);
       pruneEmptyParentsNoFollow(basePath, path);

@@ -76,14 +76,14 @@ describe('driver round-trip — built-in textBlock', () => {
   it('does not inherit file ownership from the positional Driver fallback', () => {
     root = mkdtempSync(join(tmpdir(), 'mi-text-driver-'));
     const b = join(root, 'b.md');
-    writeFileSync(b, '<!-- BEGIN y -->\nexisting\n<!-- END y -->\n');
+    const original = Buffer.from('<!-- BEGIN y -->\nexisting\n<!-- END y -->\n');
+    writeFileSync(b, original);
     make([{ path: 'a.md', id: 'x' }]).install({ projectDir: root });
     const next = make([{ path: 'b.md', id: 'y' }, { path: 'a.md', id: 'x' }]);
     next.install({ projectDir: root });
     next.uninstall({ projectDir: root });
-    // Existing matching blocks are managed, not snapshotted: removal leaves an existing empty file.
     assert.equal(existsSync(b), true);
-    assert.deepEqual(readFileSync(b), Buffer.alloc(0));
+    assert.deepEqual(readFileSync(b), original);
     assert.equal(existsSync(join(root, 'a.md')), false);
   });
 

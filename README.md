@@ -99,7 +99,8 @@ import {
   inserted delta (never a snapshot), preserving third-party content; deletes a
   file it created once emptied.
 - **`createTextBlockEffect()`** — managed delimited text block; revert removes only
-  the unedited block and its inserted spacing, preserving surrounding bytes; deletes
+  the unedited block and its inserted spacing, preserving surrounding bytes; a
+  pre-existing block with the same markers is restored on revert; deletes
   a file it created once emptied. Known limitation: if two blocks share an
   installer-created file and a later install reverses their order, uninstall can
   leave a zero-byte file because `fileCreated` belongs to one effect.
