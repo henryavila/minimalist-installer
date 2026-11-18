@@ -45,7 +45,7 @@ describe('defineInstaller (two-tier config)', () => {
 
     assert.deepEqual(
       installer.registry.list().sort(),
-      ['jsonMerge', 'legacyPrune', 'reconcileFileSet', 'refcount'],
+      ['jsonMerge', 'legacyPrune', 'reconcileFileSet', 'refcount', 'textBlock'],
     );
   });
 

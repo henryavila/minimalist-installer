@@ -48,8 +48,8 @@ npm install @henryavila/minimalist-installer
 **v0.1.0.** The engine core, extracted from `@henryavila/atomic-skills` (its first
 consumer) and now published to npm.
 
-Delivered: the effect kernel + journal + 3-hash file reconciler + the three
-built-in non-file effects (`json-merge`, `refcount`, `legacy-prune`), each with a
+Delivered: the effect kernel + journal + 3-hash file reconciler + the four
+built-in non-file effects (`json-merge`, `text-block`, `refcount`, `legacy-prune`), each with a
 round-trip / adversarial test suite; the **Provider contract** + a reference
 `createFileSetProvider()`; the **Driver** (`install` / `uninstall` / **update**,
 structural round-trip, no-clobber on user edits); **`defineInstaller`** (the
@@ -70,6 +70,7 @@ import {
   createEffectRegistry,
   createReconcileFileSetEffect,
   createJsonMergeEffect,
+  createTextBlockEffect,
   createRefcountEffect,
   createLegacyPruneEffect,
   recordEffect,
@@ -81,7 +82,7 @@ import {
 
 - **`defineInstaller({ config, providers, effects })`** — two-tier config factory:
   declarative `config` (data; engine owns `manifestDir`, rest is pass-through to
-  providers) + code-tier `providers`/`effects` (auto-registers the 4 built-ins).
+  providers) + code-tier `providers`/`effects` (auto-registers the 5 built-ins).
   Returns `{ install, uninstall, registry }` bound to `config`.
 - **`createDriver({ registry, providers, manifestDir })`** — the lower-level
   consumer-agnostic orchestrator: `install(config, { projectDir })` applies the
@@ -97,6 +98,9 @@ import {
 - **`createJsonMergeEffect()`** — additive JSON merge; revert subtracts only the
   inserted delta (never a snapshot), preserving third-party content; deletes a
   file it created once emptied.
+- **`createTextBlockEffect()`** — managed delimited text block; revert removes only
+  the unedited block and its inserted spacing, preserving surrounding bytes; deletes
+  a file it created once emptied.
 - **`createRefcountEffect()`** — per-owner marker directory validated against each
   owner's manifest; reclaims a shared artifact only when the last owner leaves.
   Crash-safe (no decrement step).

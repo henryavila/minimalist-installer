@@ -1,6 +1,7 @@
 import { createEffectRegistry } from './kernel/effect.js';
 import { createReconcileFileSetEffect } from './kernel/reconciler.js';
 import { createJsonMergeEffect } from './kernel/effects/json-merge.js';
+import { createTextBlockEffect } from './kernel/effects/text-block.js';
 import { createRefcountEffect } from './kernel/effects/refcount.js';
 import { createLegacyPruneEffect } from './kernel/effects/legacy-prune.js';
 import { createDriver } from './driver.js';
@@ -13,11 +14,12 @@ import { createDriver } from './driver.js';
 //     hatch: a consumer registers a new effect type by adding it to `effects`,
 //     and a new planner by adding it to `providers` — no kernel changes).
 //
-// The 4 built-in effect types are always registered (P4); consumer `effects`
+// The 5 built-in effect types are always registered (P4); consumer `effects`
 // extend the catalog. Returns an installer bound to `config`.
 const builtinEffects = () => [
   createReconcileFileSetEffect(),
   createJsonMergeEffect(),
+  createTextBlockEffect(),
   createRefcountEffect(),
   createLegacyPruneEffect(),
 ];

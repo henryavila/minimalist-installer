@@ -55,6 +55,8 @@ export function stableEffectId(type, args = {}) {
       return 'reconcileFileSet';
     case 'jsonMerge':
       return `jsonMerge:${args.path ?? ''}`;
+    case 'textBlock':
+      return `textBlock:${args.path ?? ''}#${args.id ?? ''}`;
     case 'refcount':
       return `refcount:${args.ownersDir ?? ''}:${args.ownerId ?? ''}`;
     case 'legacyPrune':
