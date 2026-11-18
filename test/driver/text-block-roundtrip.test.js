@@ -109,7 +109,6 @@ describe('driver round-trip — built-in textBlock', () => {
     assert.deepEqual(readFileSync(join(root, 'a.md')), Buffer.alloc(0));
   });
 
-
   it('preserves surrounding bytes when a new block receives positional previous', () => {
     root = mkdtempSync(join(tmpdir(), 'mi-text-driver-'));
     const file = join(root, 'b.md');

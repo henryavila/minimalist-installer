@@ -54,6 +54,7 @@ it('R03 removes only the appended migration after a manual edit', () => {
   const edited = Buffer.from(segment(defaults, 'hand edit'));
   writeFileSync(join(root, 'a.md'), edited);
   const next = install('x', custom);
+  assert.deepEqual(read(), Buffer.concat([edited, Buffer.from('\n' + segment(custom, 'ours'))]));
   next.uninstall({ projectDir: root });
   assert.deepEqual(read(), edited);
 });
@@ -67,6 +68,7 @@ for (const initial of ['absent', 'plain', 'adopted']) {
             : Buffer.from('head\r\n' + (initial === 'adopted' ? segment(defaults, 'original') : '') + 'tail\n');
           setup(original);
           install();
+          assert.ok(read().includes(Buffer.from(segment(defaults, 'ours'))));
           let expected = original;
           if (edit === 'outside') {
             writeFileSync(join(root, 'a.md'), Buffer.concat([read(), Buffer.from('user suffix\r\n')]));
@@ -78,7 +80,12 @@ for (const initial of ['absent', 'plain', 'adopted']) {
           const markers = markerChange ? custom : defaults;
           const id = idChange ? 'y' : 'x';
           install(id, markers, 'second');
-          const next = install(idChange ? 'z' : id, markers, 'third');
+          assert.ok(read().includes(Buffer.from(segment(markers,
+            edit === 'inside' && !markerChange ? 'hand edit' : 'second'))));
+          const thirdMarkers = markerChange ? { begin: '# third begin', end: '# third end' } : markers;
+          const next = install(idChange ? 'z' : id, thirdMarkers, 'third');
+          assert.ok(read().includes(Buffer.from(segment(thirdMarkers,
+            edit === 'inside' && !markerChange ? 'hand edit' : 'third'))));
           next.uninstall({ projectDir: root });
           if (expected === undefined) assert.equal(existsSync(join(root, 'a.md')), false);
           else assert.deepEqual(read(), expected);
