@@ -10,7 +10,7 @@ import {
 
 // Keep byte offsets so even non-UTF8 bytes outside the block survive unchanged.
 // A segment includes the end marker's newline, when present.
-const findBlock = (bytes, begin, end, state) => {
+const findBlock = (bytes, begin, end) => {
   const begins = [];
   const ends = [];
   const beginBytes = Buffer.from(begin);
@@ -21,14 +21,14 @@ const findBlock = (bytes, begin, end, state) => {
     const next = newline === -1 ? bytes.length : newline + 1;
     const line = bytes.subarray(start, newline !== -1 && bytes[stop - 1] === 13 ? stop - 1 : stop);
     if (line.equals(beginBytes)) begins.push({ start, next });
-    if (line.equals(endBytes)) ends.push({ start, next, coreEnd: stop });
+    if (line.equals(endBytes)) ends.push({ start, next });
     start = next;
   }
   if (begins.length === 0 && ends.length === 0) return null;
   if (begins.length !== 1 || ends.length !== 1 || begins[0].start >= ends[0].start) {
     return { malformed: true };
   }
-  return { start: begins[0].start, end: state?.borrowedTerminator ? ends[0].coreEnd : ends[0].next };
+  return { start: begins[0].start, end: ends[0].next };
 };
 
 // New journals retain the inserted bytes; 0e12991 journals retain their hash.
@@ -81,7 +81,7 @@ const prepare = (args, input, peers = []) => {
   let ownership;
   let fresh = args[freshInstall];
   if (previous) {
-    const old = findBlock(bytes, previous.begin, previous.end, previous);
+    const old = findBlock(bytes, previous.begin, previous.end);
     if (old?.malformed) throw new Error(`Malformed textBlock markers at "${path}"`);
     const sameIdentity = previous.id === id && previous.begin === begin && previous.end === end;
     const owned = old && ownsBlock(bytes, old, previous);
@@ -98,23 +98,22 @@ const prepare = (args, input, peers = []) => {
   if (block?.malformed) throw new Error(`Malformed textBlock markers at "${path}"`);
   if (fresh && block) throw new Error(`textBlock fresh install markers already present at "${path}"`);
 
-  // A peer's prefix may begin at this end marker. Those bytes are never
-  // adopted or hashed by this block, even when they terminate its line.
-  let borrowedTerminator = ownership?.borrowedTerminator;
+  // A newly adopted EOF block may have acquired a newline from an earlier
+  // append. Preserve that peer's separator outside the substitution, and add
+  // our own complete end-marker line. Neither journal then borrows bytes.
   if (block && !ownership) {
     for (const peer of peers) {
       if (peer.path !== path || !peer.prefix) continue;
-      const adjacent = findBlock(bytes, peer.begin, peer.end, peer);
+      const adjacent = findBlock(bytes, peer.begin, peer.end);
       const prefix = Buffer.from(peer.prefix);
       if (adjacent && !adjacent.malformed
+        && adjacent.start >= prefix.length
         && bytes.subarray(adjacent.start - prefix.length, adjacent.start).equals(prefix)
         && adjacent.start - prefix.length === block.end - 1) {
         block = { ...block, end: block.end - 1 };
-        borrowedTerminator = true;
       }
     }
   }
-  const writtenSegment = borrowedTerminator ? segment.slice(0, -1) : segment;
   let prefix;
   let result;
   const replaced = ownership ? ownership.replaced
@@ -122,7 +121,7 @@ const prepare = (args, input, peers = []) => {
   if (block) {
     prefix = ownership?.prefix ?? '';
     result = Buffer.concat([
-      bytes.subarray(0, block.start), Buffer.from(writtenSegment), bytes.subarray(block.end),
+      bytes.subarray(0, block.start), Buffer.from(segment), bytes.subarray(block.end),
     ]);
   } else {
     prefix = bytes.length === 0 || bytes.subarray(-2).equals(Buffer.from('\n\n'))
@@ -137,9 +136,8 @@ const prepare = (args, input, peers = []) => {
     path, id, begin, end,
     fileCreated: created || Boolean(previous?.fileCreated) || Boolean(args[createdFile]),
     prefix,
-    inserted: Buffer.from(prefix + writtenSegment).toString('base64'),
-    segmentHash: hashContent(writtenSegment),
-    ...(borrowedTerminator ? { borrowedTerminator: true } : {}),
+    inserted: Buffer.from(prefix + segment).toString('base64'),
+    segmentHash: hashContent(segment),
     ...(replaced !== undefined ? { replaced } : {}),
   } };
 };
@@ -169,7 +167,7 @@ export const prepareTextBlockPlan = (entries, priorStates, basePath) => {
     for (const state of all.filter((s) => priorStates.includes(s)
       || !priorStates.some((old) => old.path === s.path
         && [old.begin, old.end].some((m) => m === s.begin || m === s.end)))) {
-      const block = findBlock(bytes ?? Buffer.alloc(0), state.begin, state.end, state);
+      const block = findBlock(bytes ?? Buffer.alloc(0), state.begin, state.end);
       if (block?.malformed) throw new Error(`Malformed textBlock markers at "${args.path}"`);
       if (block && ranges.some((r) => r.start !== block.start && r.start < block.end && block.start < r.end)) {
         throw new Error(`Nested textBlock markers at "${args.path}"`);
@@ -185,7 +183,7 @@ export const prepareTextBlockPlan = (entries, priorStates, basePath) => {
     const args = entries.find((a) => a.path === state.path) ?? { basePath, path: state.path };
     const [key, bytes] = read(args);
     if (bytes === null) continue;
-    const block = findBlock(bytes, state.begin, state.end, state);
+    const block = findBlock(bytes, state.begin, state.end);
     if (block?.malformed) throw new Error(`Malformed textBlock markers at "${state.path}"`);
     if (block && ownsBlock(bytes, block, state)) {
       const result = restoreBlock(bytes, block, state);
@@ -204,7 +202,7 @@ export const prepareTextBlockPlan = (entries, priorStates, basePath) => {
     const next = { ...args,
       previous: retained.has(args.previous) ? args.previous : undefined,
       [freshInstall]: fresh,
-      [createdFile]: priorStates.some((s) => s.path === args.path && s.fileCreated),
+      [createdFile]: [...priorStates, ...peers].some((s) => s.path === args.path && s.fileCreated),
       [textBlockPeers]: [...peers],
     };
     const result = prepare(next, bytes, peers);
@@ -229,7 +227,9 @@ export const prepareTextBlockPlan = (entries, priorStates, basePath) => {
  * A deliberately narrow, byte-exact textBlock contract:
  * 1. Markers match whole lines only, excluding LF or CRLF, never prefixes.
  * 2. An absent block is appended; inserted bytes include every separator.
- * 3. Only the first install may adopt one existing block, saving its exact bytes.
+ * 3. The first install of an effect id may adopt one existing block, even on a
+ *    later installer run, saving its exact bytes. Every block owns its complete
+ *    end-marker line; revert removes any terminator added to an adopted EOF block.
  * 4. Same id and markers update in place, keeping the first before-state.
  * 5. Changed id/markers undo the old substitution, then install fresh; existing
  *    target marker lines refuse the plan. No adoption or ownership transfer.
@@ -239,7 +239,11 @@ export const prepareTextBlockPlan = (entries, priorStates, basePath) => {
  * 7. The Driver validates the whole plan before changing files or the manifest.
  * 8. Hand-edited, missing or broken blocks are left alone on revert (no-op),
  *    as in the original card; updates also preserve hand-edited block content.
+ *    Broken markers refuse later installs, including dropping the broken effect
+ *    or updating an unrelated effect.
  * 9. Legacy 0e12991 journal entries still revert using their recorded hashes.
+ * Known limit: path-string collision checks do not detect case aliases such as
+ * a.md and A.md on case-insensitive filesystems.
  */
 export const createTextBlockEffect = () => ({
   type: 'textBlock',
@@ -258,7 +262,7 @@ export const createTextBlockEffect = () => ({
     assertLexicalWithinBase(basePath, path);
     if (!existsNoFollow(basePath, path)) return;
     const bytes = readFileNoFollow(basePath, path, null);
-    const block = findBlock(bytes, beforeState.begin, beforeState.end, beforeState);
+    const block = findBlock(bytes, beforeState.begin, beforeState.end);
     if (!block || block.malformed) return;
     if (!ownsBlock(bytes, block, beforeState)) return;
 

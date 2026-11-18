@@ -53,9 +53,7 @@ for (const originalHead of ['', 'head', 'head\n', 'head\r\n']) {
           let expected = original;
           for (const id of order) {
             if (id === 'x' && old) {
-              // A preceding append owns the newline after the original EOF marker.
-              const borrowed = adoption === 'EOF' && order[0] !== 'x';
-              expected = expected.replace(old, borrowed ? block('x', 'ours').slice(0, -1) : block('x', 'ours'));
+              expected = expected.replace(old, block('x', 'ours'));
             } else expected = append(expected, block(id, 'ours'));
           }
           run(order.map((id) => ({ id })));
@@ -76,7 +74,7 @@ for (const originalHead of ['', 'head', 'head\n', 'head\r\n']) {
           let installed = original;
           for (const id of order) {
             if (id === 'x' && old) installed = installed.replace(old,
-              adoption === 'EOF' && order[0] !== 'x' ? block('x', 'ours').slice(0, -1) : block('x', 'ours'));
+              block('x', 'ours'));
             else installed = append(installed, block(id, 'ours'));
           }
           exact(installed);
@@ -107,7 +105,7 @@ for (const probe of ['P1', 'P2', 'P3', 'P4', 'P7']) {
       exact(adopted ? append(original, block('y', 'ours')) : plan.reduce((s, { id }) => append(s, block(id, 'ours')), original));
       if (adopted) {
         run([{ id: 'x' }, { id: 'y' }]);
-        exact(block('x', 'ours').slice(0, -1) + '\n\n' + block('y', 'ours'));
+        exact(block('x', 'ours') + '\n\n' + block('y', 'ours'));
       }
       const target = { begin: '# begin', end: '# end' };
       const extra = (probe === 'P4' ? '# begin EXTRA\n' : '') + block('target', 'user block', target);
@@ -215,7 +213,7 @@ for (const order of permutations(['x', 'y', 'z'])) {
       let xReplaced = '';
       for (const id of order) {
         if (id === 'x' && adopted) {
-          xInserted = order[0] === 'x' ? block('x', 'ours') : block('x', 'ours').slice(0, -1);
+          xInserted = block('x', 'ours');
           xReplaced = original;
           initial = initial.replace(original, xInserted);
         } else {
@@ -384,5 +382,80 @@ for (const reverse of [false, true]) {
     assert.throws(() => run(reverse ? plan.reverse() : plan), /symlink/i);
     assert.deepEqual(read(), bytes);
     assert.deepEqual(journal(), before);
+  });
+}
+
+for (const eol of ['\n', '\r\n']) {
+  for (const mode of ['recreated-append', 'removed-append', 'recreated-control']) {
+    it(`R6 T1 independent end-marker terminator ${mode} eol=${JSON.stringify(eol)}`, () => {
+      const original = block('x', 'original').trimEnd().replaceAll('\n', eol);
+      setup(original);
+      run([{ id: 'y', content: 'y1' }, { id: 'x' }]);
+      exact(block('x', 'ours') + '\n\n' + block('y', 'y1'));
+      const states = JSON.parse(journal()).effects.map(({ beforeState }) => beforeState);
+      assert.deepEqual(Buffer.from(states.find((s) => s.id === 'x').inserted, 'base64'), Buffer.from(block('x', 'ours')));
+      assert.deepEqual(Buffer.from(states.find((s) => s.id === 'x').replaced, 'base64'), Buffer.from(original));
+      const plan = [{ id: 'x' }];
+      if (mode !== 'removed-append') plan.unshift({ id: 'y', markers: { begin: '# begin y', end: '# end y' }, content: 'y2' });
+      const next = run(plan);
+      exact(mode === 'removed-append' ? block('x', 'ours')
+        : block('x', 'ours') + '\n' + block('y', 'y2', { begin: '# begin y', end: '# end y' }));
+      const suffix = mode === 'recreated-control' ? '' : `tail${eol}`;
+      writeFileSync(join(root, 'a.md'), Buffer.concat([read(), Buffer.from(suffix)]));
+      next.uninstall({ projectDir: root });
+      exact(original + suffix);
+    });
+  }
+  for (const userBytes of ['', `user${eol}`]) {
+    it(`R6 U1 created file after creator deleted user=${JSON.stringify(userBytes)} eol=${JSON.stringify(eol)}`, () => {
+      setup('');
+      rmSync(join(root, 'a.md'));
+      const next = run([{ id: 'x', content: 'x1' }, { id: 'y', content: 'y1' }]);
+      writeFileSync(join(root, 'a.md'), block('y', 'y1') + userBytes);
+      next.uninstall({ projectDir: root });
+      if (userBytes) exact(userBytes);
+      else assert.equal(existsSync(join(root, 'a.md')), false);
+    });
+  }
+  it(`R6 Sonnet R01 EOF separator activates marker eol=${JSON.stringify(eol)}`, () => {
+    setup(`head${eol}`);
+    run([{ id: 'y' }]);
+    writeFileSync(join(root, 'a.md'), Buffer.concat([read(), Buffer.from(markers('y').begin + '\r')]));
+    refuse([{ id: 'y', content: 'updated' }, { id: 'x' }], /Malformed textBlock markers after insertion/);
+  });
+}
+
+for (const changed of [false, true]) {
+  for (const reverse of [false, true]) {
+    it(`R6 Sonnet R03 freed markers changed=${changed} reverse=${reverse}`, () => {
+      setup('head\n');
+      run([{ id: 'x' }, { id: 'z' }]);
+      const plan = changed ? [{ id: 'x', markers: markers('z'), content: 'new' }]
+        : [{ id: 'x' }, { id: 'w', markers: markers('z'), content: 'new' }];
+      const next = run(reverse ? plan.reverse() : plan);
+      exact(changed ? append('head\n', block('z', 'new'))
+        : append(append('head\n', block('x', 'ours')), block('z', 'new')));
+      next.uninstall({ projectDir: root });
+      exact('head\n');
+    });
+  }
+}
+
+for (const update of [false, true]) {
+  it(`R6 Sonnet R04 legacy edited block update=${update}`, () => {
+    setup('head');
+    const inserted = block('x', 'ours');
+    const edited = append('head', block('x', 'user edit'));
+    writeFileSync(join(root, 'a.md'), edited);
+    mkdirSync(join(root, '.mi'));
+    writeFileSync(join(root, '.mi/manifest.json'), JSON.stringify({ journalVersion: 2,
+      effects: [{ type: 'textBlock', id: 'textBlock:a.md#x', beforeState: {
+        path: 'a.md', id: 'x', ...markers('x'), fileCreated: false,
+        prefix: '\n\n', segmentHash: hashContent(inserted),
+      } }], transaction: { state: 'complete' } }));
+    const next = update ? run([{ id: 'x', content: 'updated' }]) : make([]);
+    exact(edited);
+    next.uninstall({ projectDir: root });
+    exact(edited);
   });
 }

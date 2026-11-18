@@ -119,8 +119,10 @@ Content is a string with trailing line endings stripped; default markers are
    inline occurrences are user text.
 2. With no block, append and record the exact inserted bytes, separators included;
    revert removes those bytes. A file created by the installer is deleted once empty.
-3. On first install only, one well-formed existing block may be adopted. Its exact
-   original bytes are saved and restored on revert.
+3. On the first install of an effect id (which can be a later installer run), one
+   well-formed existing block may be adopted. Its exact original bytes are saved
+   and restored on revert. Each journaled block owns its end-marker terminator;
+   a terminator added to an adopted EOF block is removed on revert.
 4. Updates with the same id and markers replace the owned content in place and
    preserve the original before-state.
 5. Changing id or markers removes the old substitution and installs fresh. If any
@@ -134,8 +136,13 @@ Content is a string with trailing line endings stripped; default markers are
    manifest byte-for-byte.
 8. Revert leaves hand-edited content, missing blocks and broken markers untouched,
    silently returning as defined by the original effect contract. Updates also
-   preserve a hand-edited block.
+   preserve a hand-edited block. Broken markers make later installs refuse, even
+   when dropping that effect or updating an unrelated effect.
 9. Journal entries from `0e12991` remain readable and reversible.
+
+Known limit: collision checks compare path strings. On case-insensitive filesystems,
+paths such as `a.md` and `A.md` can refer to the same file without being detected
+as a collision; use the same spelling for every effect targeting that file.
 
 ## Test
 

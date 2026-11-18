@@ -91,7 +91,7 @@ export const createDriver = ({
           if (text.some((other) => other !== entry && other.args.path === entry.args.path
             && (overlap(entry, other) || entry.args.id === other.args.id || entry.effectId === other.effectId))
             || states.some((state) => entry.previous && state !== entry.previous && state.path === entry.args.path
-              && overlap(entry, state))) {
+              && text.some((other) => other.previous === state) && overlap(entry, state))) {
             throw new Error(`textBlock marker collision at "${entry.args.path}"`);
           }
         }
