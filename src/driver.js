@@ -75,42 +75,34 @@ export const createDriver = ({
             entry.previous = state;
           }
         };
-        // Reserve identities first, marker matches second, then resolve the
-        // remaining unique migrations. Array order cannot consume a match.
+        // Explicit journal identities reserve predecessors before id fallback.
         for (const entry of text) {
-          const identified = priorById.get(entry.effectId);
-          claim(entry, states.includes(identified) && identified.path === entry.args.path ? identified
-            : states.find((state) => state.path === entry.args.path && state.id === entry.args.id));
-        }
-        const candidatesFor = (entry) => states.filter((state) => state.path === entry.args.path
-          && !used.has(state) && !plannedTextIds.has(priorTextIds.get(state)));
-        for (const entry of text.filter(({ previous }) => !previous)) {
-          const matching = candidatesFor(entry).filter((state) => state.begin === entry.begin && state.end === entry.end);
-          if (matching.length > 1) throw new Error(`Ambiguous textBlock identity migration at "${entry.args.path}"`);
-          claim(entry, matching[0]);
+          const state = priorById.get(entry.effectId);
+          if (states.includes(state) && state.path === entry.args.path) claim(entry, state);
         }
         for (const entry of text.filter(({ previous }) => !previous)) {
-          const candidates = candidatesFor(entry);
-          // Several unmatched successors cannot compete for the same state.
-          const successors = text.filter((other) => !other.previous && other.args.path === entry.args.path);
-          if (candidates.length > 1 || (candidates.length && successors.length > 1)) {
-            throw new Error(`Ambiguous textBlock identity migration at "${entry.args.path}"`);
-          }
-          claim(entry, candidates[0]);
+          claim(entry, states.find((state) => !used.has(state)
+            && !plannedTextIds.has(priorTextIds.get(state))
+            && state.path === entry.args.path && state.id === entry.args.id));
         }
         const overlap = (a, b) => a.begin === b.begin || a.begin === b.end
           || a.end === b.begin || a.end === b.end;
         for (const entry of text) {
           if (text.some((other) => other !== entry && other.args.path === entry.args.path
             && (overlap(entry, other) || entry.args.id === other.args.id || entry.effectId === other.effectId))
-            || states.some((state) => state !== entry.previous && state.path === entry.args.path
+            || states.some((state) => entry.previous && state !== entry.previous && state.path === entry.args.path
               && overlap(entry, state))) {
             throw new Error(`textBlock marker collision at "${entry.args.path}"`);
           }
         }
-        const prepared = prepareTextBlockPlan(text.map(({ args, previous }) => previous
-          ? { ...args, previous: { ...previous, id: args.id } } : args), states);
-        const preparedText = new Map(text.map(({ args }, index) => [args, prepared[index]]));
+        const prepared = prepareTextBlockPlan(text.map(({ args, previous }) => ({ ...args, previous })), states, projectDir);
+        const textQueue = [...prepared.entries];
+        const orderedPlan = planned.map((entry) => {
+          if (entry.type !== 'textBlock') return entry;
+          const args = textQueue.shift();
+          const original = text.find((item) => item.args.path === args.path && item.args.id === args.id);
+          return { type: 'textBlock', args, id: original.effectId };
+        });
 
         const cursor = new Map();
         // Incomplete marker preserves prior effects so a crash before the first
@@ -135,7 +127,10 @@ export const createDriver = ({
         // Rebuild journal for this install (in memory until first successful apply).
         manifest = { ...manifest, effects: [] };
 
-        for (const { type, args, id: plannedId } of planned) {
+        for (const state of prepared.removals) {
+          registry.get('textBlock').revert({ basePath: projectDir }, state);
+        }
+        for (const { type, args, id: plannedId } of orderedPlan) {
           const effect = registry.get(type);
           if (!effect) {
             throw new Error(`Provider emitted an unregistered effect type "${type}"`);
@@ -149,7 +144,7 @@ export const createDriver = ({
             previous = priorById.get(id);
             if (previous === undefined) previous = priorByType.get(type)?.[occurrence];
           }
-          const applyArgs = type === 'textBlock' ? preparedText.get(args)
+          const applyArgs = type === 'textBlock' ? args
             : previous === undefined ? args : { ...args, previous };
 
           const beforeState = effect.apply(applyArgs);

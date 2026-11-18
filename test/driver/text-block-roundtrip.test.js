@@ -98,15 +98,14 @@ describe('driver round-trip — built-in textBlock', () => {
     assert.equal(readFileSync(file, 'utf8'), edited);
   });
 
-  it('leaves an empty created file after reversing the order of two blocks', () => {
+  it('removes a created file after reversing the order of two blocks', () => {
     root = mkdtempSync(join(tmpdir(), 'mi-text-driver-'));
     const blocks = [{ path: 'a.md', id: 'x' }, { path: 'a.md', id: 'y' }];
     make(blocks).install({ projectDir: root });
     const next = make([...blocks].reverse());
     next.install({ projectDir: root });
     next.uninstall({ projectDir: root });
-    // Known limitation: fileCreated belongs to x, which reverts before y after reordering.
-    assert.deepEqual(readFileSync(join(root, 'a.md')), Buffer.alloc(0));
+    assert.equal(existsSync(join(root, 'a.md')), false);
   });
 
   it('preserves surrounding bytes when a new block receives positional previous', () => {

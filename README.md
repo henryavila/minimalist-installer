@@ -98,12 +98,8 @@ import {
 - **`createJsonMergeEffect()`** — additive JSON merge; revert subtracts only the
   inserted delta (never a snapshot), preserving third-party content; deletes a
   file it created once emptied.
-- **`createTextBlockEffect()`** — managed delimited text block; revert removes only
-  the unedited block and its inserted spacing, preserving surrounding bytes; a
-  pre-existing block with the same markers is restored on revert; deletes
-  a file it created once emptied. Known limitation: if two blocks share an
-  installer-created file and a later install reverses their order, uninstall can
-  leave a zero-byte file because `fileCreated` belongs to one effect.
+- **`createTextBlockEffect()`** — managed delimited text block with exact byte
+  restoration and plan-wide validation. See the nine-point contract below.
 - **`createRefcountEffect()`** — per-owner marker directory validated against each
   owner's manifest; reclaims a shared artifact only when the last owner leaves.
   Crash-safe (no decrement step).
@@ -112,6 +108,34 @@ import {
   pruned files on revert).
 - **Journal** (`recordEffect`/`readEffects`/`replayReverse`) + **manifest**
   (`readManifest`/`writeManifest`, consumer-overridable directory).
+
+## textBlock contract
+
+The public arguments remain `{ basePath, path, id, content, markers?, previous? }`.
+Content is a string with trailing line endings stripped; default markers are
+`<!-- BEGIN ${id} -->` and `<!-- END ${id} -->`. The generated segment uses LF.
+
+1. Markers match whole lines exactly, excluding only LF or CRLF; prefixes and
+   inline occurrences are user text.
+2. With no block, append and record the exact inserted bytes, separators included;
+   revert removes those bytes. A file created by the installer is deleted once empty.
+3. On first install only, one well-formed existing block may be adopted. Its exact
+   original bytes are saved and restored on revert.
+4. Updates with the same id and markers replace the owned content in place and
+   preserve the original before-state.
+5. Changing id or markers removes the old substitution and installs fresh. If any
+   new marker already appears as a whole line after removal, refuse. There is no
+   migration onto an existing block or transfer of ownership between ids.
+6. Refuse duplicate, unbalanced or nested markers; empty or equal markers; planned
+   effects sharing an id or markers on one file; and content containing any planned
+   or journaled marker line on that file. Errors name the file and reason, regardless
+   of planned array order.
+7. Validate the whole plan before mutation. A refusal preserves target files and
+   manifest byte-for-byte.
+8. Revert leaves hand-edited content, missing blocks and broken markers untouched,
+   silently returning as defined by the original effect contract. Updates also
+   preserve a hand-edited block.
+9. Journal entries from `0e12991` remain readable and reversible.
 
 ## Test
 
