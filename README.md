@@ -48,8 +48,8 @@ npm install @henryavila/minimalist-installer
 **v0.1.0.** The engine core, extracted from `@henryavila/atomic-skills` (its first
 consumer) and now published to npm.
 
-Delivered: the effect kernel + journal + 3-hash file reconciler + the three
-built-in non-file effects (`json-merge`, `refcount`, `legacy-prune`), each with a
+Delivered: the effect kernel + journal + 3-hash file reconciler + the four
+built-in non-file effects (`json-merge`, `text-block`, `refcount`, `legacy-prune`), each with a
 round-trip / adversarial test suite; the **Provider contract** + a reference
 `createFileSetProvider()`; the **Driver** (`install` / `uninstall` / **update**,
 structural round-trip, no-clobber on user edits); **`defineInstaller`** (the
@@ -70,6 +70,7 @@ import {
   createEffectRegistry,
   createReconcileFileSetEffect,
   createJsonMergeEffect,
+  createTextBlockEffect,
   createRefcountEffect,
   createLegacyPruneEffect,
   recordEffect,
@@ -81,7 +82,7 @@ import {
 
 - **`defineInstaller({ config, providers, effects })`** — two-tier config factory:
   declarative `config` (data; engine owns `manifestDir`, rest is pass-through to
-  providers) + code-tier `providers`/`effects` (auto-registers the 4 built-ins).
+  providers) + code-tier `providers`/`effects` (auto-registers the 5 built-ins).
   Returns `{ install, uninstall, registry }` bound to `config`.
 - **`createDriver({ registry, providers, manifestDir })`** — the lower-level
   consumer-agnostic orchestrator: `install(config, { projectDir })` applies the
@@ -97,6 +98,8 @@ import {
 - **`createJsonMergeEffect()`** — additive JSON merge; revert subtracts only the
   inserted delta (never a snapshot), preserving third-party content; deletes a
   file it created once emptied.
+- **`createTextBlockEffect()`** — managed delimited text block with exact byte
+  restoration and plan-wide validation. See the nine-point contract below.
 - **`createRefcountEffect()`** — per-owner marker directory validated against each
   owner's manifest; reclaims a shared artifact only when the last owner leaves.
   Crash-safe (no decrement step).
@@ -105,6 +108,41 @@ import {
   pruned files on revert).
 - **Journal** (`recordEffect`/`readEffects`/`replayReverse`) + **manifest**
   (`readManifest`/`writeManifest`, consumer-overridable directory).
+
+## textBlock contract
+
+The public arguments remain `{ basePath, path, id, content, markers?, previous? }`.
+Content is a string with trailing line endings stripped; default markers are
+`<!-- BEGIN ${id} -->` and `<!-- END ${id} -->`. The generated segment uses LF.
+
+1. Markers match whole lines exactly, excluding only LF or CRLF; prefixes and
+   inline occurrences are user text.
+2. With no block, append and record the exact inserted bytes, separators included;
+   revert removes those bytes. A file created by the installer is deleted once empty.
+3. On the first install of an effect id (which can be a later installer run), one
+   well-formed existing block may be adopted. Its exact original bytes are saved
+   and restored on revert. Each journaled block owns its end-marker terminator;
+   a terminator added to an adopted EOF block is removed on revert.
+4. Updates with the same id and markers replace the owned content in place and
+   preserve the original before-state.
+5. Changing id or markers removes the old substitution and installs fresh. If any
+   new marker already appears as a whole line after removal, refuse. There is no
+   migration onto an existing block or transfer of ownership between ids.
+6. Refuse duplicate, unbalanced or nested markers; empty or equal markers; planned
+   effects sharing an id or markers on one file; and content containing any planned
+   or journaled marker line on that file. Errors name the file and reason, regardless
+   of planned array order.
+7. Validate the whole plan before mutation. A refusal preserves target files and
+   manifest byte-for-byte.
+8. Revert leaves hand-edited content, missing blocks and broken markers untouched,
+   silently returning as defined by the original effect contract. Updates also
+   preserve a hand-edited block. Broken markers make later installs refuse, even
+   when dropping that effect or updating an unrelated effect.
+9. Journal entries from `0e12991` remain readable and reversible.
+
+Known limit: collision checks compare path strings. On case-insensitive filesystems,
+paths such as `a.md` and `A.md` can refer to the same file without being detected
+as a collision; use the same spelling for every effect targeting that file.
 
 ## Test
 

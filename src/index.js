@@ -28,7 +28,7 @@ export { createFileSetProvider } from './provider.js';
 export { createDriver } from './driver.js';
 
 // defineInstaller — two-tier config factory (declarative `config` + code-tier
-// `effects`/`providers`); auto-registers the 4 built-in effect types.
+// `effects`/`providers`); auto-registers the 5 built-in effect types.
 export { defineInstaller } from './define-installer.js';
 
 // Reconciler — declarative 3-hash file-set reconciliation (the file domain).
@@ -36,6 +36,7 @@ export { classifyFile, createReconcileFileSetEffect } from './kernel/reconciler.
 
 // Built-in non-file effects (each reversible by before-state, not by snapshot).
 export { createJsonMergeEffect } from './kernel/effects/json-merge.js';
+export { createTextBlockEffect } from './kernel/effects/text-block.js';
 export { createRefcountEffect } from './kernel/effects/refcount.js';
 export { createLegacyPruneEffect } from './kernel/effects/legacy-prune.js';
 

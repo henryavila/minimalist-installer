@@ -37,7 +37,7 @@ describe('defineInstaller (two-tier config)', () => {
     assert.deepEqual(readdirSync(projectDir), [], 'round-trip to empty');
   });
 
-  it('registers the 4 built-in effect types by default (P4)', () => {
+  it('registers the 5 built-in effect types by default (P4)', () => {
     const installer = defineInstaller({
       providers: [createFileSetProvider()],
       config: {},
@@ -45,7 +45,7 @@ describe('defineInstaller (two-tier config)', () => {
 
     assert.deepEqual(
       installer.registry.list().sort(),
-      ['jsonMerge', 'legacyPrune', 'reconcileFileSet', 'refcount'],
+      ['jsonMerge', 'legacyPrune', 'reconcileFileSet', 'refcount', 'textBlock'],
     );
   });
 

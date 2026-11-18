@@ -14,6 +14,7 @@ describe('stable effect identity', () => {
 
   it('stableEffectId is deterministic for built-ins', () => {
     assert.equal(stableEffectId('reconcileFileSet', {}), 'reconcileFileSet');
+    assert.equal(stableEffectId('textBlock', { path: 'a.md', id: 'x' }), 'textBlock:a.md#x');
     assert.equal(stableEffectId('jsonMerge', { path: 'a.json' }), 'jsonMerge:a.json');
   });
 

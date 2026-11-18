@@ -1,3 +1,4 @@
+import { prepareTextBlockPlan } from './kernel/effects/text-block.js';
 import {
   readManifest,
   writeManifest,
@@ -55,6 +56,54 @@ export const createDriver = ({
           }
         }
 
+        const planned = planEffects(config, projectDir);
+        const text = planned.filter(({ type }) => type === 'textBlock').map((entry) => ({
+          ...entry,
+          effectId: entry.id ?? stableEffectId('textBlock', entry.args),
+          begin: entry.args.markers?.begin ?? `<!-- BEGIN ${entry.args.id} -->`,
+          end: entry.args.markers?.end ?? `<!-- END ${entry.args.id} -->`,
+        }));
+        const plannedTextIds = new Set(text.map(({ effectId }) => effectId));
+        const states = priorByType.get('textBlock') ?? [];
+        const priorTextIds = new Map(readEffects(prior).filter(({ type }) => type === 'textBlock')
+          .map(({ id, beforeState }) => [beforeState, id ?? stableEffectId('textBlock', beforeState)]));
+        const used = new Set();
+        const claim = (entry, state) => {
+          if (state) {
+            if (used.has(state)) throw new Error(`textBlock marker collision at "${entry.args.path}"`);
+            used.add(state);
+            entry.previous = state;
+          }
+        };
+        // Explicit journal identities reserve predecessors before id fallback.
+        for (const entry of text) {
+          const state = priorById.get(entry.effectId);
+          if (states.includes(state) && state.path === entry.args.path) claim(entry, state);
+        }
+        for (const entry of text.filter(({ previous }) => !previous)) {
+          claim(entry, states.find((state) => !used.has(state)
+            && !plannedTextIds.has(priorTextIds.get(state))
+            && state.path === entry.args.path && state.id === entry.args.id));
+        }
+        const overlap = (a, b) => a.begin === b.begin || a.begin === b.end
+          || a.end === b.begin || a.end === b.end;
+        for (const entry of text) {
+          if (text.some((other) => other !== entry && other.args.path === entry.args.path
+            && (overlap(entry, other) || entry.args.id === other.args.id || entry.effectId === other.effectId))
+            || states.some((state) => entry.previous && state !== entry.previous && state.path === entry.args.path
+              && text.some((other) => other.previous === state) && overlap(entry, state))) {
+            throw new Error(`textBlock marker collision at "${entry.args.path}"`);
+          }
+        }
+        const prepared = prepareTextBlockPlan(text.map(({ args, previous }) => ({ ...args, previous })), states, projectDir);
+        const textQueue = [...prepared.entries];
+        const orderedPlan = planned.map((entry) => {
+          if (entry.type !== 'textBlock') return entry;
+          const args = textQueue.shift();
+          const original = text.find((item) => item.args.path === args.path && item.args.id === args.id);
+          return { type: 'textBlock', args, id: original.effectId };
+        });
+
         const cursor = new Map();
         // Incomplete marker preserves prior effects so a crash before the first
         // mutation still leaves a recoverable journal. Once the first new effect
@@ -78,7 +127,10 @@ export const createDriver = ({
         // Rebuild journal for this install (in memory until first successful apply).
         manifest = { ...manifest, effects: [] };
 
-        for (const { type, args, id: plannedId } of planEffects(config, projectDir)) {
+        for (const state of prepared.removals) {
+          registry.get('textBlock').revert({ basePath: projectDir }, state);
+        }
+        for (const { type, args, id: plannedId } of orderedPlan) {
           const effect = registry.get(type);
           if (!effect) {
             throw new Error(`Provider emitted an unregistered effect type "${type}"`);
@@ -87,11 +139,13 @@ export const createDriver = ({
           const occurrence = cursor.get(type) ?? 0;
           cursor.set(type, occurrence + 1);
 
-          let previous = priorById.get(id);
-          if (previous === undefined) {
-            previous = priorByType.get(type)?.[occurrence];
+          let previous;
+          if (type !== 'textBlock') {
+            previous = priorById.get(id);
+            if (previous === undefined) previous = priorByType.get(type)?.[occurrence];
           }
-          const applyArgs = previous === undefined ? args : { ...args, previous };
+          const applyArgs = type === 'textBlock' ? args
+            : previous === undefined ? args : { ...args, previous };
 
           const beforeState = effect.apply(applyArgs);
           manifest = recordEffect(manifest, { type, id, beforeState });
