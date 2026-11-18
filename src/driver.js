@@ -78,7 +78,21 @@ export const createDriver = ({
         // Rebuild journal for this install (in memory until first successful apply).
         manifest = { ...manifest, effects: [] };
 
-        for (const { type, args, id: plannedId } of planEffects(config, projectDir)) {
+        const planned = planEffects(config, projectDir);
+        const plannedTextIds = new Set(planned.filter(({ type }) => type === 'textBlock')
+          .map(({ args }) => stableEffectId('textBlock', args)));
+        const usedTextStates = new Set();
+        const textMarkers = new Set();
+        for (const { type, args } of planned) {
+          if (type !== 'textBlock') continue;
+          const key = JSON.stringify([args.path,
+            args.markers?.begin ?? `<!-- BEGIN ${args.id} -->`,
+            args.markers?.end ?? `<!-- END ${args.id} -->`]);
+          if (textMarkers.has(key)) throw new Error(`textBlock marker collision at "${args.path}"`);
+          textMarkers.add(key);
+        }
+
+        for (const { type, args, id: plannedId } of planned) {
           const effect = registry.get(type);
           if (!effect) {
             throw new Error(`Provider emitted an unregistered effect type "${type}"`);
@@ -88,7 +102,36 @@ export const createDriver = ({
           cursor.set(type, occurrence + 1);
 
           let previous = priorById.get(id);
-          if (previous === undefined) {
+          if (type === 'textBlock') {
+            // Text blocks transfer ownership by explicit identity, never by
+            // occurrence. A renamed id may claim only an unreserved predecessor
+            // in the same file; unchanged markers disambiguate multiple blocks.
+            const states = priorByType.get(type) ?? [];
+            previous = states.find((state) => state.path === args.path && state.id === args.id);
+            if (!previous) {
+              const candidates = states.filter((state) => state.path === args.path
+                && !usedTextStates.has(state)
+                && !plannedTextIds.has(stableEffectId(type, state)));
+              const begin = args.markers?.begin ?? `<!-- BEGIN ${args.id} -->`;
+              const end = args.markers?.end ?? `<!-- END ${args.id} -->`;
+              const matching = candidates.filter((state) => state.begin === begin && state.end === end);
+              if (matching.length > 1 || (!matching.length && candidates.length > 1)) {
+                throw new Error(`Ambiguous textBlock identity migration at "${args.path}"`);
+              }
+              previous = matching[0] ?? candidates[0];
+            }
+            const begin = args.markers?.begin ?? `<!-- BEGIN ${args.id} -->`;
+            const end = args.markers?.end ?? `<!-- END ${args.id} -->`;
+            if (states.some((state) => state !== previous && state.path === args.path
+              && state.begin === begin && state.end === end)) {
+              throw new Error(`textBlock marker collision at "${args.path}"`);
+            }
+            if (previous) {
+              usedTextStates.add(previous);
+              // The effect still rejects arbitrary mismatched direct callers.
+              previous = { ...previous, id: args.id };
+            }
+          } else if (previous === undefined) {
             previous = priorByType.get(type)?.[occurrence];
           }
           const applyArgs = previous === undefined ? args : { ...args, previous };

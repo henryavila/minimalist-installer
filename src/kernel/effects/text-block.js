@@ -31,6 +31,20 @@ const findBlock = (bytes, begin, end) => {
   return { start: begins[0].start, end: ends[0].next };
 };
 
+// Both migration and uninstall settle exactly the same owned substitution.
+const restoreBlock = (bytes, block, state) => {
+  if (state.replaced !== undefined) {
+    return Buffer.concat([
+      bytes.subarray(0, block.start), Buffer.from(state.replaced, 'base64'), bytes.subarray(block.end),
+    ]);
+  }
+  const prefix = Buffer.from(state.prefix ?? '');
+  const start = block.start >= prefix.length
+    && bytes.subarray(block.start - prefix.length, block.start).equals(prefix)
+    ? block.start - prefix.length : block.start;
+  return Buffer.concat([bytes.subarray(0, start), bytes.subarray(block.end)]);
+};
+
 export const createTextBlockEffect = () => ({
   type: 'textBlock',
 
@@ -60,38 +74,44 @@ export const createTextBlockEffect = () => ({
     const created = !existsNoFollow(basePath, path);
     let bytes = created ? Buffer.alloc(0) : readFileNoFollow(basePath, path, null);
     let block;
-    let migrated = false;
-    if (previous && (previous.begin !== begin || previous.end !== end)) {
+    let ownership;
+    if (previous) {
       const old = findBlock(bytes, previous.begin, previous.end);
       if (old?.malformed) throw new Error(`Malformed textBlock markers at "${path}"`);
-      if (old && hashContent(bytes.subarray(old.start, old.end)) === previous.segmentHash) {
-        // Search without the old segment, including when only one marker changed.
-        const withoutOld = Buffer.concat([bytes.subarray(0, old.start), bytes.subarray(old.end)]);
-        const newer = findBlock(withoutOld, begin, end);
-        if (newer?.malformed) throw new Error(`Malformed textBlock markers at "${path}"`);
-        if (newer) {
-          const spacing = Buffer.from(previous.prefix);
-          const start = old.start >= spacing.length
-            && bytes.subarray(old.start - spacing.length, old.start).equals(spacing)
-            ? old.start - spacing.length : old.start;
-          bytes = Buffer.concat([bytes.subarray(0, start), bytes.subarray(old.end)]);
-          block = findBlock(bytes, begin, end);
-        } else {
+      const sameMarkers = previous.begin === begin && previous.end === end;
+      const owned = old && hashContent(bytes.subarray(old.start, old.end)) === previous.segmentHash;
+      // An edited block is no longer ours to overwrite, even on update.
+      if (old && !owned && sameMarkers) return { ...previous, id };
+      if (owned) {
+        if (sameMarkers) {
           block = old;
-          migrated = true;
+          ownership = previous;
+        } else {
+          // Resolve the old adoption at its own location before adopting a
+          // different block. A snapshot must never move to another identity.
+          const withoutOld = Buffer.concat([bytes.subarray(0, old.start), bytes.subarray(old.end)]);
+          const newer = findBlock(withoutOld, begin, end);
+          if (newer?.malformed) throw new Error(`Malformed textBlock markers at "${path}"`);
+          if (newer) {
+            bytes = restoreBlock(bytes, old, previous);
+          } else {
+            block = old;
+            ownership = previous;
+          }
         }
       }
+      // Missing or edited old blocks relinquish their snapshot. A fresh append
+      // owns only its new segment and spacing, never the old adopted bytes.
     }
     block ??= findBlock(bytes, begin, end);
     if (block?.malformed) throw new Error(`Malformed textBlock markers at "${path}"`);
 
     let prefix;
     let result;
-    const replaced = previous ? previous.replaced
+    const replaced = ownership ? ownership.replaced
       : block ? bytes.subarray(block.start, block.end).toString('base64') : undefined;
     if (block) {
-      prefix = migrated || (previous?.begin === begin && previous?.end === end)
-        ? (previous.prefix ?? '') : '';
+      prefix = ownership?.prefix ?? '';
       result = Buffer.concat([
         bytes.subarray(0, block.start), Buffer.from(segment), bytes.subarray(block.end),
       ]);
@@ -121,20 +141,7 @@ export const createTextBlockEffect = () => ({
     if (!block || block.malformed) return;
     if (hashContent(bytes.subarray(block.start, block.end)) !== beforeState.segmentHash) return;
 
-    let result;
-    if (beforeState.replaced !== undefined) {
-      result = Buffer.concat([
-        bytes.subarray(0, block.start),
-        Buffer.from(beforeState.replaced, 'base64'),
-        bytes.subarray(block.end),
-      ]);
-    } else {
-      const prefix = Buffer.from(beforeState.prefix);
-      const start = block.start >= prefix.length
-        && bytes.subarray(block.start - prefix.length, block.start).equals(prefix)
-        ? block.start - prefix.length : block.start;
-      result = Buffer.concat([bytes.subarray(0, start), bytes.subarray(block.end)]);
-    }
+    const result = restoreBlock(bytes, block, beforeState);
     if (beforeState.fileCreated && result.length === 0) {
       unlinkNoFollow(basePath, path);
       pruneEmptyParentsNoFollow(basePath, path);

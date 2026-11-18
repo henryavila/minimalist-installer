@@ -282,7 +282,8 @@ describe('textBlock effect', () => {
         assert.equal(read(file), expected);
         assert.equal(state.prefix, '');
         effect.revert(args, state);
-        assert.equal(read(file), expected.replace(migrated, ''));
+        // The target was user-owned: uninstall restores its exact bytes.
+        assert.equal(read(file), expected.replace(migrated, newer));
       });
     }
   }
@@ -308,7 +309,7 @@ describe('textBlock effect', () => {
     assert.equal(state.prefix, '');
     assert.equal(read(file), edited + '\n' + migrated);
     effect.revert(args, state);
-    assert.equal(read(file), edited + '\n');
+    assert.equal(read(file), edited + '\n# begin x\nstale\n# end x\n');
   });
 
   it('carries created-file ownership when old markers are gone during migration', () => {
